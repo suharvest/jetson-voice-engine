@@ -150,6 +150,50 @@ downstream (Code2Wav or codes-to-audio path).
   correctly via `${QWEN3_ARTIFACT_ROOT}` substitution.
 - ❌ ASR worker — proven correct on real speech.
 
+## Update: direct worker isolation (2026-05-11 evening)
+
+The regression is now isolated below the JSON/runtime prefill layer.
+Direct worker probes on `orin-nx` compared the old validated runtime
+bundle in `/tmp/qwen3_highperf_bin` against the current source build in
+`~/project/repro-qwen3/TensorRT-Edge-LLM/build`, using the same frozen
+engines and prompt `测试`.
+
+Findings:
+
+- Old runtime/plugin pre-adjust Talker logits:
+  `argmax=1995 max=26.25 eos=2.4375`.
+- Current worker + current plugin pre-adjust Talker logits:
+  `argmax=1093 max≈14.07 eos≈-1.54`.
+- Current worker + old validated plugin restores the logits:
+  `argmax=1995 max=26.25 eos=2.4375`.
+- Dumped `prefill_embeds_f32.bin` from old vs new is bit-identical
+  (`max_abs=0.0`), while `talker_prefill_logits_f32.bin` differs
+  heavily (`max_abs≈29.7`, `mean_abs≈5.82`).
+
+That rules out FP8 text embedding, language/speaker prefill construction,
+and JSON request parsing for the no-clone path. The failing component is
+the runtime plugin `.so` used by the W8A16 Talker engine.
+
+One important repository hygiene issue surfaced: the old validated plugin
+exports W8A16 symbols that the current local source tree no longer has,
+including `w8a16_m1_output_k_kernel`,
+`w8a16_hmma_m16n16k16_kernel`, and
+`w8a16_per_output_output_k_reference_kernel`. Rebuilding the current
+plugin and forcing the remaining reference/tiled W8A16 kernels did not
+restore quality. Therefore a clean reproduction must either recover and
+commit the validated output-k/HMMA W8A16 source, or bind the exact
+validated plugin binary as a required artifact. Rebuilding the current
+source as-is will reproduce the bad audio.
+
+Speaker/clone support was validated separately with the current worker
+and the old stable plugin:
+
+- default speaker path: `seqLen=9`, logits restored (`argmax=1995`);
+- `speaker_id=2301`: accepted, `seqLen=9`;
+- `speaker_embedding_b64` clone-only: accepted, `seqLen=9`;
+- `speaker_embedding_b64` combined with `speaker`/`speaker_id`: rejected
+  with `speaker_embedding_b64 cannot be combined with speaker or speaker_id`.
+
 ## Reproduce
 
 The full loopback runs on `orin-nx` (Tailscale `100.82.225.102`,
