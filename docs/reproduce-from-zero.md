@@ -1,7 +1,27 @@
 # Reproduce Qwen3 EdgeLLM Jetson
 
-This is the shortest path for a new machine to reproduce the current released
-Qwen3 ASR/TTS flow.
+## TL;DR — one shot
+
+On a Jetson Orin NX (JetPack 6, CUDA 12.6, TRT 10.3) with docker +
+`--runtime nvidia`:
+
+```bash
+git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
+bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh
+# add: --reference <24kHz mono wav> to also verify zero-shot voice clone
+```
+
+`scripts/reproduce_qwen3_highperf.sh` is the canonical entry point — it
+clones the three repos at the validated branches, builds EdgeLLM,
+SHA-256-verifies the HF artifacts, brings the slim docker image up, then
+hands off to `scripts/verify_reproduction.sh` which symbol-checks the
+plugin and runs a TTS→ASR round-trip on three Chinese prompts (plus
+voice clone if a reference WAV is provided). Exit 0 means the entire
+chain is healthy.
+
+The rest of this document is the step-by-step expansion that lets you
+inspect any single layer when something fails. Reading it is optional
+if the one-shot exit 0'd.
 
 > **2026-05-11 update**: this guide has been hardened against the issues that
 > blocked the first clean-room reproduction on Orin NX. See `docs/performance/
