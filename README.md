@@ -6,7 +6,7 @@ This repository is the Qwen-specific companion to `jetson-voice`:
 
 - `jetson-voice` remains the deployable product service with API, frontend/backend selection, Docker, and device deployment.
 - This repo owns Qwen3 ASR/TTS export/build/runtime glue, performance scripts, validation gates, and lessons learned.
-- Large ONNX/TensorRT/embedding artifacts live in the Hugging Face model repo `harvestsu/qwen3-edgellm-jetson-artifacts`.
+- Runtime TensorRT/embedding artifacts live in the Hugging Face model repo `harvestsu/qwen3-edgellm-jetson-artifacts`; ONNX files are reproducible intermediate build products generated locally from official Qwen weights.
 - TensorRT-Edge-LLM runtime changes live in the fork `suharvest/TensorRT-Edge-LLM`.
 
 ## Runtime Profiles
@@ -34,6 +34,7 @@ The highperf branch includes the runtime pieces required by the measured path: e
 - `docs/performance/`: frozen performance records across Orin Nano/NX.
 - `docs/plans/`: implementation notes and negative results that should not be rediscovered.
 - `docs/export-from-official-weights.md`: official Qwen3 weight -> ONNX export guide.
+- `AGENTS.md`: concise operating guide for coding agents working in this repo.
 - `deploy/artifacts/qwen3_manifest.json`: HF artifact manifest consumed by Jetson Voice.
 - `configs/profiles/`: Jetson Voice deployment profiles.
 
