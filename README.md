@@ -33,8 +33,23 @@ The highperf branch includes the runtime pieces required by the measured path: e
 - `scripts/`: export, engine build, quantization, stateful Code2Wav, quality gate, and V2V scripts.
 - `docs/performance/`: frozen performance records across Orin Nano/NX.
 - `docs/plans/`: implementation notes and negative results that should not be rediscovered.
+- `docs/export-from-official-weights.md`: official Qwen3 weight -> ONNX export guide.
 - `deploy/artifacts/qwen3_manifest.json`: HF artifact manifest consumed by Jetson Voice.
 - `configs/profiles/`: Jetson Voice deployment profiles.
+
+## ONNX Export
+
+Users can start from official Qwen3 ASR/TTS Hugging Face snapshots and generate
+ONNX locally:
+
+```bash
+bash scripts/setup_trt_export_env.sh
+scripts/export_qwen3_asr_onnx.sh --model-dir /models/Qwen3-ASR-0.6B --out /tmp/qwen3-asr-onnx
+scripts/export_qwen3_tts_onnx.sh --model-dir /models/Qwen3-TTS-0.6B --out /tmp/qwen3-tts-onnx
+```
+
+See `docs/export-from-official-weights.md` for the uv environment, Qwen package
+dependencies, and highperf post-processing details.
 
 ## Artifact Repo
 

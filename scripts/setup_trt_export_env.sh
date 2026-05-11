@@ -17,12 +17,15 @@
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
-export http_proxy="" https_proxy="" no_proxy="*"
+if [ "${DISABLE_PROXY:-0}" = "1" ]; then
+    export http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="*"
+fi
 
 MIRROR="${PYPI_MIRROR:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 TRT_SRC="${TRT_SRC:-$HOME/project/tensorrt-edge-llm}"
-PROJECT_DIR="/tmp/trt-export"
+PROJECT_DIR="${TRT_EXPORT_PROJECT:-/tmp/trt-export}"
 PYTHON="${PYTHON:-3.12}"
+RESET="${RESET:-1}"
 
 echo "=== Step 1: Install uv ==="
 if ! command -v uv &>/dev/null; then
@@ -30,8 +33,12 @@ if ! command -v uv &>/dev/null; then
 fi
 
 echo "=== Step 2: Create uv project ==="
-rm -rf "$PROJECT_DIR" 2>/dev/null || true
-uv init --no-readme "$PROJECT_DIR"
+if [ "$RESET" = "1" ]; then
+    rm -rf "$PROJECT_DIR" 2>/dev/null || true
+fi
+if [ ! -d "$PROJECT_DIR" ]; then
+    uv init --no-readme "$PROJECT_DIR"
+fi
 cd "$PROJECT_DIR"
 echo "$PYTHON" > .python-version
 
@@ -49,11 +56,19 @@ SYS_SITE=$(python3 -c "import site; print(site.getusersitepackages())")
 VENV_SITE="$PROJECT_DIR/.venv/lib/python$PYTHON/site-packages"
 
 for pkg in qwen_asr qwen_tts qwen_omni_utils; do
-    if [ -d "$SYS_SITE/$pkg" ]; then
+    pkg_env=$(echo "${pkg}_PKG_DIR" | tr '[:lower:]' '[:upper:]')
+    pkg_dir="${!pkg_env:-}"
+    if [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then
+        rm -rf "$VENV_SITE/$pkg"
+        cp -r "$pkg_dir" "$VENV_SITE/$pkg"
+        echo "  Copied $pkg from $pkg_dir"
+    elif [ -d "$SYS_SITE/$pkg" ]; then
+        rm -rf "$VENV_SITE/$pkg"
         cp -r "$SYS_SITE/$pkg" "$VENV_SITE/"
-        echo "  Copied $pkg"
+        echo "  Copied $pkg from $SYS_SITE"
     else
         echo "  WARNING: $pkg not found in $SYS_SITE"
+        echo "           Set ${pkg_env}=/path/to/$pkg if the package is checked out locally."
     fi
 done
 
