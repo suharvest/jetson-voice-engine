@@ -37,6 +37,7 @@ ARTIFACT_SET="orin-nx-highperf-2026-05-11"
 SERVICE_URL="http://localhost:18092"
 REFERENCE_WAV=""
 SPEAKER_ENCODER=""
+PRECOMPUTED_EMBEDDING=""
 SKIP_CLONE=0
 SKIP_SERVICE=0
 
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
     --service-url) SERVICE_URL="$2"; shift 2 ;;
     --reference) REFERENCE_WAV="$2"; shift 2 ;;
     --speaker-encoder) SPEAKER_ENCODER="$2"; shift 2 ;;
+    --embedding) PRECOMPUTED_EMBEDDING="$2"; shift 2 ;;
     --skip-clone) SKIP_CLONE=1; shift ;;
     --skip-service) SKIP_SERVICE=1; shift ;;
     -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
@@ -133,8 +135,13 @@ else
     )
     for prompt in "${PROMPTS[@]}"; do
       WAV="$TMPDIR/tts_$(echo -n "$prompt" | md5sum | cut -c1-8).wav"
+      # Greedy sampling for deterministic verification — top_k=1 = pure argmax,
+      # temperature very low. Lets the same prompt produce the same audio across
+      # runs, otherwise default talker_temperature=0.9 + top_k=50 + 1.05 repetition
+      # penalty makes the TTS→ASR exact-match assertion flaky.
       CODE=$(curl -s -X POST "$SERVICE_URL/tts" -H 'content-type: application/json' \
-        -d "{\"text\":\"$prompt\"}" -o "$WAV" -w '%{http_code}')
+        -d "{\"text\":\"$prompt\",\"talker_top_k\":1,\"talker_temperature\":0.05,\"predictor_top_k\":1,\"predictor_temperature\":0.05}" \
+        -o "$WAV" -w '%{http_code}')
       if [ "$CODE" != "200" ] || [ ! -s "$WAV" ]; then
         fail "/tts \"$prompt\"" "http=$CODE size=$(stat -c %s "$WAV" 2>/dev/null || echo 0)"
         continue
@@ -157,8 +164,40 @@ echo
 echo "== [4/4] Voice clone loopback =="
 if [ "$SKIP_SERVICE" -eq 1 ] || [ "$SKIP_CLONE" -eq 1 ]; then
   skip "voice clone" "skip flag set"
+elif [ -n "$PRECOMPUTED_EMBEDDING" ]; then
+  if [ ! -f "$PRECOMPUTED_EMBEDDING" ]; then
+    fail "precomputed embedding" "file missing: $PRECOMPUTED_EMBEDDING"
+  else
+    EMB_FILE="$PRECOMPUTED_EMBEDDING"
+    ok "using precomputed embedding ($(wc -c < "$EMB_FILE") b64 chars)"
+    for prompt in "${PROMPTS[@]}"; do
+      WAV="$TMPDIR/clone_pre_$(echo -n "$prompt" | md5sum | cut -c1-8).wav"
+      REQ=$(python3 -c "import json; print(json.dumps({'text':'$prompt','speaker_embedding_b64':open('$EMB_FILE').read().strip(),'first_chunk_frames':7,'chunk_frames':10,'max_chunk_frames':10,'talker_top_k':1,'talker_temperature':0.05,'predictor_top_k':1,'predictor_temperature':0.05},ensure_ascii=False))")
+      PCM="$TMPDIR/clone_pre.pcm"
+      CODE=$(curl -s -N -X POST "$SERVICE_URL/tts/clone/stream" -H 'content-type: application/json' -d "$REQ" -o "$PCM" -w '%{http_code}')
+      if [ "$CODE" != "200" ] || [ ! -s "$PCM" ]; then
+        fail "/tts/clone/stream \"$prompt\"" "http=$CODE size=$(stat -c %s "$PCM" 2>/dev/null || echo 0)"
+        continue
+      fi
+      python3 - "$PCM" "$WAV" <<'PY' || true
+import sys, struct, wave
+raw = open(sys.argv[1],'rb').read(); sr = struct.unpack('<I', raw[:4])[0]
+with wave.open(sys.argv[2],'wb') as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(sr); w.writeframes(raw[4:])
+PY
+      ASR_JSON=$(curl -s -X POST "$SERVICE_URL/asr" -F "file=@$WAV")
+      ASR_TXT=$(echo "$ASR_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("text",""))' 2>/dev/null)
+      NORM_PROMPT=$(echo "$prompt" | tr -d '。，、！？.,!?')
+      NORM_ASR=$(echo "$ASR_TXT" | tr -d '。，、！？.,!?')
+      if [ "$NORM_PROMPT" = "$NORM_ASR" ]; then
+        ok "clone→ASR (precomputed) \"$prompt\" → \"$ASR_TXT\""
+      else
+        fail "clone→ASR (precomputed) \"$prompt\"" "got \"$ASR_TXT\""
+      fi
+    done
+  fi
 elif [ -z "$REFERENCE_WAV" ]; then
-  skip "voice clone" "--reference not given"
+  skip "voice clone" "pass --reference <wav> (needs librosa) or --embedding <b64> (no python deps needed)"
 else
   if [ -z "$SPEAKER_ENCODER" ]; then
     SPEAKER_ENCODER="$ARTIFACT_ROOT/tts/speaker_encoder/speaker_encoder.onnx"
@@ -170,16 +209,18 @@ else
     fail "speaker encoder" "not at $SPEAKER_ENCODER"
   elif [ ! -f "$EXTRACT" ]; then
     fail "extract script" "$EXTRACT missing"
+  elif ! python3 -c 'import librosa, onnxruntime' >/dev/null 2>&1; then
+    skip "voice clone" "python3 is missing librosa+onnxruntime (install: pip install librosa onnxruntime); extract embedding on a workstation with --embedding instead"
   else
     EMB_FILE="$TMPDIR/spk_emb.b64"
     if ! python3 "$EXTRACT" "$REFERENCE_WAV" "$SPEAKER_ENCODER" "$EMB_FILE" >/dev/null 2>&1; then
-      fail "extract embedding" "extractor errored — check librosa+onnxruntime install"
+      fail "extract embedding" "extractor errored — re-run manually: python3 $EXTRACT $REFERENCE_WAV $SPEAKER_ENCODER /tmp/out.b64"
     else
       EMB=$(cat "$EMB_FILE")
       ok "embedding extracted ($(wc -c < "$EMB_FILE") b64 chars)"
       for prompt in "${PROMPTS[@]}"; do
         WAV="$TMPDIR/clone_$(echo -n "$prompt" | md5sum | cut -c1-8).wav"
-        REQ=$(python3 -c "import json; print(json.dumps({'text':'$prompt','speaker_embedding_b64':open('$EMB_FILE').read().strip(),'first_chunk_frames':7,'chunk_frames':10,'max_chunk_frames':10},ensure_ascii=False))")
+        REQ=$(python3 -c "import json; print(json.dumps({'text':'$prompt','speaker_embedding_b64':open('$EMB_FILE').read().strip(),'first_chunk_frames':7,'chunk_frames':10,'max_chunk_frames':10,'talker_top_k':1,'talker_temperature':0.05,'predictor_top_k':1,'predictor_temperature':0.05},ensure_ascii=False))")
         PCM="$TMPDIR/clone.pcm"
         CODE=$(curl -s -N -X POST "$SERVICE_URL/tts/clone/stream" -H 'content-type: application/json' \
           -d "$REQ" -o "$PCM" -w '%{http_code}')

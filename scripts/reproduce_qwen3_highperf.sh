@@ -41,6 +41,7 @@ ARTIFACT_SET="orin-nx-highperf-2026-05-11"
 ARTIFACT_ROOT="${QWEN3_ARTIFACT_ROOT:-/opt/models/qwen3-edgellm}"
 SERVICE_PORT=18092
 REFERENCE_WAV=""
+EMBEDDING_FILE=""
 SKIP_BUILD=0; SKIP_DEPLOY=0; SKIP_DOCKER=0; SKIP_VERIFY=0
 CUDA_DIR="${CUDA_DIR:-/usr/local/cuda-12.6}"
 CUDA_CTK_VER="${CUDA_CTK_VER:-12.6}"
@@ -52,6 +53,7 @@ while [ $# -gt 0 ]; do
     --artifact-root) ARTIFACT_ROOT="$2"; shift 2 ;;
     --service-port) SERVICE_PORT="$2"; shift 2 ;;
     --reference) REFERENCE_WAV="$2"; shift 2 ;;
+    --embedding) EMBEDDING_FILE="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --skip-deploy) SKIP_DEPLOY=1; shift ;;
     --skip-docker) SKIP_DOCKER=1; shift ;;
@@ -215,6 +217,7 @@ if [ $SKIP_VERIFY -eq 0 ]; then
     --service-url "http://localhost:${SERVICE_PORT}"
   )
   [ -n "$REFERENCE_WAV" ] && ARGS+=(--reference "$REFERENCE_WAV")
+  [ -n "$EMBEDDING_FILE" ] && ARGS+=(--embedding "$EMBEDDING_FILE")
   bash "$QEJ/scripts/verify_reproduction.sh" "${ARGS[@]}"
   RC=$?
   if [ $RC -ne 0 ]; then exit $RC; fi
