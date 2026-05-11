@@ -96,7 +96,13 @@
                 "tts/tokenizer/tokenizer.json",
                 "tts/tokenizer/tokenizer_config.json",
                 "tts/tokenizer/processed_chat_template.json",
-                "tts/speaker_encoder/speaker_encoder.onnx"
+                "tts/speaker_encoder/speaker_encoder.onnx",
+                "engines/orin-nano/official/code_predictor/codec_embeddings.safetensors",
+                "engines/orin-nano/official/code_predictor/lm_heads.safetensors",
+                "engines/orin-nano/official/code_predictor/small_to_mtp_projection.safetensors",
+                "engines/orin-nano/official/talker/embedding.safetensors",
+                "engines/orin-nano/official/talker/text_embedding.safetensors",
+                "engines/orin-nano/official/talker/text_projection.safetensors"
             ]
         }
     }
