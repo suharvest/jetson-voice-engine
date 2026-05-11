@@ -7,6 +7,7 @@ This repository is the Qwen-specific companion to `jetson-voice`:
 - `jetson-voice` remains the deployable product service with API, frontend/backend selection, Docker, and device deployment.
 - This repo owns Qwen3 ASR/TTS export/build/runtime glue, performance scripts, validation gates, and lessons learned.
 - Large ONNX/TensorRT/embedding artifacts live in the Hugging Face model repo `harvestsu/qwen3-edgellm-jetson-artifacts`.
+- TensorRT-Edge-LLM runtime changes live in the fork `suharvest/TensorRT-Edge-LLM`.
 
 ## Runtime Profiles
 
@@ -16,6 +17,15 @@ Two Qwen profiles are maintained:
 - `highperf`: product path for low-latency Qwen3 ASR + Qwen3 TTS dual residency on Jetson Orin.
 
 Jetson Voice consumes these via JSON profiles copied under `configs/profiles/` and the artifact manifest under `deploy/artifacts/qwen3_manifest.json`. `multilanguage-qwen-highperf` targets the Nano artifact set; `multilanguage-qwen-highperf-nx` targets NX-native engines.
+
+## EdgeLLM Fork
+
+Use these TensorRT-Edge-LLM fork branches:
+
+- `official-qwen3-tts-upstream-runtime`: minimal-diff correctness/runtime branch for upstream review.
+- `qwen3-tts-highperf-runtime-w8a16`: product high-performance branch used by the current Orin highperf artifacts.
+
+The highperf branch includes the runtime pieces required by the measured path: explicit Qwen3-TTS backend without duplicate generic Talker load, W8A16 plugin/runtime support, CP runtime optimizations, stateful Code2Wav runner, and optional Code2Wav timing profile via `QWEN3_TTS_CODE2WAV_PROFILE=1`.
 
 ## Contents
 
