@@ -15,7 +15,7 @@ Two Qwen profiles are maintained:
 - `official`: minimal-diff EdgeLLM-compatible path for correctness and upstream review.
 - `highperf`: product path for low-latency Qwen3 ASR + Qwen3 TTS dual residency on Jetson Orin.
 
-Jetson Voice consumes these via JSON profiles copied under `configs/profiles/` and the artifact manifest under `deploy/artifacts/qwen3_manifest.json`.
+Jetson Voice consumes these via JSON profiles copied under `configs/profiles/` and the artifact manifest under `deploy/artifacts/qwen3_manifest.json`. `multilanguage-qwen-highperf` targets the Nano artifact set; `multilanguage-qwen-highperf-nx` targets NX-native engines.
 
 ## Contents
 
@@ -38,6 +38,14 @@ In `jetson-voice`, select Qwen3 with:
 
 ```bash
 JETSON_VOICE_PROFILE=multilanguage-qwen-highperf \
+QWEN3_HF_REPO_ID=harvestsu/qwen3-edgellm-jetson-artifacts \
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+On Orin NX, use:
+
+```bash
+JETSON_VOICE_PROFILE=multilanguage-qwen-highperf-nx \
 QWEN3_HF_REPO_ID=harvestsu/qwen3-edgellm-jetson-artifacts \
 docker compose -f deploy/docker-compose.yml up -d
 ```

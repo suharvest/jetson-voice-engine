@@ -12,5 +12,7 @@ __pycache__/
 *.tar.gz
 *.log
 artifacts/
+!deploy/artifacts/
+!deploy/artifacts/qwen3_manifest.json
 models/
 engines/
