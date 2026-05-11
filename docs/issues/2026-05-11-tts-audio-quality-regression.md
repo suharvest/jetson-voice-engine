@@ -222,6 +222,27 @@ will crash with `scales must be provided for FP8 embedding table` — but
 that crash itself becomes useful evidence (proves the FP8 path is the
 one being exercised at the failure point).
 
+## Earlier-session evidence (2026-05-02 hand-off memory)
+
+A prior session on the same codebase (project memory
+`project_trt_edgellm_session_2026_05_02.md`) had already filed the
+"TRT-Edge-LLM C++ runtime produces garbage output" symptom and noted
+the relevant runtime fix locations. Cross-checking those against the
+current `qwen3-tts-highperf-runtime-w8a16` HEAD:
+
+| Earlier finding | File:line | Status on current HEAD |
+|---|---|---|
+| `trackSeenToken` off-by-one — dedup used old token but GPU buffer had new token | `qwen3OmniTTSRuntime.cpp:1110` (was) → `:3585` (now) | Fix appears applied (lambda reads from `mTalkerSelectedIndices` GPU buffer instead of the stale `token` arg), but the function signature still takes `token` as a dead parameter — worth confirming the lambda body is actually correct, not just structurally similar to the fix |
+| `success=true` after generation failure | `qwen3OmniTTSRuntime.cpp:~1054` | NOT verified on current HEAD — matches today's symptom exactly: `audio_complete=true` despite gibberish output |
+| Repetition penalty off-by-one | (filed as upstream issue) | unverified |
+| BF16 builder flag in `builderUtils.cpp:267` (`config->setFlag(kBF16)`) | engine-build code | The HF-published engines were baked elsewhere; whether they include this flag is unknown from the artifact alone |
+
+Two earlier-session statements are not relevant anymore:
+- "CuTe DSL needs CUDA 12.8+" — outdated, repo now ships
+  `cutedsl_aarch64_sm_87_cuda12.tar.gz` prebuilt for Jetson CUDA 12.x
+- "old `qwen3_speech_engine` runtime works with same engines" — that
+  runtime predates this fork; current path is EdgeLLM exclusively.
+
 ## Open questions for the dev agent
 
 1. Were the `orin-nx-highperf-2026-05-11` engines cooked against the FP8
