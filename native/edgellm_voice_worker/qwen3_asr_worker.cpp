@@ -13,6 +13,7 @@
 #include "requestFileParser.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "tokenizer/tokenizer.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -455,10 +456,179 @@ Json buildOneShotRequestForMel(std::string const& melPath, int32_t maxGenerateLe
 struct HopResult
 {
     bool ok{false};
-    std::string text;
+    std::string text;              //!< Legacy: full output from runHop (back-compat).
+    std::string generatedText;     //!< Step 3.1: raw output (excludes prefix) from runStreamingHop.
+    std::string rawDecoded;        //!< Step 3.1: prefix + generatedText.
     double totalMs{0.0};
     StageTimingSnapshot stages{};
 };
+
+// ---------------------------------------------------------------------------
+// Step 3.1: prefix-prompt rollback chunk-and-confirm loop (§15.6 step 3).
+// Mirrors qwen3_asr.py:728-746 (per-hop) / 809-816 (finish variant). Saves
+// ~21ms/hop steady-state by skipping re-decode of confirmed prefix tokens.
+// Requires EdgeLLM Method B fix (system-prompt KV cache mismatch fallback,
+// streaming-asr/m1-append-prefill-embeds@0f618d6) to avoid duplication.
+// ---------------------------------------------------------------------------
+constexpr char const* kAssistantGenPrompt = "<|im_start|>assistant\n";
+constexpr char const* kUtf8Replacement = "\xEF\xBF\xBD";  //!< U+FFFD as UTF-8.
+
+//! Strip a leading "language X<asr_text>" / language prefix from raw output.
+//! Splits on <asr_text> tag when present; otherwise trims "language Xxx ".
+std::string parseAsrText(std::string const& raw)
+{
+    static constexpr char const* kAsrTextTag = "<asr_text>";
+    auto tagPos = raw.find(kAsrTextTag);
+    if (tagPos != std::string::npos)
+    {
+        return raw.substr(tagPos + std::strlen(kAsrTextTag));
+    }
+    if (raw.rfind("language ", 0) == 0)
+    {
+        auto nl = raw.find('\n');
+        if (nl != std::string::npos)
+        {
+            return raw.substr(nl + 1);
+        }
+        auto sp1 = raw.find(' ', 9);
+        if (sp1 != std::string::npos)
+        {
+            auto sp2 = raw.find(' ', sp1 + 1);
+            if (sp2 != std::string::npos)
+            {
+                return raw.substr(sp2 + 1);
+            }
+        }
+    }
+    return raw;
+}
+
+//! Build prefix text from accumulated decoded output via tokenizer roll-back.
+//! Mirrors qwen3_asr.py:728-746 (per-hop) and 809-816 (finish variant).
+std::string computePrefix(AsrSessionState const& session, tokenizer::Tokenizer* tok, bool isFinish)
+{
+    if (tok == nullptr || session.rawDecoded.empty())
+    {
+        return "";
+    }
+    if (session.chunkId < session.unfixedChunkNum)
+    {
+        return "";
+    }
+    auto tokens = tok->encode(session.rawDecoded, /*addBos=*/false, /*addEos=*/false);
+    if (tokens.empty())
+    {
+        return "";
+    }
+    int k = session.unfixedTokenNum;
+    int const total = static_cast<int>(tokens.size());
+    while (true)
+    {
+        int end = total - k;
+        if (isFinish)
+        {
+            end = std::max(1, end);
+        }
+        else
+        {
+            end = std::max(0, end);
+        }
+        std::string prefix;
+        if (end > 0)
+        {
+            std::vector<tokenizer::Rank> slice(tokens.begin(), tokens.begin() + end);
+            prefix = tok->decode(slice, /*skipSpecialTokens=*/false);
+        }
+        if (prefix.find(kUtf8Replacement) == std::string::npos)
+        {
+            return prefix;
+        }
+        if (!isFinish && end == 0)
+        {
+            return "";
+        }
+        if (isFinish && end == 1)
+        {
+            return prefix;
+        }
+        ++k;
+    }
+}
+
+//! Build LLMGenerationRequest from prefix + audio mel and invoke runtime.
+//! Step 3.1 streaming hop: assistant-message-as-prefix trick. Requires
+//! EdgeLLM Method B fix to function correctly across all hop indices.
+HopResult runStreamingHop(std::string const& melPath, std::string const& prefix,
+    AsrSessionState const& session, rt::LLMInferenceSpecDecodeRuntime& runtime,
+    cudaStream_t stream, StageTimingCounters& stageCounters)
+{
+    HopResult result;
+    auto const t0 = std::chrono::steady_clock::now();
+    try
+    {
+        rt::LLMGenerationRequest::Request req;
+
+        rt::Message sysMsg;
+        sysMsg.role = "system";
+        sysMsg.contents.push_back({"text", session.context});
+        req.messages.push_back(sysMsg);
+
+        rt::Message userMsg;
+        userMsg.role = "user";
+        rt::Message::MessageContent audioContent;
+        audioContent.type = "audio";
+        audioContent.content = melPath;
+        userMsg.contents.push_back(audioContent);
+        req.messages.push_back(userMsg);
+
+        std::string assistantContent = kAssistantGenPrompt;
+        if (!session.forceLanguage.empty())
+        {
+            assistantContent += "language " + session.forceLanguage + "<asr_text>";
+        }
+        assistantContent += prefix;
+        rt::Message asstMsg;
+        asstMsg.role = "assistant";
+        asstMsg.contents.push_back({"text", assistantContent});
+        req.messages.push_back(asstMsg);
+
+        rt::audioUtils::AudioData audio;
+        audio.melSpectrogramPath = melPath;
+        audio.melSpectrogramFormat = "safetensors";
+        req.audioBuffers.push_back(std::move(audio));
+
+        rt::LLMGenerationRequest llmReq;
+        llmReq.requests.push_back(std::move(req));
+        llmReq.temperature = 1.0f;
+        llmReq.topP = 1.0f;
+        llmReq.topK = 1;
+        llmReq.maxGenerateLength = session.maxDecodeTokensPerHop;
+        llmReq.applyChatTemplate = true;
+        llmReq.addGenerationPrompt = false;
+        llmReq.enableThinking = false;
+
+        rt::LLMGenerationResponse llmResponse;
+        bool const ok = runtime.handleRequest(llmReq, llmResponse, stream);
+        result.ok = ok;
+        if (ok && !llmResponse.outputTexts.empty())
+        {
+            result.generatedText = llmResponse.outputTexts[0];
+        }
+        result.rawDecoded = prefix + result.generatedText;
+        result.text = result.rawDecoded;  //!< Back-compat for code reading hop.text.
+    }
+    catch (std::exception const& e)
+    {
+        LOG_ERROR("runStreamingHop exception: %s", e.what());
+        result.ok = false;
+        result.generatedText = std::string("hop_exception: ") + e.what();
+        result.rawDecoded = prefix + result.generatedText;
+        result.text = result.rawDecoded;
+    }
+    result.totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    result.stages = captureStageDelta(stageCounters);
+    return result;
+}
 
 HopResult runHop(std::string const& melPath, int32_t maxGenerateLength,
     rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
@@ -694,9 +864,25 @@ void handleChunk(Json const& input, AsrSessionState& session,
     bool const shouldRotate = hasAudioSec && !isLast && wouldOverflow(audioSec);
 
     int32_t const hopId = session.chunkId;
-    HopResult const hop = runHop(melPath, maxGenerateLength, runtime, stream, loraWeightsMap, stageCounters);
+    // Step 3.1 prefix-prompt: compute prefix from prior rawDecoded via
+    // tokenizer rollback, then drive a streaming hop that surfaces the
+    // prefix through the assistant message. Requires EdgeLLM Method B fix.
+    tokenizer::Tokenizer* tok = runtime.getTokenizerForTesting();
+    std::string const prefix = computePrefix(session, tok, /*isFinish=*/isLast);
+    HopResult const hop = runStreamingHop(melPath, prefix, session, runtime, stream, stageCounters);
+    // Silence unused-warning for the legacy runHop path (kept for one-shot
+    // request flows and unused vars from the old call signature).
+    (void) maxGenerateLength;
+    (void) loraWeightsMap;
     session.chunkId += 1;
-    session.rawDecoded = hop.text;
+    if (hop.ok)
+    {
+        session.rawDecoded = hop.rawDecoded;
+    }
+    else
+    {
+        session.rawDecoded = hop.text;
+    }
 
     if (shouldRotate)
     {
