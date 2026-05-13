@@ -17,6 +17,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -35,33 +36,52 @@ struct Args
 };
 
 // ---------------------------------------------------------------------------
-// M2 streaming-ASR session scaffold (design doc §12 milestone 2).
+// M3 streaming-ASR worker (design doc §15 v5.2).
 //
-// M2 introduces session lifecycle (beginAsrSession/endAsrSession) and KV
-// capacity caps in the runtime layer. The worker stays one-shot for now —
-// the event-driven dispatcher lands in M3. M2 only:
-//   1. Declares the single-session state struct + an in-process session table
-//      stub so M3 can plug the begin/chunk/end dispatcher in without further
-//      header churn.
-//   2. Wires the structured KV-capacity error event through, so if a future
-//      runtime->appendPrefillEmbeds call (M3+) returns false with status
-//      kKvCapacityExceeded, the worker emits the explicit
-//      {"event":"error","ok":false,"error":"kv_capacity_exceeded",...} event
-//      instead of the generic "error" string.
+// The worker is now event-driven on stdin. Each line is a JSON object:
 //
-// Idle-session timeout policy (full enforcement lands in M3):
-//   - A session is considered idle when (now - last_activity) > 30 seconds.
-//   - On the next request that touches that session, the worker shall
-//     endAsrSession the stale slot and emit
-//     {"event":"error","ok":false,"error":"session_timeout",...}.
-//   - M2 leaves last_activity bookkeeping wired into the struct; M3 adds the
-//     dispatcher tick that enforces the rule.
+//   {"event":"begin","id":<sid>,"sample_rate":16000,
+//    "chunk_size_sec":0.5,"unfixed_chunk_num":2,"unfixed_token_num":5,
+//    "force_language":null,"context":""}
+//   {"event":"chunk","id":<sid>,"mel":<base64 fp16 mel>,"last":false}
+//   {"event":"end","id":<sid>}
+//
+// Lines with no `event` field hit the legacy one-shot handler — required
+// for byte-equivalent backward compatibility with M2 callers.
+//
+// Single-session worker: a `begin` arriving while another session is active
+// is refused with {"event":"error","error":"session_already_active"}.
 // ---------------------------------------------------------------------------
 struct AsrSessionState
 {
-    std::string sessionId;                                         //!< Stable ID emitted by the client at begin.
-    std::chrono::steady_clock::time_point lastActivity{};          //!< Updated on every chunk/end touching the slot.
-    bool active{false};                                            //!< True between begin and end.
+    std::string sessionId;                                   //!< Stable ID emitted by the client at begin.
+    std::chrono::steady_clock::time_point lastActivity{};    //!< Updated on every chunk/end touching the slot.
+    bool active{false};                                      //!< True between begin and end.
+
+    // §15.1 streaming state — populated at begin.
+    double sampleRate{16000.0};
+    double chunkSizeSec{0.5};
+    int32_t unfixedChunkNum{2};
+    int32_t unfixedTokenNum{5};
+    std::string forceLanguage{};      //!< Empty = no force; e.g. "Chinese".
+    std::string context{};            //!< System-prompt context.
+
+    // Per-hop accumulator: precomputed mel frames stored as concatenated
+    // fp16 bytes. Each chunk-event mel payload is appended verbatim. The
+    // mel tensor shape is [1, mel_bins, T_total]; we track T_total.
+    std::vector<uint8_t> melAccumBytes;
+    int32_t melBins{128};            //!< Mel bin count; locked from first chunk.
+    int32_t melFrames{0};            //!< Cumulative frame count of melAccumBytes.
+
+    // Hop-trigger bookkeeping: number of mel frames at the time of last hop.
+    int32_t melFramesAtLastHop{0};
+
+    // Decoded text state.
+    std::string rawDecoded{};        //!< Mirrors official state._raw_decoded.
+    int32_t chunkId{0};              //!< Hop counter (mirrors official chunk_id).
+
+    // Session-level accumulator for auto-segmentation (Step 4).
+    std::string fullText{};
 };
 
 //! Convenience wrapper: build the structured kv_capacity_exceeded error event
@@ -84,10 +104,6 @@ Json makeKvCapacityErrorEvent(std::string const& id, int32_t kvLength, int32_t c
 }
 
 //! Maps a runtime AppendPrefillStatus to the structured worker-side JSON event.
-//! Returns std::nullopt when the status is kOk (caller emits the normal
-//! response). For M2 the only non-Ok status the worker surfaces is
-//! kKvCapacityExceeded — other failure modes still flow through the generic
-//! error path until M3 plumbs the chunked dispatcher in.
 std::optional<Json> mapAppendStatusToErrorEvent(
     rt::LLMInferenceSpecDecodeRuntime const& runtime, std::string const& id)
 {
@@ -101,10 +117,7 @@ std::optional<Json> mapAppendStatusToErrorEvent(
     case Status::kChunkTooLong:
     case Status::kPreconditionFailed:
     case Status::kPrefillFailed:
-    default:
-        // M3 will expand the structured-error coverage. For now fall through to
-        // the generic error path.
-        return std::nullopt;
+    default: return std::nullopt;
     }
 }
 
@@ -168,6 +181,149 @@ std::filesystem::path writeTempInput(Json const& input, std::string const& id)
     file << input.dump();
     return path;
 }
+
+// ---------------------------------------------------------------------------
+// Step 1 handlers: stub event handlers. The streaming chunk-and-confirm
+// loop lands in step 2 (no-prefix spike) and step 3 (prefix-prompt). For
+// now begin/chunk/end just ACK so the dispatcher contract is testable.
+// ---------------------------------------------------------------------------
+
+void handleBegin(Json const& input, AsrSessionState& session)
+{
+    std::string const id = input.value("id", "");
+    if (session.active)
+    {
+        Json ev = {{"event", "error"}, {"ok", false}, {"error", "session_already_active"}};
+        if (!id.empty())
+        {
+            ev["id"] = id;
+        }
+        std::cout << ev.dump() << std::endl;
+        return;
+    }
+    session = AsrSessionState{};
+    session.sessionId = id;
+    session.active = true;
+    session.lastActivity = std::chrono::steady_clock::now();
+    session.sampleRate = input.value("sample_rate", 16000.0);
+    session.chunkSizeSec = input.value("chunk_size_sec", 0.5);
+    session.unfixedChunkNum = input.value("unfixed_chunk_num", 2);
+    session.unfixedTokenNum = input.value("unfixed_token_num", 5);
+    session.context = input.value("context", std::string{});
+    if (input.contains("force_language") && !input["force_language"].is_null())
+    {
+        session.forceLanguage = input["force_language"].get<std::string>();
+    }
+    Json ev = {{"event", "begin_ack"}, {"id", id}};
+    std::cout << ev.dump() << std::endl;
+}
+
+void handleChunk(Json const& input, AsrSessionState& session)
+{
+    std::string const id = input.value("id", "");
+    if (!session.active)
+    {
+        Json ev = {{"event", "error"}, {"ok", false}, {"error", "no_active_session"}};
+        if (!id.empty())
+        {
+            ev["id"] = id;
+        }
+        std::cout << ev.dump() << std::endl;
+        return;
+    }
+    session.lastActivity = std::chrono::steady_clock::now();
+    Json ev = {{"event", "chunk_ack"}, {"id", id}};
+    std::cout << ev.dump() << std::endl;
+}
+
+void handleEnd(Json const& /*input*/, AsrSessionState& session)
+{
+    std::string const id = session.sessionId;
+    session = AsrSessionState{};
+    Json ev = {{"event", "end_ack"}, {"id", id}};
+    std::cout << ev.dump() << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// One-shot legacy handler. Existing M2 behavior preserved verbatim — only
+// the surrounding main() loop changes. handleOneShot must produce a JSON
+// response byte-equivalent (modulo `total_ms` jitter) to the M2 worker.
+// ---------------------------------------------------------------------------
+void handleOneShot(Json input, rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
+    std::unordered_map<std::string, std::string>& loraWeightsMap)
+{
+    Json response;
+    std::filesystem::path tempPath;
+    auto const requestStart = std::chrono::steady_clock::now();
+    try
+    {
+        std::string const id = input.value("id", "");
+        input.erase("id");
+        int32_t const batchSizeOverride = input.value("batch_size_override", -1);
+        int64_t const maxGenerateLengthOverride = input.value("max_generate_length_override", -1);
+        input.erase("batch_size_override");
+        input.erase("max_generate_length_override");
+
+        tempPath = writeTempInput(input, id);
+        std::vector<rt::LLMGenerationRequest> batchedRequests;
+        std::tie(loraWeightsMap, batchedRequests)
+            = exampleUtils::parseRequestFile(tempPath, batchSizeOverride, maxGenerateLengthOverride);
+        if (batchedRequests.empty())
+        {
+            throw std::runtime_error("No valid ASR requests found");
+        }
+
+        Json responses = Json::array();
+        bool ok = true;
+        for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
+        {
+            rt::LLMGenerationResponse llmResponse;
+            bool const requestOk = runtime.handleRequest(batchedRequests[requestIdx], llmResponse, stream);
+            ok = ok && requestOk;
+            for (size_t batchIdx = 0; batchIdx < batchedRequests[requestIdx].requests.size(); ++batchIdx)
+            {
+                bool const hasOutputText = requestOk && batchIdx < llmResponse.outputTexts.size();
+                std::string const text = hasOutputText
+                    ? llmResponse.outputTexts[batchIdx]
+                    : "TensorRT Edge LLM cannot handle this request. Fails.";
+                responses.push_back(Json{
+                    {"request_idx", requestIdx}, {"batch_idx", batchIdx}, {"output_text", text}});
+            }
+        }
+        double const totalMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
+        if (!ok)
+        {
+            if (auto structuredEv = mapAppendStatusToErrorEvent(runtime, id))
+            {
+                Json ev = std::move(*structuredEv);
+                ev["total_ms"] = totalMs;
+                response = std::move(ev);
+            }
+            else
+            {
+                response = Json{{"id", id}, {"event", "error"}, {"ok", false}, {"responses", responses},
+                    {"total_ms", totalMs}};
+            }
+        }
+        else
+        {
+            response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
+                {"total_ms", totalMs}};
+        }
+    }
+    catch (std::exception const& e)
+    {
+        response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}};
+    }
+    if (!tempPath.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(tempPath, ec);
+    }
+    std::cout << response.dump() << std::endl;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -198,11 +354,8 @@ int main(int argc, char** argv)
     double const initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
     std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
 
-    // M2 session table stub. M2 worker is still one-shot, so this map stays
-    // empty in the M2 build — M3 populates it from {"event":"begin"} /
-    // {"event":"chunk"} / {"event":"end"} messages on stdin.
-    std::unordered_map<std::string, AsrSessionState> sessions;
-    (void) sessions; // suppress -Wunused until M3 wires the dispatcher.
+    // Single-session worker per §15.6. Multi-session is out of scope for P0.
+    AsrSessionState session;
 
     std::string line;
     while (std::getline(std::cin, line))
@@ -212,83 +365,48 @@ int main(int argc, char** argv)
             continue;
         }
 
-        Json response;
-        std::filesystem::path tempPath;
-        auto const requestStart = std::chrono::steady_clock::now();
+        Json parsed;
         try
         {
-            Json input = Json::parse(line);
-            std::string const id = input.value("id", "");
-            input.erase("id");
-            int32_t const batchSizeOverride = input.value("batch_size_override", -1);
-            int64_t const maxGenerateLengthOverride = input.value("max_generate_length_override", -1);
-            input.erase("batch_size_override");
-            input.erase("max_generate_length_override");
-
-            tempPath = writeTempInput(input, id);
-            std::vector<rt::LLMGenerationRequest> batchedRequests;
-            std::tie(loraWeightsMap, batchedRequests)
-                = exampleUtils::parseRequestFile(tempPath, batchSizeOverride, maxGenerateLengthOverride);
-            if (batchedRequests.empty())
-            {
-                throw std::runtime_error("No valid ASR requests found");
-            }
-
-            Json responses = Json::array();
-            bool ok = true;
-            for (size_t requestIdx = 0; requestIdx < batchedRequests.size(); ++requestIdx)
-            {
-                rt::LLMGenerationResponse llmResponse;
-                bool const requestOk = runtime->handleRequest(batchedRequests[requestIdx], llmResponse, stream);
-                ok = ok && requestOk;
-                for (size_t batchIdx = 0; batchIdx < batchedRequests[requestIdx].requests.size(); ++batchIdx)
-                {
-                    bool const hasOutputText = requestOk && batchIdx < llmResponse.outputTexts.size();
-                    std::string const text
-                        = hasOutputText ? llmResponse.outputTexts[batchIdx] : "TensorRT Edge LLM cannot handle this request. Fails.";
-                    responses.push_back(Json{{"request_idx", requestIdx},
-                        {"batch_idx", batchIdx},
-                        {"output_text", text}});
-                }
-            }
-            double const totalMs
-                = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
-            // M2: if the underlying runtime tagged the failure with a streaming
-            // status code (currently only kKvCapacityExceeded propagates),
-            // emit the structured event instead of the generic "error" string.
-            // For M2 handleRequest never sets the append status, so this
-            // branch is dead code at runtime — but the wiring is here so M3
-            // can plug appendPrefillEmbeds straight in.
-            if (!ok)
-            {
-                if (auto structuredEv = mapAppendStatusToErrorEvent(*runtime, id))
-                {
-                    Json ev = std::move(*structuredEv);
-                    ev["total_ms"] = totalMs;
-                    response = std::move(ev);
-                }
-                else
-                {
-                    response = Json{{"id", id}, {"event", "error"}, {"ok", false}, {"responses", responses},
-                        {"total_ms", totalMs}};
-                }
-            }
-            else
-            {
-                response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
-                    {"total_ms", totalMs}};
-            }
+            parsed = Json::parse(line);
         }
         catch (std::exception const& e)
         {
-            response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}};
+            Json err = {{"event", "error"}, {"ok", false}, {"error", std::string("json_parse_failed: ") + e.what()}};
+            std::cout << err.dump() << std::endl;
+            continue;
         }
-        if (!tempPath.empty())
+
+        if (!parsed.contains("event"))
         {
-            std::error_code ec;
-            std::filesystem::remove(tempPath, ec);
+            // Backward-compat one-shot: any line that omits `event` flows through
+            // the M2 legacy path. handleRequest behavior unchanged.
+            handleOneShot(std::move(parsed), *runtime, stream, loraWeightsMap);
+            continue;
         }
-        std::cout << response.dump() << std::endl;
+
+        std::string const event = parsed.value("event", "");
+        if (event == "begin")
+        {
+            handleBegin(parsed, session);
+        }
+        else if (event == "chunk")
+        {
+            handleChunk(parsed, session);
+        }
+        else if (event == "end")
+        {
+            handleEnd(parsed, session);
+        }
+        else
+        {
+            Json err = {{"event", "error"}, {"ok", false}, {"error", "unknown_event"}};
+            if (parsed.contains("id"))
+            {
+                err["id"] = parsed["id"];
+            }
+            std::cout << err.dump() << std::endl;
+        }
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));
