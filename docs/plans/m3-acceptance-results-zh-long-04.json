@@ -1,0 +1,175 @@
+{
+  "scenarios": {
+    "A_oneshot": {
+      "ok": true,
+      "text": "今天天气真好。",
+      "raw_keys": [
+        "event",
+        "id",
+        "ok",
+        "responses",
+        "total_ms"
+      ],
+      "response": {
+        "event": "done",
+        "id": "afcd7065423b4577b30042c8906a571b",
+        "ok": true,
+        "responses": [
+          {
+            "batch_idx": 0,
+            "output_text": "language Chinese今天天气真好。",
+            "request_idx": 0
+          }
+        ],
+        "total_ms": 1039.092477
+      }
+    },
+    "B_streaming": {
+      "duration_s": 2.64,
+      "n_hops": 6,
+      "rotations": 0,
+      "final": {
+        "decode_ms": 124.5479965209961,
+        "elapsed_ms": 156.437445,
+        "encoder_ms": 9.34563159942627,
+        "event": "final",
+        "hop_id": 5,
+        "id": "scen_b_4b61ae",
+        "ok": true,
+        "prefill_ms": 18.302623748779297,
+        "segment_count": 1,
+        "text": "今天天气真好。",
+        "total_ms": 156.437445
+      },
+      "end_latency_ms": 157.03765605576336,
+      "text": "今天天气真好。",
+      "lcs_vs_baseline": 1.0
+    },
+    "C_latency": {
+      "runs_ms": [
+        157.6909248251468
+      ],
+      "median_ms": 157.6909248251468,
+      "p95_ms": 157.6909248251468,
+      "min_ms": 157.6909248251468,
+      "max_ms": 157.6909248251468
+    },
+    "D_autosegment": {
+      "duration_s": 12.9,
+      "rotations": 1,
+      "final": {
+        "decode_ms": 284.2253112792969,
+        "elapsed_ms": 372.552486,
+        "encoder_ms": 20.331071853637695,
+        "event": "final",
+        "hop_id": 11,
+        "id": "scen_d_2d718b",
+        "ok": true,
+        "prefill_ms": 58.577056884765625,
+        "segment_count": 2,
+        "text": "科学家们可以得出结论：暗物质对其他暗物质的影响。其他物质的影响方式与普通物质相同。",
+        "total_ms": 372.552486
+      },
+      "text": "科学家们可以得出结论：暗物质对其他暗物质的影响。其他物质的影响方式与普通物质相同。",
+      "segment_count": 2,
+      "lcs_vs_long_baseline": null,
+      "lcs_vs_baseline_x2": 0.04878048780487805,
+      "lcs_vs_baseline_x1": 0.024390243902439025,
+      "long_baseline_text": null,
+      "lcs_vs_curated_gt": 0.7804878048780488,
+      "curated_ground_truth": "科学家们可以得出结论，暗物质对其他暗物质的影响方式与普通物质相同。",
+      "lcs_best": 0.7804878048780488
+    },
+    "E_errors": {
+      "malformed_json": {
+        "got": {
+          "error": "json_parse_failed: [json.exception.parse_error.101] parse error at line 1, column 3: syntax error while parsing object key - invalid literal; last read: '{th'; expected string literal",
+          "event": "error",
+          "ok": false
+        },
+        "ok": true
+      },
+      "unknown_event": {
+        "got": {
+          "error": "unknown_event",
+          "event": "error",
+          "id": "e2",
+          "ok": false,
+          "received": "unknown_thing"
+        },
+        "ok": true
+      },
+      "chunk_too_long": {
+        "got": {
+          "chunk_sec": 8.0,
+          "error": "chunk_too_long",
+          "event": "error",
+          "id": "e3",
+          "limit_sec": 7.0,
+          "ok": false
+        },
+        "ok": true
+      },
+      "session_cleared_after_error": {
+        "got": {
+          "error": "no_active_session",
+          "event": "error",
+          "id": "e3",
+          "ok": false
+        },
+        "ok": true
+      }
+    },
+    "F_pcm_streaming": {
+      "duration_s": 2.64,
+      "n_hops": 6,
+      "rotations": 0,
+      "final": {
+        "decode_ms": 121.0198974609375,
+        "elapsed_ms": 151.083646,
+        "encoder_ms": 9.104607582092285,
+        "event": "final",
+        "hop_id": 5,
+        "id": "scen_f_85f226",
+        "ok": true,
+        "prefill_ms": 17.14022445678711,
+        "segment_count": 1,
+        "text": "今天天气真好。",
+        "total_ms": 151.083646
+      },
+      "end_latency_ms": 248.68845287710428,
+      "text": "今天天气真好。",
+      "lcs_vs_baseline_B": 1.0,
+      "lcs_vs_baseline_A": 1.0
+    }
+  },
+  "gates": {
+    "A_oneshot_ok": true,
+    "B_lcs_ge_0.95": true,
+    "C_median_le_500ms": true,
+    "C_p95_le_1000ms": true,
+    "D_one_final": true,
+    "D_at_least_one_segment_rotation": true,
+    "D_lcs_ge_0.90_soft": false,
+    "E_malformed_json_handled": true,
+    "E_unknown_event_handled": true,
+    "E_chunk_too_long_handled": true,
+    "E_session_cleared_after_error": true,
+    "F_pcm_lcs_ge_0.95": true
+  },
+  "hard_gates": {
+    "A_oneshot_ok": true,
+    "B_lcs_ge_0.95": true,
+    "C_median_le_500ms": true,
+    "C_p95_le_1000ms": true,
+    "D_one_final": true,
+    "D_at_least_one_segment_rotation": true,
+    "E_malformed_json_handled": true,
+    "E_unknown_event_handled": true,
+    "E_chunk_too_long_handled": true,
+    "E_session_cleared_after_error": true,
+    "F_pcm_lcs_ge_0.95": true
+  },
+  "all_hard_gates_passed": true,
+  "all_gates_passed": false
+}

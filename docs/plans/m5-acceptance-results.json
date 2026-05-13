@@ -1,0 +1,147 @@
+{
+  "per_prompt": {
+    "p1": {
+      "wav": "docs/audio-evidence/nx-loopback-pass-p1-2026-05-11.wav",
+      "ground_truth": "今天天气真好。",
+      "duration_s": 2.64,
+      "clipped_s": 2.64,
+      "A_oneshot": {
+        "text": "今天天气真好。",
+        "ok": true
+      },
+      "B_streaming_mel": {
+        "text": "今天天气真好。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 151.50159504264593,
+        "n_hops": 6,
+        "rotations": 0
+      },
+      "F_streaming_pcm": {
+        "text": "今天天气真好。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 246.32675293833017,
+        "n_hops": 6,
+        "rotations": 0
+      },
+      "C_latency": {
+        "runs_ms": [
+          151.50159504264593,
+          152.0095479208976,
+          151.6863377764821,
+          152.37413719296455,
+          151.8067589495331
+        ],
+        "median_ms": 151.8067589495331,
+        "p95_ms": 152.30121933855116,
+        "min_ms": 151.50159504264593,
+        "max_ms": 152.37413719296455
+      }
+    },
+    "p2": {
+      "wav": "docs/audio-evidence/nx-loopback-pass-p2-2026-05-11.wav",
+      "ground_truth": "人工智能改变了世界。",
+      "duration_s": 2.64,
+      "clipped_s": 2.64,
+      "A_oneshot": {
+        "text": "人工智能改变了世界。",
+        "ok": true
+      },
+      "B_streaming_mel": {
+        "text": "人工智能改变了世界。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 136.671531945467,
+        "n_hops": 6,
+        "rotations": 0
+      },
+      "F_streaming_pcm": {
+        "text": "人工智能改变了世界。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 233.97340904921293,
+        "n_hops": 6,
+        "rotations": 0
+      },
+      "C_latency": {
+        "runs_ms": [
+          136.671531945467,
+          136.6448439657688,
+          136.456327047199,
+          138.38553987443447,
+          142.86129595711827
+        ],
+        "median_ms": 136.671531945467,
+        "p95_ms": 141.9661447405815,
+        "min_ms": 136.456327047199,
+        "max_ms": 142.86129595711827
+      }
+    },
+    "p3": {
+      "wav": "docs/audio-evidence/nx-loopback-pass-p3-2026-05-11.wav",
+      "ground_truth": "一二三四五六七八九十。",
+      "duration_s": 3.2,
+      "clipped_s": 3.2,
+      "A_oneshot": {
+        "text": "一二三四五六七八九十。",
+        "ok": true
+      },
+      "B_streaming_mel": {
+        "text": "一二三四五六七八九十。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 168.39938098564744,
+        "n_hops": 7,
+        "rotations": 0
+      },
+      "F_streaming_pcm": {
+        "text": "一二三四五六七八九十。",
+        "lcs_vs_baseline": 1.0,
+        "end_latency_ms": 282.7528698835522,
+        "n_hops": 7,
+        "rotations": 0
+      },
+      "C_latency": {
+        "runs_ms": [
+          168.39938098564744,
+          167.9518159944564,
+          169.00749783962965,
+          169.11937505938113,
+          169.3725660443306
+        ],
+        "median_ms": 169.00749783962965,
+        "p95_ms": 169.3219278473407,
+        "min_ms": 167.9518159944564,
+        "max_ms": 169.3725660443306
+      }
+    }
+  },
+  "gates": {
+    "by_prompt": {
+      "p1": {
+        "A_ok": true,
+        "B_lcs_ge_0.95": true,
+        "C_median_le_500ms": true,
+        "C_p95_le_1000ms": true,
+        "F_lcs_ge_0.95": true
+      },
+      "p2": {
+        "A_ok": true,
+        "B_lcs_ge_0.95": true,
+        "C_median_le_500ms": true,
+        "C_p95_le_1000ms": true,
+        "F_lcs_ge_0.95": true
+      },
+      "p3": {
+        "A_ok": true,
+        "B_lcs_ge_0.95": true,
+        "C_median_le_500ms": true,
+        "C_p95_le_1000ms": true,
+        "F_lcs_ge_0.95": true
+      }
+    },
+    "all_pass": true
+  },
+  "settings": {
+    "lcs_gate": 0.95,
+    "median_gate_ms": 500.0,
+    "p95_gate_ms": 1000.0,
+    "latency_runs": 5
+  }
+}
