@@ -82,7 +82,11 @@ constexpr int32_t kPromptOverheadTokens = 32;
 constexpr int32_t kAudioBosEosTokens = 2;
 constexpr int32_t kInputSafetyMargin = 8;
 constexpr double kAudioTokensPerSec = 13.0;
-constexpr double kSingleChunkHardLimitSec = 5.0;   //!< Refuse if any single chunk's audio_sec exceeds this.
+//! Hard refuse if any single chunk's audio_sec exceeds this. Set above the
+//! per-hop cap so auto-segmentation has a window to fire first. Engine math:
+//! audio cap = (128 - 8 - 32 - 2) / 13 ≈ 6.6 s; we hard-refuse at 7.0 s to
+//! leave a small margin and reserve 5.0–6.6 s for the auto-segment path.
+constexpr double kSingleChunkHardLimitSec = 7.0;
 constexpr double kCarryoverSec = 1.0;              //!< Segment boundary keeps last N seconds of audio.
 constexpr int64_t kIdleTimeoutMs = 30000;          //!< Force-close session after this much inactivity.
 
