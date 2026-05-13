@@ -986,6 +986,19 @@ changes.
 
 ### 15.1 Mechanism
 
+> **Status update (2026-05-13)**: Prefix-prompt inner loop (the
+> `prefix_text = tokenizer.decode(tokens[:-K])` branch below) was
+> experimentally validated as fragile under Qwen3-ASR-0.6B in the
+> EdgeLLM backend. Both literal injection (step 3) and chat-template
+> reformulation (step 3.1) regressed LCS-similarity from 1.0 to 0.857.
+> Codex + empirical evidence confirms this is a mechanism-intrinsic
+> OOD issue with the 0.6B model, not fixable in the worker layer.
+> **P0 production worker** uses the **step 2 mechanism** — full
+> re-decode each hop, no prefix prompt. Prefix prompt is deferred to
+> P1 (requires either a larger ASR model or a fine-tune on partial-
+> prefix continuations). The §15.5.2 auto-segmentation policy and the
+> §15.5.1 `max_input_len` enforcement remain in P0.
+
 Per streaming session:
 
 ```
