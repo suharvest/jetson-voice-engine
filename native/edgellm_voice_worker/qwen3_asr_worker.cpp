@@ -117,6 +117,7 @@ struct AsrSessionState
     double chunkSizeSec{0.5};
     int32_t unfixedChunkNum{2};
     int32_t unfixedTokenNum{5};
+    int32_t maxDecodeTokensPerHop{64};   //!< Max new tokens per streaming hop (mirrors official).
     std::string forceLanguage{};      //!< Empty = no force; e.g. "Chinese".
     std::string context{};            //!< System-prompt context.
 
