@@ -18,10 +18,15 @@
 #include <getopt.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <optional>
+#include <poll.h>
 #include <string>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -38,15 +43,28 @@ struct Args
 };
 
 // ---------------------------------------------------------------------------
-// M3 streaming-ASR worker (design doc §15 v5.2).
+// M3 streaming-ASR worker (design doc §15 v5.3 — step 2 mechanism + step 4
+// max_input_len enforcement + transparent auto-segmentation + cleanup).
 //
-// The worker is now event-driven on stdin. Each line is a JSON object:
+// The worker is event-driven on stdin. Each line is a JSON object:
 //
 //   {"event":"begin","id":<sid>,"sample_rate":16000,
 //    "chunk_size_sec":0.5,"unfixed_chunk_num":2,"unfixed_token_num":5,
 //    "force_language":null,"context":""}
-//   {"event":"chunk","id":<sid>,"mel_path":<path to fp16 mel safetensors>,"last":false}
+//   {"event":"chunk","id":<sid>,"mel_path":<path>,"audio_sec":<float>,"last":false}
 //   {"event":"end","id":<sid>}
+//
+// Per design §15.5.2, when projected per-hop input length would exceed the
+// thinker engine's max_input_len, the worker transparently rotates the
+// session: decodes the current mel as a segment, appends its text to a
+// session-level fullText accumulator, emits a `segment_rotation` event
+// (driver MUST trim audio_accum to last `carryover_sec` and continue), and
+// resets internal hop state. The client sees exactly ONE `final` event at
+// end-of-stream, carrying the concatenation of all segment texts.
+//
+// `audio_sec` on `chunk` events is REQUIRED for cumulative-mel callers that
+// want auto-segmentation; when absent, behavior reduces to step 2 spike
+// (no enforcement, hop-id increments forever).
 //
 // Lines with no `event` field hit the legacy one-shot handler — required
 // for byte-equivalent backward compatibility with M2 callers.
@@ -54,6 +72,31 @@ struct Args
 // Single-session worker: a `begin` arriving while another session is active
 // is refused with {"event":"error","error":"session_already_active"}.
 // ---------------------------------------------------------------------------
+
+// §15.5.1 — engine cap is max_input_len=128. Per-hop input budget breakdown
+// (audio_tokens + prompt_overhead + audio_bos/eos). 13 audio tokens/s is the
+// Spike A measurement. Prompt overhead ~32 tokens for the highperf chat
+// template. Reserve 8 tokens as safety margin.
+constexpr int32_t kEngineMaxInputLen = 128;
+constexpr int32_t kPromptOverheadTokens = 32;
+constexpr int32_t kAudioBosEosTokens = 2;
+constexpr int32_t kInputSafetyMargin = 8;
+constexpr double kAudioTokensPerSec = 13.0;
+constexpr double kSingleChunkHardLimitSec = 5.0;   //!< Refuse if any single chunk's audio_sec exceeds this.
+constexpr double kCarryoverSec = 1.0;              //!< Segment boundary keeps last N seconds of audio.
+constexpr int64_t kIdleTimeoutMs = 30000;          //!< Force-close session after this much inactivity.
+
+inline int32_t projectInputTokens(double audioSec)
+{
+    auto const audioTokens = static_cast<int32_t>(std::ceil(audioSec * kAudioTokensPerSec));
+    return audioTokens + kPromptOverheadTokens + kAudioBosEosTokens;
+}
+
+inline bool wouldOverflow(double audioSec)
+{
+    return projectInputTokens(audioSec) > (kEngineMaxInputLen - kInputSafetyMargin);
+}
+
 struct AsrSessionState
 {
     std::string sessionId;                                   //!< Stable ID emitted by the client at begin.
@@ -84,7 +127,20 @@ struct AsrSessionState
 
     // Session-level accumulator for auto-segmentation (Step 4).
     std::string fullText{};
+
+    // Audio seconds in the most-recent chunk's mel (driver-reported). Used
+    // for max_input_len enforcement and the auto-segmentation projection.
+    double lastAudioSec{0.0};
+    // Number of internal segment rotations during this session (debug only).
+    int32_t segmentCount{0};
 };
+
+//! Reset session to inactive state and clear all accumulators. Used by both
+//! the normal end-of-session path and every error-cleanup path (§15.6 step 4).
+void freeSession(AsrSessionState& session)
+{
+    session = AsrSessionState{};
+}
 
 //! Convenience wrapper: build the structured kv_capacity_exceeded error event
 //! the design doc §12 milestone 2 calls for. M3 routes through this when the
@@ -345,7 +401,34 @@ void handleBegin(Json const& input, AsrSessionState& session)
     std::cout << ev.dump() << std::endl;
 }
 
-// SPIKE — replaced in step 3.
+//! Strip "language Chinese " / "language English " etc. prefixes that the
+//! ASR model adds. Mirror of the spike test driver helper. Applied before
+//! concatenating segment texts so the fullText output reads naturally.
+std::string stripLanguagePrefix(std::string const& text)
+{
+    static char const* kPrefix = "language ";
+    if (text.compare(0, std::strlen(kPrefix), kPrefix) != 0)
+    {
+        return text;
+    }
+    static char const* kLangs[] = {"Chinese", "English", "Cantonese", "Japanese", "Korean",
+        "French", "German", "Italian", "Portuguese", "Russian", "Spanish"};
+    for (auto const* lang : kLangs)
+    {
+        std::string const probe = std::string(kPrefix) + lang;
+        if (text.compare(0, probe.size(), probe) == 0)
+        {
+            size_t off = probe.size();
+            while (off < text.size() && (text[off] == ' ' || text[off] == '\t' || text[off] == '\n'))
+            {
+                ++off;
+            }
+            return text.substr(off);
+        }
+    }
+    return text;
+}
+
 void handleChunk(Json const& input, AsrSessionState& session,
     rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
     std::unordered_map<std::string, std::string>& loraWeightsMap,
@@ -366,24 +449,78 @@ void handleChunk(Json const& input, AsrSessionState& session,
     {
         Json ev = {{"event", "error"}, {"ok", false}, {"error", "chunk_missing_mel_path"}, {"id", id}};
         std::cout << ev.dump() << std::endl;
+        freeSession(session);
         return;
     }
 
     std::string const melPath = input["mel_path"].get<std::string>();
     bool const isLast = input.value("last", false);
+    // audio_sec is OPTIONAL for backward compat with step 2 spike (which omits
+    // it and treats the worker as a stateless cumulative-mel decoder). When
+    // present, drives the max_input_len cap + auto-segmentation policy.
+    bool const hasAudioSec = input.contains("audio_sec") && input["audio_sec"].is_number();
+    double const audioSec = hasAudioSec ? input["audio_sec"].get<double>() : 0.0;
     session.lastActivity = std::chrono::steady_clock::now();
+    session.lastAudioSec = audioSec;
+
+    // §15.6 step 4 — hard refuse: pathological chunk longer than the engine
+    // can ever handle in a single hop. Audio_sec=0 path (spike compat) skips
+    // this entirely.
+    if (hasAudioSec && audioSec > kSingleChunkHardLimitSec)
+    {
+        Json ev = {{"event", "error"}, {"ok", false}, {"error", "chunk_too_long"},
+            {"id", id}, {"chunk_sec", audioSec}, {"limit_sec", kSingleChunkHardLimitSec}};
+        std::cout << ev.dump() << std::endl;
+        freeSession(session);
+        return;
+    }
+
+    // §15.6 step 4 — auto-segmentation: if running this hop would push input
+    // tokens past the engine cap, run the hop as a segment-final FIRST, save
+    // its text to fullText, then signal the driver to rotate and continue.
+    // We only auto-segment when audio_sec is provided AND this is NOT the
+    // last chunk (last=true always runs the final hop and emits final).
+    bool const shouldRotate = hasAudioSec && !isLast && wouldOverflow(audioSec);
 
     int32_t const hopId = session.chunkId;
     HopResult const hop = runHop(melPath, maxGenerateLength, runtime, stream, loraWeightsMap, stageCounters);
     session.chunkId += 1;
     session.rawDecoded = hop.text;
 
+    if (shouldRotate)
+    {
+        // Append this segment's text and rotate. Strip language prefix so
+        // segment texts concatenate cleanly.
+        std::string segText = stripLanguagePrefix(hop.text);
+        session.fullText += segText;
+        session.segmentCount += 1;
+        session.chunkId = 0;
+        session.rawDecoded.clear();
+        // Emit the rotation signal — driver MUST trim its audio buffer to
+        // the last `carryover_sec` and continue sending cumulative mels
+        // starting from there. NOT exposed as a partial/final.
+        Json ev = {
+            {"event", "segment_rotation"},
+            {"id", id},
+            {"segment_id", session.segmentCount - 1},
+            {"carryover_sec", kCarryoverSec},
+            {"projected_tokens", projectInputTokens(audioSec)},
+            {"cap_tokens", kEngineMaxInputLen - kInputSafetyMargin},
+            {"segment_text", segText},
+            {"elapsed_ms", hop.totalMs},
+            {"encoder_ms", hop.stages.encoderMs},
+            {"prefill_ms", hop.stages.prefillMs},
+            {"decode_ms", hop.stages.decodeMs},
+        };
+        std::cout << ev.dump() << std::endl;
+        return;
+    }
+
     Json ev = {
         {"event", isLast ? "final" : "partial"},
         {"id", id},
         {"hop_id", hopId},
         {"ok", hop.ok},
-        {"text", hop.text},
         {"elapsed_ms", hop.totalMs},
         {"encoder_ms", hop.stages.encoderMs},
         {"prefill_ms", hop.stages.prefillMs},
@@ -391,27 +528,42 @@ void handleChunk(Json const& input, AsrSessionState& session,
     };
     if (isLast)
     {
+        // Build final text = concatenated segments + this final hop.
+        std::string segText = stripLanguagePrefix(hop.text);
+        std::string finalText = session.fullText + segText;
+        ev["text"] = finalText;
+        ev["segment_count"] = session.segmentCount + 1;
         ev["total_ms"] = hop.totalMs;
         std::cout << ev.dump() << std::endl;
-        // Free session.
-        session = AsrSessionState{};
+        freeSession(session);
         return;
     }
+    // Partial: keep the raw (with language prefix) for parity with step 2 spike.
+    ev["text"] = hop.text;
     std::cout << ev.dump() << std::endl;
 }
 
-// SPIKE — replaced in step 3.
 void handleEnd(Json const& /*input*/, AsrSessionState& session,
     rt::LLMInferenceSpecDecodeRuntime& /*runtime*/, cudaStream_t /*stream*/,
     std::unordered_map<std::string, std::string>& /*loraWeightsMap*/,
     StageTimingCounters& /*stageCounters*/, int32_t /*maxGenerateLength*/)
 {
     std::string const id = session.sessionId;
-    // Spike contract: the driver flags the final hop via last=true on a chunk
-    // event. Bare `end` events just close the session.
-    session = AsrSessionState{};
-    Json ev = {{"event", "end_ack"}, {"id", id}};
-    std::cout << ev.dump() << std::endl;
+    // The driver flags the final hop via last=true on a chunk event (which
+    // emits the `final` event there). Bare `end` events emit a `final` with
+    // whatever fullText we have accumulated and close the session.
+    if (session.active && (!session.fullText.empty() || session.segmentCount > 0))
+    {
+        Json ev = {{"event", "final"}, {"id", id}, {"text", session.fullText},
+            {"segment_count", session.segmentCount}, {"ok", true}};
+        std::cout << ev.dump() << std::endl;
+    }
+    else
+    {
+        Json ev = {{"event", "end_ack"}, {"id", id}};
+        std::cout << ev.dump() << std::endl;
+    }
+    freeSession(session);
 }
 
 // ---------------------------------------------------------------------------
@@ -534,56 +686,127 @@ int main(int argc, char** argv)
     // SPIKE — per-hop decode budget. Generous default; driver controls hop cadence.
     int32_t const spikeMaxGenerateLength = 200;
 
-    std::string line;
-    while (std::getline(std::cin, line))
+    // Streaming worker stdin loop. Use poll() with 1 s timeout so we can fire
+    // a per-session idle-timeout check between events (§15.6 step 4).
+    auto const checkIdleTimeout = [&session]() {
+        if (!session.active)
+        {
+            return;
+        }
+        auto const now = std::chrono::steady_clock::now();
+        auto const idleMs
+            = std::chrono::duration_cast<std::chrono::milliseconds>(now - session.lastActivity).count();
+        if (idleMs > kIdleTimeoutMs)
+        {
+            std::string const sid = session.sessionId;
+            freeSession(session);
+            Json ev = {{"event", "timeout"}, {"id", sid}, {"idle_ms", idleMs}};
+            std::cout << ev.dump() << std::endl;
+        }
+    };
+
+    std::string buffer;
+    char readBuf[4096];
+    bool eof = false;
+    while (!eof)
     {
-        if (line.empty())
+        struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+        int const pr = ::poll(&pfd, 1, 1000);
+        if (pr < 0)
         {
-            continue;
-        }
-
-        Json parsed;
-        try
-        {
-            parsed = Json::parse(line);
-        }
-        catch (std::exception const& e)
-        {
-            Json err = {{"event", "error"}, {"ok", false}, {"error", std::string("json_parse_failed: ") + e.what()}};
-            std::cout << err.dump() << std::endl;
-            continue;
-        }
-
-        if (!parsed.contains("event"))
-        {
-            // Backward-compat one-shot: any line that omits `event` flows through
-            // the M2 legacy path. handleRequest behavior unchanged.
-            handleOneShot(std::move(parsed), *runtime, stream, loraWeightsMap);
-            continue;
-        }
-
-        std::string const event = parsed.value("event", "");
-        if (event == "begin")
-        {
-            handleBegin(parsed, session);
-        }
-        else if (event == "chunk")
-        {
-            handleChunk(parsed, session, *runtime, stream, loraWeightsMap, stageCounters, spikeMaxGenerateLength);
-        }
-        else if (event == "end")
-        {
-            handleEnd(parsed, session, *runtime, stream, loraWeightsMap, stageCounters, spikeMaxGenerateLength);
-        }
-        else
-        {
-            Json err = {{"event", "error"}, {"ok", false}, {"error", "unknown_event"}};
-            if (parsed.contains("id"))
+            if (errno == EINTR)
             {
-                err["id"] = parsed["id"];
+                continue;
             }
-            std::cout << err.dump() << std::endl;
+            LOG_ERROR("poll() failed: %s", std::strerror(errno));
+            break;
         }
+        if (pr == 0)
+        {
+            checkIdleTimeout();
+            continue;
+        }
+        if (pfd.revents & (POLLIN | POLLHUP))
+        {
+            auto const n = ::read(STDIN_FILENO, readBuf, sizeof(readBuf));
+            if (n <= 0)
+            {
+                eof = true;
+                break;
+            }
+            buffer.append(readBuf, static_cast<size_t>(n));
+        }
+        // Process whole lines accumulated in the buffer.
+        size_t pos;
+        while ((pos = buffer.find('\n')) != std::string::npos)
+        {
+            std::string const line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (line.empty())
+            {
+                continue;
+            }
+
+            Json parsed;
+            try
+            {
+                parsed = Json::parse(line);
+            }
+            catch (std::exception const& e)
+            {
+                Json err = {{"event", "error"}, {"ok", false},
+                    {"error", std::string("json_parse_failed: ") + e.what()}};
+                std::cout << err.dump() << std::endl;
+                // Drop any active session on malformed input — protects against
+                // a stuck client locking the worker.
+                if (session.active)
+                {
+                    freeSession(session);
+                }
+                continue;
+            }
+
+            if (!parsed.contains("event"))
+            {
+                // Backward-compat one-shot: any line that omits `event` flows
+                // through the M2 legacy path. handleRequest behavior unchanged.
+                handleOneShot(std::move(parsed), *runtime, stream, loraWeightsMap);
+                continue;
+            }
+
+            std::string const event = parsed.value("event", "");
+            if (event == "begin")
+            {
+                handleBegin(parsed, session);
+            }
+            else if (event == "chunk")
+            {
+                handleChunk(parsed, session, *runtime, stream, loraWeightsMap, stageCounters,
+                    spikeMaxGenerateLength);
+            }
+            else if (event == "end")
+            {
+                handleEnd(parsed, session, *runtime, stream, loraWeightsMap, stageCounters,
+                    spikeMaxGenerateLength);
+            }
+            else
+            {
+                Json err = {{"event", "error"}, {"ok", false}, {"error", "unknown_event"},
+                    {"received", event}};
+                if (parsed.contains("id"))
+                {
+                    err["id"] = parsed["id"];
+                }
+                std::cout << err.dump() << std::endl;
+                // Unknown event: free any active session for hygiene per §15.6
+                // step 4 error-path cleanup contract.
+                if (session.active)
+                {
+                    freeSession(session);
+                }
+            }
+        }
+        checkIdleTimeout();
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));
