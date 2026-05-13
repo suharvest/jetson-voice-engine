@@ -17,6 +17,7 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -32,6 +33,80 @@ struct Args
     std::string multimodalEngineDir;
     bool debug{false};
 };
+
+// ---------------------------------------------------------------------------
+// M2 streaming-ASR session scaffold (design doc §12 milestone 2).
+//
+// M2 introduces session lifecycle (beginAsrSession/endAsrSession) and KV
+// capacity caps in the runtime layer. The worker stays one-shot for now —
+// the event-driven dispatcher lands in M3. M2 only:
+//   1. Declares the single-session state struct + an in-process session table
+//      stub so M3 can plug the begin/chunk/end dispatcher in without further
+//      header churn.
+//   2. Wires the structured KV-capacity error event through, so if a future
+//      runtime->appendPrefillEmbeds call (M3+) returns false with status
+//      kKvCapacityExceeded, the worker emits the explicit
+//      {"event":"error","ok":false,"error":"kv_capacity_exceeded",...} event
+//      instead of the generic "error" string.
+//
+// Idle-session timeout policy (full enforcement lands in M3):
+//   - A session is considered idle when (now - last_activity) > 30 seconds.
+//   - On the next request that touches that session, the worker shall
+//     endAsrSession the stale slot and emit
+//     {"event":"error","ok":false,"error":"session_timeout",...}.
+//   - M2 leaves last_activity bookkeeping wired into the struct; M3 adds the
+//     dispatcher tick that enforces the rule.
+// ---------------------------------------------------------------------------
+struct AsrSessionState
+{
+    std::string sessionId;                                         //!< Stable ID emitted by the client at begin.
+    std::chrono::steady_clock::time_point lastActivity{};          //!< Updated on every chunk/end touching the slot.
+    bool active{false};                                            //!< True between begin and end.
+};
+
+//! Convenience wrapper: build the structured kv_capacity_exceeded error event
+//! the design doc §12 milestone 2 calls for. M3 routes through this when the
+//! runtime returns false with status kKvCapacityExceeded.
+Json makeKvCapacityErrorEvent(std::string const& id, int32_t kvLength, int32_t cap)
+{
+    Json ev = {
+        {"event", "error"},
+        {"ok", false},
+        {"error", "kv_capacity_exceeded"},
+        {"kv_length", kvLength},
+        {"cap", cap},
+    };
+    if (!id.empty())
+    {
+        ev["id"] = id;
+    }
+    return ev;
+}
+
+//! Maps a runtime AppendPrefillStatus to the structured worker-side JSON event.
+//! Returns std::nullopt when the status is kOk (caller emits the normal
+//! response). For M2 the only non-Ok status the worker surfaces is
+//! kKvCapacityExceeded — other failure modes still flow through the generic
+//! error path until M3 plumbs the chunked dispatcher in.
+std::optional<Json> mapAppendStatusToErrorEvent(
+    rt::LLMInferenceSpecDecodeRuntime const& runtime, std::string const& id)
+{
+    using Status = rt::LLMInferenceSpecDecodeRuntime::AppendPrefillStatus;
+    auto const status = runtime.getLastAppendStatus();
+    switch (status)
+    {
+    case Status::kOk: return std::nullopt;
+    case Status::kKvCapacityExceeded:
+        return makeKvCapacityErrorEvent(id, runtime.getLastObservedKvLength(), runtime.getMaxKvCacheCapacity());
+    case Status::kChunkTooLong:
+    case Status::kPreconditionFailed:
+    case Status::kPrefillFailed:
+    default:
+        // M3 will expand the structured-error coverage. For now fall through to
+        // the generic error path.
+        return std::nullopt;
+    }
+}
 
 enum OptionId : int
 {
@@ -123,6 +198,12 @@ int main(int argc, char** argv)
     double const initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
     std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
 
+    // M2 session table stub. M2 worker is still one-shot, so this map stays
+    // empty in the M2 build — M3 populates it from {"event":"begin"} /
+    // {"event":"chunk"} / {"event":"end"} messages on stdin.
+    std::unordered_map<std::string, AsrSessionState> sessions;
+    (void) sessions; // suppress -Wunused until M3 wires the dispatcher.
+
     std::string line;
     while (std::getline(std::cin, line))
     {
@@ -172,8 +253,31 @@ int main(int argc, char** argv)
             }
             double const totalMs
                 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
-            response = Json{{"id", id}, {"event", ok ? "done" : "error"}, {"ok", ok}, {"responses", responses},
-                {"total_ms", totalMs}};
+            // M2: if the underlying runtime tagged the failure with a streaming
+            // status code (currently only kKvCapacityExceeded propagates),
+            // emit the structured event instead of the generic "error" string.
+            // For M2 handleRequest never sets the append status, so this
+            // branch is dead code at runtime — but the wiring is here so M3
+            // can plug appendPrefillEmbeds straight in.
+            if (!ok)
+            {
+                if (auto structuredEv = mapAppendStatusToErrorEvent(*runtime, id))
+                {
+                    Json ev = std::move(*structuredEv);
+                    ev["total_ms"] = totalMs;
+                    response = std::move(ev);
+                }
+                else
+                {
+                    response = Json{{"id", id}, {"event", "error"}, {"ok", false}, {"responses", responses},
+                        {"total_ms", totalMs}};
+                }
+            }
+            else
+            {
+                response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
+                    {"total_ms", totalMs}};
+            }
         }
         catch (std::exception const& e)
         {
