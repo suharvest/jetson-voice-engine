@@ -1,0 +1,22 @@
+{
+  "name": "chirp_100_4000hz_2s",
+  "pcm_path": "chirp_100_4000hz_2s.pcm.f32",
+  "pcm_samples": 32000,
+  "pcm_sr": 16000,
+  "pcm_md5": "b3ae590875b7ababaeb8b2b2903528db",
+  "pcm_duration_sec": 2.0,
+  "mel_path": "chirp_100_4000hz_2s.mel.f32",
+  "mel_shape": [
+    128,
+    200
+  ],
+  "mel_md5": "ad60b15b5ddc8cd1d247c20ea78bc78a",
+  "mel_min": -0.49964869022369385,
+  "mel_max": 1.5003513097763062,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

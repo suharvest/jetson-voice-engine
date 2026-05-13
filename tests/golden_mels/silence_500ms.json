@@ -1,0 +1,22 @@
+{
+  "name": "silence_500ms",
+  "pcm_path": "silence_500ms.pcm.f32",
+  "pcm_samples": 8000,
+  "pcm_sr": 16000,
+  "pcm_md5": "22054b0f4ee3aba7e05490fd09d5799d",
+  "pcm_duration_sec": 0.5,
+  "mel_path": "silence_500ms.mel.f32",
+  "mel_shape": [
+    128,
+    50
+  ],
+  "mel_md5": "6e1944c395d022ae9f5918cbc723c70a",
+  "mel_min": -1.5,
+  "mel_max": -1.5,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

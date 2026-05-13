@@ -1,0 +1,22 @@
+{
+  "name": "long_10s",
+  "pcm_path": "long_10s.pcm.f32",
+  "pcm_samples": 160000,
+  "pcm_sr": 16000,
+  "pcm_md5": "f28aec8d55b68aba248255e70f7059bd",
+  "pcm_duration_sec": 10.0,
+  "mel_path": "long_10s.mel.f32",
+  "mel_shape": [
+    128,
+    1000
+  ],
+  "mel_md5": "be1085e2fcc8665bb4e6fe705913f43b",
+  "mel_min": -0.6255702972412109,
+  "mel_max": 1.374429702758789,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

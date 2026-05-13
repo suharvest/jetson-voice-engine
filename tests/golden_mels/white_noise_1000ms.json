@@ -1,0 +1,22 @@
+{
+  "name": "white_noise_1000ms",
+  "pcm_path": "white_noise_1000ms.pcm.f32",
+  "pcm_samples": 16000,
+  "pcm_sr": 16000,
+  "pcm_md5": "de0430dcaf180dd7fe423c5779ad56bb",
+  "pcm_duration_sec": 1.0,
+  "mel_path": "white_noise_1000ms.mel.f32",
+  "mel_shape": [
+    128,
+    100
+  ],
+  "mel_md5": "3d9f0e1f424b9a598699227329b5330d",
+  "mel_min": -0.686158299446106,
+  "mel_max": 0.9124748110771179,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

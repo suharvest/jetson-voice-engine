@@ -1,0 +1,22 @@
+{
+  "name": "real_nx_voice_clone_2026_05_11",
+  "pcm_path": "real_nx_voice_clone_2026_05_11.pcm.f32",
+  "pcm_samples": 75520,
+  "pcm_sr": 16000,
+  "pcm_md5": "19d3e4e7a4fa6b90540ade0d02c73e74",
+  "pcm_duration_sec": 4.72,
+  "mel_path": "real_nx_voice_clone_2026_05_11.mel.f32",
+  "mel_shape": [
+    128,
+    472
+  ],
+  "mel_md5": "9a2c3442250725196a1d5f5a551c1650",
+  "mel_min": -0.6302111148834229,
+  "mel_max": 1.3697888851165771,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

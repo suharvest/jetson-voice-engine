@@ -1,0 +1,22 @@
+{
+  "name": "real_nano_official_2026_05_11",
+  "pcm_path": "real_nano_official_2026_05_11.pcm.f32",
+  "pcm_samples": 19200,
+  "pcm_sr": 16000,
+  "pcm_md5": "1b30d0257cbf4094b57ba8a0ed932298",
+  "pcm_duration_sec": 1.2,
+  "mel_path": "real_nano_official_2026_05_11.mel.f32",
+  "mel_shape": [
+    128,
+    120
+  ],
+  "mel_md5": "0fd0fbc14959f24c08a33d3ecf2131ff",
+  "mel_min": -0.5717318058013916,
+  "mel_max": 1.4282681941986084,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

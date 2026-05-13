@@ -1,0 +1,22 @@
+{
+  "name": "dc_0.5s",
+  "pcm_path": "dc_0.5s.pcm.f32",
+  "pcm_samples": 8000,
+  "pcm_sr": 16000,
+  "pcm_md5": "7be9c62a228a3beace0cac71b36c3b61",
+  "pcm_duration_sec": 0.5,
+  "mel_path": "dc_0.5s.mel.f32",
+  "mel_shape": [
+    128,
+    50
+  ],
+  "mel_md5": "648e361d2e403452cd2913ae5215bec8",
+  "mel_min": -0.8793081045150757,
+  "mel_max": 1.1206918954849243,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}
