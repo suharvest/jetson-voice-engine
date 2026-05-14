@@ -148,6 +148,25 @@ Then drive a one-shot ASR request against the new engine path with the
 existing `test_streaming_worker.py` style harness. A sane Chinese
 transcription is the smoke-test pass criterion.
 
+## Worker Source Layout (unified)
+
+Worker C++ source has a single canonical home in **this repo** at
+`native/edgellm_voice_worker/`. The jetson-voice repo's build references
+this directory via the `WORKER_SRC_DIR` cache variable in its
+`CMakeLists.txt`.
+
+Do NOT edit worker source under `jetson-voice/native/edgellm_voice_worker/`
+— it contains only the CMakeLists.txt entry point + a README stub.
+
+Reproducer guarantees sibling-clone layout:
+
+```
+~/project/qwen3-edgellm-jetson/  <-- canonical worker source
+~/project/jetson-voice/          <-- build entry, references sibling
+```
+
+Build configures with FATAL_ERROR if sibling dir is missing.
+
 ---
 
 History note: see commit messages on `streaming-asr/m2-worker-capacity` for
