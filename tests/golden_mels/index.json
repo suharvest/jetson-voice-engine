@@ -1,0 +1,34 @@
+{
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  },
+  "cases": [
+    "silence_500ms",
+    "silence_1000ms",
+    "silence_2000ms",
+    "silence_5000ms",
+    "sine_220hz_1s",
+    "sine_440hz_1s",
+    "sine_1000hz_1s",
+    "sine_4000hz_1s",
+    "white_noise_500ms",
+    "white_noise_1000ms",
+    "white_noise_5000ms",
+    "chirp_100_4000hz_2s",
+    "short_0.1s",
+    "short_0.5s",
+    "odd_length_16001",
+    "long_10s",
+    "impulse_0.5s",
+    "dc_0.5s",
+    "synth_speechlike_1.4s",
+    "real_voice_clone_reference_S1_2026_05_11",
+    "real_nx_highperf_2026_05_11",
+    "real_nx_voice_clone_2026_05_11",
+    "real_nx_clone_pass_p2_2026_05_11",
+    "real_nano_official_2026_05_11"
+  ]
+}

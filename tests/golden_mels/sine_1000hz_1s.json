@@ -1,0 +1,22 @@
+{
+  "name": "sine_1000hz_1s",
+  "pcm_path": "sine_1000hz_1s.pcm.f32",
+  "pcm_samples": 16000,
+  "pcm_sr": 16000,
+  "pcm_md5": "cca841aef61f972d7170bf90b60fbd9d",
+  "pcm_duration_sec": 1.0,
+  "mel_path": "sine_1000hz_1s.mel.f32",
+  "mel_shape": [
+    128,
+    100
+  ],
+  "mel_md5": "61c1a523589670d35553ba805629ce97",
+  "mel_min": -0.5255539417266846,
+  "mel_max": 1.4744460582733154,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

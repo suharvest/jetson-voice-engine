@@ -1,0 +1,22 @@
+{
+  "name": "real_nx_highperf_2026_05_11",
+  "pcm_path": "real_nx_highperf_2026_05_11.pcm.f32",
+  "pcm_samples": 76800,
+  "pcm_sr": 16000,
+  "pcm_md5": "730f9e923494d5a7c1ee21a47ffbdc2d",
+  "pcm_duration_sec": 4.8,
+  "mel_path": "real_nx_highperf_2026_05_11.mel.f32",
+  "mel_shape": [
+    128,
+    480
+  ],
+  "mel_md5": "46236f7a21698d317b240640db73b269",
+  "mel_min": -0.47657322883605957,
+  "mel_max": 1.5234267711639404,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

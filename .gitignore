@@ -7,6 +7,9 @@ __pycache__/
 *.data
 *.safetensors
 *.bin
+!deploy/audio_preprocessing/mel_filters.bin
+*.f32
+!tests/golden_mels/*.f32
 *.npz
 *.wav
 *.tar.gz

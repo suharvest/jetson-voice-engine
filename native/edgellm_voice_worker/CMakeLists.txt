@@ -136,6 +136,47 @@ target_include_directories(
                           ${COMMON_INCLUDE_DIRS})
 target_link_libraries(voiceWorkerUtils PRIVATE edgellmCore commonLibraryExt)
 
+# -----------------------------------------------------------------------------
+# kissfft (vendored, fp64 mode) + MelExtractor — C++ port of upstream
+# `WhisperFeatureExtractor` for the streaming ASR worker's PCM→mel path.
+# Validated against golden tensors by test_mel_extractor (≤ 1e-3 tol).
+# -----------------------------------------------------------------------------
+add_library(kissfft_double STATIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/kissfft/kiss_fft.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/kissfft/kiss_fftr.c")
+target_include_directories(kissfft_double PUBLIC
+                           "${CMAKE_CURRENT_SOURCE_DIR}/kissfft")
+target_compile_definitions(kissfft_double PUBLIC kiss_fft_scalar=double)
+set_target_properties(kissfft_double PROPERTIES
+                      POSITION_INDEPENDENT_CODE ON
+                      C_STANDARD 99)
+
+add_library(melExtractor STATIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/mel_extractor.cpp")
+target_include_directories(melExtractor PUBLIC
+                           "${CMAKE_CURRENT_SOURCE_DIR}"
+                           ${EDGE_LLM_SOURCE_DIR}/3rdParty/nlohmannJson/include)
+target_link_libraries(melExtractor PUBLIC kissfft_double)
+set_target_properties(melExtractor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# -----------------------------------------------------------------------------
+# AudioVadSplitter (energy-based audio chunk splitter, Phase 2 wiring).
+# C++ port of split_audio_into_chunks from qwen_asr/inference/utils.py:246.
+# No external deps — pure stdlib. Used by the ASR worker auto-segment path
+# to choose a low-energy boundary inside [VAD_TRIGGER_SEC, HARD_LIMIT_SEC]
+# instead of cutting at a fixed offset.
+# -----------------------------------------------------------------------------
+add_library(audioVadSplit STATIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/audio_vad_split.cpp")
+target_include_directories(audioVadSplit PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(audioVadSplit PUBLIC cxx_std_17)
+set_target_properties(audioVadSplit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Standalone test binary (WAV → boundaries JSON + sanity checks).
+add_executable(test_audio_vad_split
+               "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_vad_split.cpp")
+target_link_libraries(test_audio_vad_split PRIVATE audioVadSplit)
+
 set(VOICE_WORKER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/workers")
 
 add_executable(qwen3_tts_worker qwen3_tts_worker.cpp)
@@ -154,13 +195,23 @@ add_executable(qwen3_asr_worker qwen3_asr_worker.cpp)
 target_include_directories(
   qwen3_asr_worker PRIVATE ${COMMON_INCLUDE_DIRS}
                            ${EDGE_LLM_SOURCE_DIR}/examples/utils)
-target_link_libraries(qwen3_asr_worker PRIVATE voiceWorkerUtils edgellmCore
+target_link_libraries(qwen3_asr_worker PRIVATE voiceWorkerUtils melExtractor
+                                               audioVadSplit edgellmCore
                                                commonLibraryExt)
 add_cross_build_link_options(qwen3_asr_worker)
 set_target_properties(qwen3_asr_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                   ${VOICE_WORKER_OUTPUT_DIR}
                                                   LINKER_LANGUAGE CUDA
                                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Standalone CPU-only test binary for MelExtractor parity vs golden tensors.
+add_executable(test_mel_extractor
+               "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mel_extractor.cpp")
+target_link_libraries(test_mel_extractor PRIVATE melExtractor)
+target_include_directories(test_mel_extractor PRIVATE
+                           ${EDGE_LLM_SOURCE_DIR}/3rdParty/nlohmannJson/include)
+set_target_properties(test_mel_extractor PROPERTIES
+                      RUNTIME_OUTPUT_DIRECTORY ${VOICE_WORKER_OUTPUT_DIR})
 
 function(link_edgellm_cutedsl_if_enabled target)
   string(TOUPPER "${ENABLE_CUTE_DSL}" _enable_cutedsl)

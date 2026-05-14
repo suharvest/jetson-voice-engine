@@ -1,0 +1,22 @@
+{
+  "name": "odd_length_16001",
+  "pcm_path": "odd_length_16001.pcm.f32",
+  "pcm_samples": 16001,
+  "pcm_sr": 16000,
+  "pcm_md5": "57b0e901404831b8dfd023b389fc271e",
+  "pcm_duration_sec": 1.0000625,
+  "mel_path": "odd_length_16001.mel.f32",
+  "mel_shape": [
+    128,
+    100
+  ],
+  "mel_md5": "239258ef377b3c6224daa904a416a681",
+  "mel_min": -0.6255702972412109,
+  "mel_max": 1.374429702758789,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

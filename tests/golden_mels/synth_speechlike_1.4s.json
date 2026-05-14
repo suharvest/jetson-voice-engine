@@ -1,0 +1,22 @@
+{
+  "name": "synth_speechlike_1.4s",
+  "pcm_path": "synth_speechlike_1.4s.pcm.f32",
+  "pcm_samples": 22400,
+  "pcm_sr": 16000,
+  "pcm_md5": "249e1335975db69ca35cddf8de1d83bd",
+  "pcm_duration_sec": 1.4,
+  "mel_path": "synth_speechlike_1.4s.mel.f32",
+  "mel_shape": [
+    128,
+    140
+  ],
+  "mel_md5": "259634694f533c8d892983d47b5a5823",
+  "mel_min": -0.5854008197784424,
+  "mel_max": 1.4145991802215576,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

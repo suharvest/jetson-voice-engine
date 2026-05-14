@@ -1,0 +1,22 @@
+{
+  "name": "real_nx_clone_pass_p2_2026_05_11",
+  "pcm_path": "real_nx_clone_pass_p2_2026_05_11.pcm.f32",
+  "pcm_samples": 39680,
+  "pcm_sr": 16000,
+  "pcm_md5": "f1f37f64f025ebcdcb079743be11eb30",
+  "pcm_duration_sec": 2.48,
+  "mel_path": "real_nx_clone_pass_p2_2026_05_11.mel.f32",
+  "mel_shape": [
+    128,
+    248
+  ],
+  "mel_md5": "9feec46bf07e18dacf351b98912b4574",
+  "mel_min": -0.5856332778930664,
+  "mel_max": 1.4143667221069336,
+  "settings": {
+    "n_fft": 400,
+    "hop_length": 160,
+    "n_mels": 128,
+    "sampling_rate": 16000
+  }
+}

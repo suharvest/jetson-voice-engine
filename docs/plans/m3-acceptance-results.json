@@ -1,0 +1,153 @@
+{
+  "scenarios": {
+    "A_oneshot": {
+      "ok": true,
+      "text": "语音合成的稳定性训练。",
+      "raw_keys": [
+        "event",
+        "id",
+        "ok",
+        "responses",
+        "total_ms"
+      ],
+      "response": {
+        "event": "done",
+        "id": "41ba81bef7fd4b2d8bbcfa5ed74556a2",
+        "ok": true,
+        "responses": [
+          {
+            "batch_idx": 0,
+            "output_text": "language Chinese语音合成的稳定性训练。",
+            "request_idx": 0
+          }
+        ],
+        "total_ms": 1904.802447
+      }
+    },
+    "B_streaming": {
+      "duration_s": 5.0,
+      "n_hops": 10,
+      "rotations": 0,
+      "final": {
+        "decode_ms": 136.73231506347656,
+        "elapsed_ms": 177.896123,
+        "encoder_ms": 10.545503616333008,
+        "event": "final",
+        "hop_id": 9,
+        "id": "scen_b_a1e780",
+        "ok": true,
+        "prefill_ms": 25.12575912475586,
+        "segment_count": 1,
+        "text": "语音合成的稳定性训练。",
+        "total_ms": 177.896123
+      },
+      "end_latency_ms": 178.8336189929396,
+      "text": "语音合成的稳定性训练。",
+      "lcs_vs_baseline": 1.0
+    },
+    "C_latency": {
+      "runs_ms": [
+        185.9290930442512,
+        179.947461001575,
+        213.6128160636872,
+        186.73242698423564,
+        217.90767484344542
+      ],
+      "median_ms": 186.73242698423564,
+      "p95_ms": 217.04870308749378,
+      "min_ms": 179.947461001575,
+      "max_ms": 217.90767484344542
+    },
+    "D_autosegment": {
+      "duration_s": 8.64,
+      "rotations": 1,
+      "final": {
+        "decode_ms": 273.82342529296875,
+        "elapsed_ms": 306.601872,
+        "encoder_ms": 9.163935661315918,
+        "event": "final",
+        "hop_id": 3,
+        "id": "scen_d_cfc141",
+        "ok": true,
+        "prefill_ms": 18.562015533447266,
+        "segment_count": 2,
+        "text": "语音合成的稳定性、迅。아니, 그거 지고 싶은 거밖에 없잖아.",
+        "total_ms": 306.601872
+      },
+      "text": "语音合成的稳定性、迅。아니, 그거 지고 싶은 거밖에 없잖아.",
+      "segment_count": 2,
+      "lcs_vs_long_baseline": null,
+      "lcs_vs_baseline_x2": 0.28125,
+      "lcs_vs_baseline_x1": 0.28125,
+      "long_baseline_text": null,
+      "lcs_best": 0.28125
+    },
+    "E_errors": {
+      "malformed_json": {
+        "got": {
+          "error": "json_parse_failed: [json.exception.parse_error.101] parse error at line 1, column 3: syntax error while parsing object key - invalid literal; last read: '{th'; expected string literal",
+          "event": "error",
+          "ok": false
+        },
+        "ok": true
+      },
+      "unknown_event": {
+        "got": {
+          "error": "unknown_event",
+          "event": "error",
+          "id": "e2",
+          "ok": false,
+          "received": "unknown_thing"
+        },
+        "ok": true
+      },
+      "chunk_too_long": {
+        "got": {
+          "chunk_sec": 8.0,
+          "error": "chunk_too_long",
+          "event": "error",
+          "id": "e3",
+          "limit_sec": 7.0,
+          "ok": false
+        },
+        "ok": true
+      },
+      "session_cleared_after_error": {
+        "got": {
+          "error": "no_active_session",
+          "event": "error",
+          "id": "e3",
+          "ok": false
+        },
+        "ok": true
+      }
+    }
+  },
+  "gates": {
+    "A_oneshot_ok": true,
+    "B_lcs_ge_0.95": true,
+    "C_median_le_500ms": true,
+    "C_p95_le_1000ms": true,
+    "D_one_final": true,
+    "D_at_least_one_segment_rotation": true,
+    "D_lcs_ge_0.90_soft": false,
+    "E_malformed_json_handled": true,
+    "E_unknown_event_handled": true,
+    "E_chunk_too_long_handled": true,
+    "E_session_cleared_after_error": true
+  },
+  "hard_gates": {
+    "A_oneshot_ok": true,
+    "B_lcs_ge_0.95": true,
+    "C_median_le_500ms": true,
+    "C_p95_le_1000ms": true,
+    "D_one_final": true,
+    "D_at_least_one_segment_rotation": true,
+    "E_malformed_json_handled": true,
+    "E_unknown_event_handled": true,
+    "E_chunk_too_long_handled": true,
+    "E_session_cleared_after_error": true
+  },
+  "all_hard_gates_passed": true,
+  "all_gates_passed": false
+}
