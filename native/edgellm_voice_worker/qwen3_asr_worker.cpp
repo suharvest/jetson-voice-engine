@@ -889,7 +889,11 @@ void handleChunk(Json const& input, AsrSessionState& session,
             // simply overwrite each chunk's accumulator with the latest.
             session.pcmAccum = pcm;
             int32_t n_frames = 0;
-            std::vector<float> mel = gMelExtractor->compute(pcm, &n_frames);
+            // Pad to encoder chunk size so [-1, 128, 100] profile is satisfied
+            // (first hop ~0.5s → 50 frames → must pad to 100). Mirrors
+            // scripts/test_streaming_worker.py:146-147.
+            std::vector<float> mel = gMelExtractor->compute(pcm, &n_frames,
+                                                            kEncoderMelFramesPerChunk);
             if (n_frames <= 0)
             {
                 Json ev = {{"event", "error"}, {"ok", false},

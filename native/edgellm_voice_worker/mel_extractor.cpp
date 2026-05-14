@@ -130,7 +130,8 @@ MelExtractor::MelExtractor(std::string const& settings_json_path,
 MelExtractor::~MelExtractor() = default;
 
 std::vector<float> MelExtractor::compute(std::vector<float> const& pcm_in,
-                                         int32_t* out_n_frames) const
+                                         int32_t* out_n_frames,
+                                         int32_t pad_to_multiple) const
 {
     int32_t const n_fft = settings_.n_fft;
     int32_t const hop = settings_.hop_length;
@@ -275,6 +276,35 @@ std::vector<float> MelExtractor::compute(std::vector<float> const& pcm_in,
     if (settings_.post_normalize_add4_div4)
     {
         for (float& v : log_mel) v = (v + 4.0f) / 4.0f;
+    }
+
+    // 7) Optional time-dim padding to the encoder's static chunk size.
+    //
+    //    Encoder engine profile = [-1, 128, 100] (n_chunks dynamic, mel_bins
+    //    fixed at 128, time fixed at 100 frames/chunk). The streaming first
+    //    hop carries only ~0.5 s of audio → ~50 mel frames → TRT rejects the
+    //    shape. The Python driver pads with constant zeros after the post-log
+    //    normalize step (scripts/test_streaming_worker.py:146-147); we mirror
+    //    that here with raw 0.0f so prefill of short PCM cumulative slices
+    //    works end-to-end. Pad-value rationale: `np.pad(mode="constant")` in
+    //    NumPy defaults to 0.0, so 0.0f is bit-exact-compatible.
+    if (pad_to_multiple > 0 && num_frames_kept > 0)
+    {
+        int32_t const target = ((num_frames_kept + pad_to_multiple - 1)
+                                / pad_to_multiple) * pad_to_multiple;
+        if (target > num_frames_kept)
+        {
+            std::vector<float> padded(static_cast<size_t>(n_mels) * target, 0.0f);
+            for (int32_t m = 0; m < n_mels; ++m)
+            {
+                std::copy_n(&log_mel[static_cast<size_t>(m) * num_frames_kept],
+                            num_frames_kept,
+                            &padded[static_cast<size_t>(m) * target]);
+            }
+            log_mel = std::move(padded);
+            if (out_n_frames) *out_n_frames = target;
+            return log_mel;
+        }
     }
 
     if (out_n_frames) *out_n_frames = num_frames_kept;

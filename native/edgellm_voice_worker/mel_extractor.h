@@ -16,6 +16,14 @@
 #include <string>
 #include <vector>
 
+//! Encoder static profile time-dim chunk size. The Qwen3-ASR encoder engine is
+//! built with shape `[-1, 128, 100]` (chunk count dynamic, mel_bins=128,
+//! time=100 fixed). Callers driving the encoder must pad their mel output's
+//! time dimension up to a multiple of this value, otherwise TRT rejects the
+//! shape. See scripts/test_streaming_worker.py:146-147 for the Python
+//! reference that motivates this constant.
+constexpr int32_t kEncoderMelFramesPerChunk = 100;
+
 class MelExtractor
 {
 public:
@@ -50,8 +58,17 @@ public:
     //! Compute log-mel spectrogram for a 16 kHz mono float32 PCM buffer.
     //! Output layout: row-major [n_mels, n_frames] float32. n_frames depends
     //! on `pcm.size()` per the upstream recipe (drop_last_frame=true).
+    //!
+    //! If `pad_to_multiple > 0`, the time dimension is right-padded with zeros
+    //! up to the next multiple of `pad_to_multiple`, and `*out_n_frames`
+    //! reports the padded count. Mirrors the Python driver's behaviour at
+    //! `scripts/test_streaming_worker.py:146-147` so the encoder static
+    //! profile `[-1, 128, 100]` is satisfied for short PCM buffers (e.g. the
+    //! 0.5 s first hop in streaming mode produces only 50 mel frames).
+    //! Pad value is raw 0.0f (constant) to match `np.pad(mode="constant")`.
     std::vector<float> compute(std::vector<float> const& pcm,
-                               int32_t* out_n_frames = nullptr) const;
+                               int32_t* out_n_frames = nullptr,
+                               int32_t pad_to_multiple = 0) const;
 
     int32_t n_mels() const { return settings_.n_mels; }
     int32_t hop_length() const { return settings_.hop_length; }
