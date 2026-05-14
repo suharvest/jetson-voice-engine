@@ -162,3 +162,34 @@ SUMMARY  n=10/10  p50=0.7ms  p95=3.3ms  max=3.3ms
 ```
 
 Note: Only the `trt_edgellm` backend was exercised on this side-by-side container. The other backends (`paraformer`, `sherpa`, `qwen3_asr_rk`) are covered by unit tests only at this milestone; their e2e validation depends on a profile switch or separate hardware (RPi4 for sherpa).
+
+## E2E Validation Results — Orin Nano (2026-05-14)
+
+- Device: Jetson Orin Nano Super (orin-nano, 100.92.125.65)
+- Container: `seeed-local-voice-feat-cancel` (temp swap with seeed-nano-v112)
+- Image: `seeed-local-voice:feat-cancel-test` (overlay on jetson-v1.12, host networking)
+- ASR_BACKEND: trt_edgellm
+- N trials: 10/10
+- p50: 0.6 ms
+- p95: 0.6 ms
+- max: 0.6 ms
+- Verdict: **PASS** (≤200ms gate; ~300x headroom)
+
+Raw harness tail:
+```
+V2V barge-in latency probe  URL=ws://localhost:8000/v2v/stream  trials=10
+  trial  1: abort_to_last_audio_ms =     0.6
+  trial  2: abort_to_last_audio_ms =     0.5
+  trial  3: abort_to_last_audio_ms =     0.6
+  trial  4: abort_to_last_audio_ms =     0.5
+  trial  5: abort_to_last_audio_ms =     0.6
+  trial  6: abort_to_last_audio_ms =     0.6
+  trial  7: abort_to_last_audio_ms =     0.6
+  trial  8: abort_to_last_audio_ms =     0.6
+  trial  9: abort_to_last_audio_ms =     0.6
+  trial 10: abort_to_last_audio_ms =     0.6
+
+SUMMARY  n=10/10  p50=0.6ms  p95=0.6ms  max=0.6ms
+```
+
+Post-test: seeed-nano-v112 restored to Up + /health 200; feat container removed; feat-cancel-test image removed (freed ~1GB layer). Confirms orin-nx result (p50=0.7 / p95=3.3 ms) generalizes to Nano with even tighter variance.
