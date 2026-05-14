@@ -50,6 +50,16 @@ FMAX = 8000.0
 MEL_FLOOR = 1e-10
 HOP_SEC = 0.5
 
+# P1 (post-VAD-Phase2) — default ASR thinker engine path. Scenario D
+# (12.9 s zh-long-04) requires the v2 engine rebuilt at max_input_len=256;
+# the old 128-cap engine silently fails prefill on the final hop and
+# yields an empty transcript. The container-mounted host path is also
+# valid (overrides via --engine-dir still respected).
+DEFAULT_ASR_ENGINE_DIR = (
+    "/opt/models/qwen3-edgellm/engines/orin-nx/highperf-v2/asr_thinker_full_fp8embed")
+DEFAULT_ASR_MULTIMODAL_ENGINE_DIR = (
+    "/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_audio_encoder")
+
 
 # ---------------------------------------------------------------------------
 # Mel preprocessing (copied from test_m3_step2_spike.py).
@@ -513,9 +523,9 @@ def main() -> int:
     parser.add_argument("--worker", default="/opt/jv-workers/qwen3_asr_worker")
     parser.add_argument("--plugin", default="/opt/edgellm-bin/libNvInfer_edgellm_plugin.so")
     parser.add_argument("--engine-dir",
-        default="/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_thinker_full_fp8embed")
+        default=DEFAULT_ASR_ENGINE_DIR)
     parser.add_argument("--multimodal-engine-dir",
-        default="/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_audio_encoder")
+        default=DEFAULT_ASR_MULTIMODAL_ENGINE_DIR)
     parser.add_argument("--mel-dir", default="/tmp/m3_streaming_mels")
     parser.add_argument("--mel-settings", default=None,
                         help="Path to whisper_feature_extractor.json — enables scenario F (PCM input).")

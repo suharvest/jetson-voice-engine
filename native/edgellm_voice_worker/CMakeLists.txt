@@ -159,6 +159,24 @@ target_include_directories(melExtractor PUBLIC
 target_link_libraries(melExtractor PUBLIC kissfft_double)
 set_target_properties(melExtractor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# -----------------------------------------------------------------------------
+# AudioVadSplitter (energy-based audio chunk splitter, Phase 2 wiring).
+# C++ port of split_audio_into_chunks from qwen_asr/inference/utils.py:246.
+# No external deps — pure stdlib. Used by the ASR worker auto-segment path
+# to choose a low-energy boundary inside [VAD_TRIGGER_SEC, HARD_LIMIT_SEC]
+# instead of cutting at a fixed offset.
+# -----------------------------------------------------------------------------
+add_library(audioVadSplit STATIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/audio_vad_split.cpp")
+target_include_directories(audioVadSplit PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(audioVadSplit PUBLIC cxx_std_17)
+set_target_properties(audioVadSplit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Standalone test binary (WAV → boundaries JSON + sanity checks).
+add_executable(test_audio_vad_split
+               "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_audio_vad_split.cpp")
+target_link_libraries(test_audio_vad_split PRIVATE audioVadSplit)
+
 set(VOICE_WORKER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/workers")
 
 add_executable(qwen3_tts_worker qwen3_tts_worker.cpp)
@@ -178,7 +196,8 @@ target_include_directories(
   qwen3_asr_worker PRIVATE ${COMMON_INCLUDE_DIRS}
                            ${EDGE_LLM_SOURCE_DIR}/examples/utils)
 target_link_libraries(qwen3_asr_worker PRIVATE voiceWorkerUtils melExtractor
-                                               edgellmCore commonLibraryExt)
+                                               audioVadSplit edgellmCore
+                                               commonLibraryExt)
 add_cross_build_link_options(qwen3_asr_worker)
 set_target_properties(qwen3_asr_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                   ${VOICE_WORKER_OUTPUT_DIR}

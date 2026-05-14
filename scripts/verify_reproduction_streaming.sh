@@ -23,7 +23,11 @@ set -uo pipefail
 REPO_ROOT="/opt/qwen3-edgellm-jetson"
 WORKER="/opt/jv-workers/qwen3_asr_worker"
 PLUGIN="/opt/edgellm-bin/libNvInfer_edgellm_plugin.so"
-ENGINE_DIR="/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_thinker_full_fp8embed"
+# Default to the P1 highperf-v2 thinker engine (max_input_len=256). The old
+# highperf/ thinker is max_input_len=128 and silently fails prefill on long
+# audio (audio_sec > ~9 s), producing empty transcripts. Override via
+# --engine-dir when intentionally testing the legacy engine.
+ENGINE_DIR="/opt/models/qwen3-edgellm/engines/orin-nx/highperf-v2/asr_thinker_full_fp8embed"
 MULTIMODAL_ENGINE_DIR="/opt/models/qwen3-edgellm/engines/orin-nx/highperf/asr_audio_encoder"
 MEL_SETTINGS=""
 MEL_FILTERS=""

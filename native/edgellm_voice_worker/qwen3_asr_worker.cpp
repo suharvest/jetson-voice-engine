@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "audio_vad_split.h"
 #include "common/checkMacros.h"
 #include "common/logger.h"
 #include "common/stringUtils.h"
@@ -97,6 +98,18 @@ constexpr double kSingleChunkHardLimitSec = 15.0;
 constexpr double kCarryoverSec = 1.0;              //!< Segment boundary keeps last N seconds of audio.
 constexpr int64_t kIdleTimeoutMs = 30000;          //!< Force-close session after this much inactivity.
 
+//! P2 VAD-aligned auto-segment params (design doc §15.5.2 VAD revision).
+//! Trigger BEFORE the hard 15 s refuse so VAD has a search window. When
+//! triggered, the splitter looks for a low-energy boundary within
+//! ±kVadSearchExpandSec of the target cut at kVadMaxChunkSec. If a clean
+//! boundary is found inside [trigger, hard-limit], rotate at that boundary
+//! and carry over the audio that follows it. Otherwise fall through to the
+//! hard refuse path (preserves old behavior for adversarial inputs).
+constexpr double kVadTriggerSec = 12.0;           //!< Earliest audio_sec at which VAD considers rotating.
+constexpr double kVadMaxChunkSec = 13.0;          //!< Target cut point inside the VAD splitter (~2 s margin below hard limit).
+constexpr double kVadSearchExpandSec = 2.0;       //!< Symmetric search window around the target cut.
+constexpr double kVadMinChunkSec = 0.5;           //!< Pad short tail chunks to this length (mirrors MIN_ASR_INPUT_SECONDS).
+
 inline int32_t projectInputTokens(double audioSec)
 {
     auto const audioTokens = static_cast<int32_t>(std::ceil(audioSec * kAudioTokensPerSec));
@@ -145,6 +158,15 @@ struct AsrSessionState
     double lastAudioSec{0.0};
     // Number of internal segment rotations during this session (debug only).
     int32_t segmentCount{0};
+
+    // P2 VAD-aligned auto-segment state.
+    //
+    // When the chunk event delivers PCM (`pcm_b64`), we accumulate the raw
+    // float32 mono PCM so that at rotation time we can run AudioVadSplitter
+    // to find a low-energy boundary and recommend a precise carry-over to
+    // the driver. For mel_path-only sessions, pcmAccum stays empty and the
+    // worker falls back to the fixed-carryover policy (kCarryoverSec).
+    std::vector<float> pcmAccum;
 };
 
 //! Reset session to inactive state and clear all accumulators. Used by both
@@ -173,6 +195,32 @@ Json makeKvCapacityErrorEvent(std::string const& id, int32_t kvLength, int32_t c
     };
     if (!id.empty())
     {
+        ev["id"] = id;
+    }
+    return ev;
+}
+
+//! P2 — Explicit prefill_failed error emission. Replaces the prior silent-
+//! empty-partial behavior when runtime->handleRequest returns false in the
+//! streaming hop path. Surfaces enough diagnostic state (hop_id, audio_sec,
+//! kv state, engine cap) for the driver / operator to understand whether
+//! the failure is a true engine cap breach (use a bigger thinker) or an
+//! upstream input issue.
+Json makePrefillFailedEvent(std::string const& id, int32_t hopId, double audioSec,
+    rt::LLMInferenceSpecDecodeRuntime const& runtime)
+{
+    Json ev = {
+        {"event", "error"},
+        {"ok", false},
+        {"error", "prefill_failed"},
+        {"hop_id", hopId},
+        {"audio_sec", audioSec},
+        {"kv_length", runtime.getLastObservedKvLength()},
+        {"max_kv_capacity", runtime.getMaxKvCacheCapacity()},
+        {"hint", "audio_sec or accumulated token count likely exceeds engine max_input_len; "
+                 "see docs/plans/p1-thinker-rebuild-results.md for the rebuild path"},
+    };
+    if (!id.empty()) {
         ev["id"] = id;
     }
     return ev;
@@ -835,6 +883,11 @@ void handleChunk(Json const& input, AsrSessionState& session,
             }
             std::vector<float> pcm(raw.size() / sizeof(float));
             std::memcpy(pcm.data(), raw.data(), raw.size());
+            // P2 — keep the latest cumulative PCM so VAD can locate a
+            // low-energy boundary at rotation time. Drivers send cumulative
+            // PCM slices (matching the cumulative-mel convention), so we
+            // simply overwrite each chunk's accumulator with the latest.
+            session.pcmAccum = pcm;
             int32_t n_frames = 0;
             std::vector<float> mel = gMelExtractor->compute(pcm, &n_frames);
             if (n_frames <= 0)
@@ -911,7 +964,46 @@ void handleChunk(Json const& input, AsrSessionState& session,
     // its text to fullText, then signal the driver to rotate and continue.
     // We only auto-segment when audio_sec is provided AND this is NOT the
     // last chunk (last=true always runs the final hop and emits final).
-    bool const shouldRotate = hasAudioSec && !isLast && wouldOverflow(audioSec);
+    //
+    // P2 — VAD-aligned rotation. When the chunk arrives in PCM mode AND
+    // audio_sec is within the VAD trigger band [kVadTriggerSec,
+    // kSingleChunkHardLimitSec), invoke AudioVadSplitter on the accumulated
+    // PCM to pick a clean boundary; if a true split is returned (>=2
+    // chunks), use the first chunk's end as the rotation point. Otherwise
+    // fall through to the legacy projected-overflow rotation policy.
+    bool const overflowTrigger = hasAudioSec && !isLast && wouldOverflow(audioSec);
+    bool vadAligned = false;
+    double vadBoundarySec = 0.0;
+    double vadCarryoverSec = kCarryoverSec;
+    if (!isLast && hasAudioSec && audioSec >= kVadTriggerSec && !session.pcmAccum.empty())
+    {
+        edgellm_voice_worker::AudioVadSplitter const vad(
+            /*sample_rate=*/16000, kVadMaxChunkSec, kVadSearchExpandSec,
+            /*min_window_ms=*/100.0, kVadMinChunkSec);
+        auto const chunks = vad.split(session.pcmAccum);
+        if (chunks.size() >= 2)
+        {
+            // First boundary = end of chunks[0] in sample index. The tail
+            // (everything after this boundary) becomes the next segment's
+            // initial PCM window — driver gets `carryover_sec = audio_sec
+            // - vad_boundary_sec` so it knows precisely how much audio to
+            // keep when starting the next session view.
+            int64_t boundarySamples = 0;
+            for (auto const& c : chunks)
+            {
+                boundarySamples += static_cast<int64_t>(c.samples.size());
+                break;  // only first chunk's length
+            }
+            vadBoundarySec = static_cast<double>(boundarySamples) / 16000.0;
+            // Carryover is the audio AFTER the VAD boundary up to current
+            // accumulator length (typically ~2-3 s of post-boundary speech).
+            double const tailSec
+                = static_cast<double>(session.pcmAccum.size()) / 16000.0 - vadBoundarySec;
+            vadCarryoverSec = std::max(0.0, tailSec);
+            vadAligned = true;
+        }
+    }
+    bool const shouldRotate = overflowTrigger || vadAligned;
 
     int32_t const hopId = session.chunkId;
     // Step 3.1 prefix-prompt: compute prefix from prior rawDecoded via
@@ -925,14 +1017,22 @@ void handleChunk(Json const& input, AsrSessionState& session,
     (void) maxGenerateLength;
     (void) loraWeightsMap;
     session.chunkId += 1;
-    if (hop.ok)
+
+    // P2 — explicit prefill failure. Prior behavior silently stored
+    // hop.text (which on failure contains an "hop_exception:" string or an
+    // empty payload) into rawDecoded and emitted a meaningless partial.
+    // Now we surface a structured error event, free the session, and
+    // stop processing this stream so the driver fails fast.
+    if (!hop.ok)
     {
-        session.rawDecoded = hop.rawDecoded;
+        Json err = makePrefillFailedEvent(id, hopId, audioSec, runtime);
+        err["elapsed_ms"] = hop.totalMs;
+        err["hop_text"] = hop.text;  //!< Optional diagnostic payload (e.g. C++ exception string).
+        std::cout << err.dump() << std::endl;
+        freeSession(session);
+        return;
     }
-    else
-    {
-        session.rawDecoded = hop.text;
-    }
+    session.rawDecoded = hop.rawDecoded;
 
     if (shouldRotate)
     {
@@ -945,6 +1045,29 @@ void handleChunk(Json const& input, AsrSessionState& session,
         session.segmentCount += 1;
         session.chunkId = 0;
         session.rawDecoded.clear();
+        // P2 — VAD-aligned mode trims the in-worker PCM accumulator past
+        // the boundary; the new session view starts from the post-boundary
+        // tail (driver mirrors this for its own buffer accounting).
+        double const carryoverSec = vadAligned ? vadCarryoverSec : kCarryoverSec;
+        if (vadAligned)
+        {
+            int64_t const boundarySamples
+                = static_cast<int64_t>(std::llround(vadBoundarySec * 16000.0));
+            if (boundarySamples > 0
+                && boundarySamples < static_cast<int64_t>(session.pcmAccum.size()))
+            {
+                session.pcmAccum.erase(session.pcmAccum.begin(),
+                    session.pcmAccum.begin() + static_cast<std::ptrdiff_t>(boundarySamples));
+            }
+            else
+            {
+                session.pcmAccum.clear();
+            }
+        }
+        else
+        {
+            session.pcmAccum.clear();
+        }
         // Emit the rotation signal — driver MUST trim its audio buffer to
         // the last `carryover_sec` and continue sending cumulative mels
         // starting from there. NOT exposed as a partial/final.
@@ -952,7 +1075,7 @@ void handleChunk(Json const& input, AsrSessionState& session,
             {"event", "segment_rotation"},
             {"id", id},
             {"segment_id", session.segmentCount - 1},
-            {"carryover_sec", kCarryoverSec},
+            {"carryover_sec", carryoverSec},
             {"projected_tokens", projectInputTokens(audioSec)},
             {"cap_tokens", kEngineMaxInputLen - kInputSafetyMargin},
             {"segment_text", segText},
@@ -960,7 +1083,12 @@ void handleChunk(Json const& input, AsrSessionState& session,
             {"encoder_ms", hop.stages.encoderMs},
             {"prefill_ms", hop.stages.prefillMs},
             {"decode_ms", hop.stages.decodeMs},
+            {"rotation_kind", vadAligned ? "vad_aligned" : "projected_overflow"},
         };
+        if (vadAligned)
+        {
+            ev["vad_boundary_sec"] = vadBoundarySec;
+        }
         std::cout << ev.dump() << std::endl;
         return;
     }
