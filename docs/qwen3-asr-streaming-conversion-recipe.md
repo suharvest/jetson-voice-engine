@@ -49,6 +49,50 @@ ln_post + proj1 + GELU + proj2 → output [N, 1024]
 - `max_input_len` — prefill 时单次输入 token 数上限。**Qwen3-ASR 0.6B 默认 128**，太小，对流式有强约束（见 §4.2）
 - `max_kv_cache_capacity` — KV 缓存总容量。默认 256
 
+### 1.4 量化策略（**只有 embedding 做 FP8**）
+
+| 部件 | 精度 | 备注 |
+|---|---|---|
+| Embedding 表 `embedding.safetensors` | **FP8 E4M3**, per-row block 128 | 唯一被量化的，~50% 内存节省 |
+| Thinker hidden weights（28 层 attention + MLP）| FP16 | 官方原始精度 |
+| Activations | FP16 | |
+| KV cache | FP16 | |
+| Audio encoder | FP16 | |
+
+**重要警告**：不要尝试加 MLP INT8 或其他更激进的量化。本仓 `scripts/build_qwen3_asr_thinker_mlp_int8.py` 是历史**实验性 feasibility script**（docstring 自己写了 "not a production recipe"），把它当 production 工具用必撞 TRT Error 9（AttentionPlugin format negotiation），因为 EdgeLLM 的 AttentionPlugin 不支持 INT8 attention path。production engine 量化路径就是 FP8-embed-only，别折腾。
+
+### 1.5 Engine 构建 canonical 路径
+
+**production 路径**：
+
+```bash
+# Step 1: Export ONNX (with --fp8_embedding) — 在装了 qwen_asr + transformers 的 dev 机器上
+tensorrt-edgellm-export-llm \
+  --model_dir Qwen/Qwen3-ASR-0.6B \
+  --output_dir <out>/asr-fp8emb \
+  --fp8_embedding
+
+# 或者如果你已经有 FP16 embedding：
+python scripts/quantize_embedding_safetensors_fp8.py \
+  <onnx_dir>/embedding.safetensors \
+  <onnx_dir>/embedding.fp8.safetensors
+mv <onnx_dir>/embedding.fp8.safetensors <onnx_dir>/embedding.safetensors
+
+# Step 2: Build engine with the C++ llm_build binary (在目标设备上 build，SM 必须对齐)
+./build/examples/llm/llm_build \
+  --onnxDir <out>/asr-fp8emb \
+  --engineDir <out>/asr_thinker_full_fp8embed \
+  --maxBatchSize 1 \
+  --maxInputLen 256 \
+  --maxKVCacheCapacity 512
+```
+
+参考文档：`tensorrt-edge-llm/docs/source/user_guide/features/fp8-embedding.md`
+
+本仓提供一键 wrapper：`scripts/build_qwen3_asr_thinker_engine.sh`（env override `ONNX_DIR / ENGINE_DIR / MAX_INPUT_LEN / MAX_KV`）。
+
+**坑警告**：`llm_build` 自己从 `embedding.safetensors` 的 metadata 自动识别 FP8，**不需要 build flag**。但 plugin 必须用 `_asr` 变体（注册了 `qkv_scales` attribute），如果 plugin 路径默认指向 `build_sm87/libNvInfer_edgellm_plugin.so` 而这条路径在你机器上不存在，编译时会 fallback 到 generic plugin → Error 9。务必显式 `--plugin /path/to/libNvInfer_edgellm_plugin_asr.so` 或确认 build_sm87/ 链接到正确变体。
+
 ## 2. 为什么"切 encoder"做流式行不通
 
 ### 2.1 朴素切分（dead path #1）
@@ -346,6 +390,46 @@ Qwen3-ASR encoder 接受 `[num_chunks, 128, 100]` 形状的 mel。每 chunk 是 
 
 中文 token 经常是 3-byte UTF-8。`tokenizer.decode(tokens[:-K])` 可能切在字符中间，输出含 `�`（U+FFFD 替换字符）。官方 retry 循环逐个增大 K 直到合法。**移植时不要省掉这个 retry**。
 
+### 7.10 Out-of-tree worker source 重复拷贝（**multi-repo 必踩**）
+
+如果你的产品有多个仓（如本项目：`qwen3-edgellm-jetson` 项目仓 + `jetson-voice` serving 仓），**把同一份 worker C++ 在两个仓里各拷一份**是常见反模式：
+- 历史上某次 `cp -r` 之后两边各自演化
+- 实际 build 跑的是 jetson-voice 那份（CMake 在 jetson-voice 里）
+- 开发者在项目仓改了代码，commit 推到 origin，但 build 用的还是 jetson-voice 那份没改的版本 → "**改了没生效**"
+
+诊断特征：
+- 两份 `qwen3_asr_worker.cpp` md5 不同
+- git log 跨仓比对发现独立 evolution
+
+修复方法（本仓采用）：
+- 项目仓做 canonical（所有 .cpp/.h/CMakeLists/tests 都在这里）
+- jetson-voice CMakeLists 加 cache 变量指向 sibling：
+  ```cmake
+  set(WORKER_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../qwen3-edgellm-jetson/native/edgellm_voice_worker"
+      CACHE PATH "Worker C++ source root")
+  if(NOT EXISTS "${WORKER_SRC_DIR}/qwen3_asr_worker.cpp")
+    message(FATAL_ERROR "Canonical worker source missing at ${WORKER_SRC_DIR}.")
+  endif()
+  add_executable(qwen3_asr_worker ${WORKER_SRC_DIR}/qwen3_asr_worker.cpp)
+  # ... 其他 source ref 同样改 ${WORKER_SRC_DIR}/...
+  ```
+- 删 jetson-voice 那份所有重复文件，只留 CMakeLists + stub README
+- Reproducer 永远 clone 两仓到 sibling 路径，relative path 永远成立
+
+**移植到其他硬件时**：先想清楚 worker source 的唯一 home，CMake 引用统一。**不要让两个仓各维护一份**。
+
+### 7.11 `mlp_int8` script 看着像 production 实际不是
+
+本仓 `scripts/build_qwen3_asr_thinker_mlp_int8.py` 是历史实验文件，docstring 自己写：
+
+> "This is a **feasibility builder for W8A16/PTQ, not a production recipe**.
+> It keeps attention and lm_head conservative while forcing only
+> `/mlp/{gate,up,down}_proj/MatMul` layers to INT8..."
+
+**别用它**。production engine 用 §1.5 的 `llm_build` C++ 二进制建，量化策略是 FP8-embed-only。误用 `mlp_int8` script 会撞 Error 9 AttentionPlugin format negotiation —— plugin 不支持 INT8 attention path 的 dtype 组合。
+
+调试时这个误判我们交了 1 整天学费，**记下来**。
+
 ## 8. 路径图（演化路线）
 
 ```
@@ -389,5 +473,66 @@ P2 (long-term, 真低延迟):
 
 ---
 
-最后修改：2026-05-13
+---
+
+## 11. 跨硬件适配 checklist（适配到下个目标设备时照走）
+
+### 11.1 硬件 / 编译环境前置
+
+- [ ] 目标 SM 版本（Orin 系列都是 SM 87，AGX 87，RK3576 不是 NVIDIA）
+- [ ] TensorRT 版本对齐到 production：当前是 **10.3**（`libnvinfer.so.10`）
+- [ ] CUDA / cuDNN 版本对齐：CUDA 12.6 / cuDNN 9.3 / JetPack 6.2
+- [ ] 在目标设备上独立 build `TensorRT-Edge-LLM`：engine 必须用 SM 对齐的 plugin 编译
+- [ ] 目标设备能跑 `tensorrt-edgellm-export-llm` Python toolchain（或在 dev 机器上 export ONNX 后传过去）
+
+### 11.2 内存预算（关键）
+
+按目标设备 RAM 估 engine 参数上限：
+
+| RAM | Build-time peak | Runtime peak | 推荐 max_input_len | 备注 |
+|---|---|---|---|---|
+| 8 GB（Orin Nano） | 容器全停后约 ~6 GB 可用 | 1.5 GB | 128 | 太紧，需停其他容器 build；运行时 ~6.5 GB |
+| 16 GB（Orin NX） | 容器全停后约 ~12 GB 可用 | 2 GB | 256 (production) / 512 (long-form) | 当前 production 配置 |
+| 32 GB+（Orin AGX）| 16 GB+ 可用 | 3 GB | 512 / 1024 | 长 dictation 场景 |
+| 云端 GPU（A10G+） | TB 级 | 任意 | 任意 | 不约束 |
+
+**坑提醒**：build-time peak（TRT 优化器 + INT8 calibrator）**远大于 runtime**。Nano 8GB 建议在 dev 机器（NX 或 AGX）build engine 后传过去，**同 SM 87 engine 跨设备 portable**。
+
+### 11.3 后端选型 / 后端 API
+
+| 目标后端 | 备注 |
+|---|---|
+| EdgeLLM (本 fork) | 当前 production；C++ runtime + Python export；Orin 友好 |
+| vLLM (upstream) | 官方 streaming 实现就在这；x86 GPU 优先；ARM 支持 weak |
+| TensorRT-LLM (upstream) | NVIDIA 官方；engine 直接 portable；plugin 兼容性需测 |
+| ONNX Runtime | 跨平台广；ARM/x86/手机都行；但 multimodal audio 支持差 |
+| llama.cpp | CPU 友好；目前不支持 Qwen3-ASR 多模态 |
+| RKNN / Hailo / 其他边缘加速器 | 多媒体编解码芯片；Qwen3-ASR 多模态支持各家差异大，需逐个评估 |
+
+### 11.4 跨硬件必测项
+
+1. **One-shot 字节相等**：现存 reproduction WAV 走老 → 新两套 backend 输出文本对比
+2. **流式 LCS ≥ 0.95**：3 个 reproduction prompts × 2 模式（mel / pcm）共 6 条用例
+3. **End-of-speech 延迟 ≤ 500ms 中位、≤ 1000ms p95**：M5 scenarios C
+4. **长 utterance 单 final**（auto-segment 路径）：M5 scenarios D
+5. **错误路径**：恶意 JSON / unknown event / oversize chunk → 正确 cleanup
+6. **多 session 串行**：begin → end → begin 第二轮等价于第一轮
+
+完整 acceptance test：`scripts/test_streaming_worker.py`（移植时各 backend 自己实现 worker，但 driver script 通用）。
+
+### 11.5 文档同步
+
+每个目标设备适配完，回头更新两个东西：
+- 本 recipe doc §6 实测数据汇总（加该设备的 LCS / 延迟 / engine size 数据）
+- `deploy/artifacts/qwen3_manifest.json` 新增 artifact set 条目
+
+### 11.6 已知不适配场景
+
+- **真低延迟（<300ms 首词）**：需要 P2 fine-tune chunk-causal encoder，本 recipe 不覆盖
+- **长 dictation（>20s）**：需要 VAD-aligned segmentation 或 max_input_len ≥ 1024 engine
+- **多语言混合时长**：单 session 内频繁切换语种可能撞模型 OOD 限制（待测）
+
+---
+
+最后修改：2026-05-14
 对应的本项目实战详细设计文档：`docs/plans/qwen3-asr-streaming-design-2026-05-13.md`
