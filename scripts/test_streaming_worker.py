@@ -195,6 +195,9 @@ def strip_language_prefix(text: str) -> str:
 # LCS-similarity (mirrors scripts/verify_reproduction.py policy).
 # ---------------------------------------------------------------------------
 def lcs_similarity(a: str, b: str) -> float:
+    strip = lambda s: "".join(c for c in s if c not in "。，、！？.,!?、，。 \t\n")
+    a = strip(a)
+    b = strip(b)
     if not a and not b:
         return 1.0
     if not a or not b:
