@@ -15,12 +15,14 @@
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "tokenizer/tokenizer.h"
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <cerrno>
 #include <cmath>
@@ -45,6 +47,7 @@ struct Args
     std::string multimodalEngineDir;
     std::string melSettingsPath;     //!< whisper_feature_extractor.json (optional, enables PCM input)
     std::string melFiltersPath;      //!< mel_filters.bin (optional, enables PCM input)
+    int32_t maxSlots{4};             //!< ASR decoder slot-pool size (D1 concurrency). Default 4.
     bool debug{false};
 };
 
@@ -75,8 +78,19 @@ struct Args
 // Lines with no `event` field hit the legacy one-shot handler — required
 // for byte-equivalent backward compatibility with M2 callers.
 //
-// Single-session worker: a `begin` arriving while another session is active
-// is refused with {"event":"error","error":"session_already_active"}.
+// Slot-pool worker (D1 Step 3): up to --max_slots concurrent logical sessions,
+// each routed by its `id` to an independent decoder slot (own runtime +
+// IExecutionContext + KV state + CUDA stream, sharing one base engine). A
+// `begin` for a NEW id when every slot is busy is refused with
+// {"event":"error","error":"pool_saturated","status":4429}. A `begin` for an
+// id that already owns a slot reuses it (idempotent re-begin). With
+// --max_slots=1 the behaviour reduces to the prior single-session worker
+// (one slot; a second concurrent id gets pool_saturated).
+//
+// NOTE: the worker drives a SINGLE stdin poll() loop (one OS thread), so events
+// are processed serially even when several sessions are interleaved on the
+// stream; the routing tables are still mutex-guarded for forward compatibility
+// with a future thread-per-connection front-end.
 // ---------------------------------------------------------------------------
 
 // §15.5.1 — engine cap is max_input_len=256 (rebuilt P1, highperf-v2/
@@ -176,6 +190,248 @@ void freeSession(AsrSessionState& session)
     session = AsrSessionState{};
 }
 
+// ===========================================================================
+// ASR slot-pool (Phase D-1, Step 2 scaffolding).
+//
+// C-optimized concurrency layout:
+//   * ONE shared audio encoder context, serialized by gEncoderMutex. Measured
+//     N=4 encoder GPU utilization is only ~16%, so a single time-sliced
+//     encoder context is the right trade-off for now (the encoder lives inside
+//     each runtime today; gEncoderMutex is the conservative guard until
+//     audio-runner multi-context safety is separately proven — spec §2 / R2).
+//   * N decoder/"thinker" slots, each with its OWN
+//     LLMInferenceSpecDecodeRuntime + IExecutionContext + KV/cache manager
+//     state + runtime tensors + CUDA stream, all SHARING one deserialized base
+//     ICudaEngine (weight memory paid once; fork shared-engine constructor).
+//
+// Step 2 builds the pool data structures + initialization ONLY. Request
+// routing (begin/chunk/end -> slot) stays on the single-session path; Step 3
+// wires acquire/release into dispatch.
+//
+// Reference: MossTtsNanoSlot + mPoolMutex/mSlots/acquirePoolSlot/releasePoolSlot
+// in cpp/runtime/mossTtsNanoRuntime.{h,cpp} of the TensorRT-Edge-LLM fork.
+// ===========================================================================
+
+//! Per-slot decoder state. One AsrSlot == one logical ASR session capacity.
+//! Owns an independent runtime + CUDA stream + the full per-session token/mel
+//! state that used to live in the single `AsrSessionState session`. Two live
+//! sessions therefore never share KV state, runtime tensors, or accumulators.
+struct AsrSlot
+{
+    int32_t slotId{-1};
+    std::atomic<bool> inUse{false};
+
+    //! Per-slot decoder runtime. Slot 0 deserializes the base engine; slots
+    //! 1..N-1 share slot 0's ICudaEngine via the fork shared-engine path.
+    std::unique_ptr<rt::LLMInferenceSpecDecodeRuntime> thinker;
+
+    //! Per-slot CUDA stream. Each slot's handleRequest passes THIS stream so
+    //! independent execution contexts can (eventually) overlap on the GPU.
+    cudaStream_t stream{nullptr};
+
+    //! Per-slot streaming/inference state (moved out of the single session).
+    AsrSessionState session{};
+
+    AsrSlot() = default;
+    // Non-copyable / non-movable: holds std::atomic + CUDA stream + unique runtime.
+    AsrSlot(AsrSlot const&) = delete;
+    AsrSlot& operator=(AsrSlot const&) = delete;
+};
+
+//! Number of decoder slots. Default 4; overridable via --max_slots CLI.
+int32_t gMaxSlots{4};
+
+//! The slot pool. Sized to gMaxSlots by initSlotPool(). Held via unique_ptr
+//! because AsrSlot contains std::atomic (non-movable), so the vector must not
+//! relocate-move its elements.
+std::vector<std::unique_ptr<AsrSlot>> gSlotPool;
+
+//! Guards slot bring-up/teardown bookkeeping (acquire/release/init/shutdown).
+std::mutex gPoolMutex;
+
+//! Serializes the SHARED audio encoder path across slots (spec §2 / R2).
+//! Held only around the encoder portion of a hop once Step 3 wires routing.
+std::mutex gEncoderMutex;
+
+//! Step 3 — sessionId → slotId routing table.
+//!
+//! Maps the client-supplied stable session id (begin/chunk/end `id`) onto the
+//! slot index that acquireSlot() handed out at begin. chunk/end look the slot
+//! up here; end erases the entry after releaseSlot().
+//!
+//! THREAD-SAFETY NOTE: the product worker drives a SINGLE stdin poll() loop
+//! (one OS thread — see main()), so begin/chunk/end events are processed
+//! strictly serially even when multiple logical sessions are interleaved on
+//! the stream. This map therefore sees no true concurrent access today. It is
+//! still guarded by gSessionMapMutex so the routing layer stays correct if a
+//! future thread-per-connection front-end is added, and because acquire/
+//! release already take gPoolMutex (this mutex orders strictly below it — we
+//! never hold gSessionMapMutex while calling acquire/releaseSlot to avoid any
+//! lock-ordering coupling).
+std::unordered_map<std::string, int32_t> gSessionToSlot;
+std::mutex gSessionMapMutex;
+
+//! Look up the slot index bound to @p sessionId. Returns -1 if no live mapping
+//! exists (session was never begun, already ended, or timed out).
+int32_t lookupSlot(std::string const& sessionId)
+{
+    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
+    auto const it = gSessionToSlot.find(sessionId);
+    return it == gSessionToSlot.end() ? -1 : it->second;
+}
+
+//! Bind sessionId → slotId. Caller must already hold a freshly acquired slot.
+void bindSession(std::string const& sessionId, int32_t slotId)
+{
+    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
+    gSessionToSlot[sessionId] = slotId;
+}
+
+//! Remove the sessionId → slot mapping (end / timeout / error cleanup).
+void unbindSession(std::string const& sessionId)
+{
+    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
+    gSessionToSlot.erase(sessionId);
+}
+
+//! Acquire a free slot for @p sessionId.
+//!
+//! Lock-free claim via atomic compare_exchange on each slot's `inUse`. On
+//! success, resets the slot's session state and stamps the sessionId, then
+//! returns the slot index. Returns -1 when every slot is busy (caller emits a
+//! pool-saturation error / 4429 — wired in Step 3).
+//!
+//! NOTE (Step 2): not yet called from the dispatch loop; defined so Step 3 can
+//! route begin events through it. Same-sessionId remapping (idempotent begin)
+//! is a Step-3 concern and intentionally NOT handled here.
+int32_t acquireSlot(std::string const& sessionId)
+{
+    std::lock_guard<std::mutex> const guard(gPoolMutex);
+    for (auto& slotPtr : gSlotPool)
+    {
+        bool expected = false;
+        if (slotPtr->inUse.compare_exchange_strong(expected, true))
+        {
+            // Reset per-slot session state before reuse so we never read a
+            // prior session's token/mel/KV accumulators (slot reuse contract).
+            freeSession(slotPtr->session);
+            slotPtr->session.sessionId = sessionId;
+            return slotPtr->slotId;
+        }
+    }
+    return -1; // pool saturated
+}
+
+//! Release a slot back to the free list and reset reusable state.
+//!
+//! Clears the per-slot AsrSessionState via freeSession() (token buffer, mel
+//! accumulators, decoded text, PCM accumulator, etc.) and marks the slot free.
+//!
+//! [Step 3 NOTE — decoder KV/runtime reset] The fork
+//! LLMInferenceSpecDecodeRuntime exposes beginAsrSession()/endAsrSession()
+//! keyed on a SpecDecodeInferenceContext but NO generic reset()/resetState().
+//! The current worker drives decode via handleRequest (no explicit
+//! begin/endAsrSession), so there is no in-runtime KV state to clear between
+//! reuses on the handleRequest path today. Once Step 3 routes per-slot
+//! begin/end, releaseSlot must also tear down any runtime-level per-session
+//! state (endAsrSession on the slot's inference context, or a runtime reset
+//! API if one is added). Marked [needs Step 3 handling].
+void releaseSlot(int32_t slotId)
+{
+    std::lock_guard<std::mutex> const guard(gPoolMutex);
+    if (slotId < 0 || static_cast<size_t>(slotId) >= gSlotPool.size())
+    {
+        return;
+    }
+    auto& slot = *gSlotPool[static_cast<size_t>(slotId)];
+    freeSession(slot.session); // clears token/mel/PCM/decoded-text accumulators
+    // [Step 3 — KV teardown] The streaming path drives decode through
+    // runStreamingHop → runtime.handleRequest with NO explicit
+    // beginAsrSession/endAsrSession, so the fork runtime holds no per-session KV
+    // state that survives between handleRequest calls — each hop rebuilds its
+    // prefill from the prefix + mel and the runtime's KV/cache manager is
+    // re-driven per request. There is therefore no in-runtime KV residue to
+    // clear here today; the freeSession() above resets all worker-side
+    // accumulators. If a future change routes per-slot begin/endAsrSession
+    // (explicit SpecDecodeInferenceContext sessions), call endAsrSession on the
+    // slot's context HERE before marking the slot free. [confirmed no residue]
+    slot.inUse.store(false);
+}
+
+//! Build the N-slot decoder pool sharing one deserialized base ICudaEngine.
+//!
+//! Slot 0 takes the EXISTING path-based vanilla constructor (deserializes the
+//! base engine once + loads its own multimodal/audio encoder + tokenizer +
+//! embedding). Slots 1..N-1 use the fork shared-engine constructor overload,
+//! passing slot 0's base engine via getBaseEngine() so the heavy LLM weights
+//! are paid for ONCE while each slot keeps its own IExecutionContext, KV/cache
+//! state, runtime tensors, shared-exec-context memory, and CUDA stream.
+//!
+//! @param engineDir            thinker/decoder engine dir (--engineDir)
+//! @param multimodalEngineDir  multimodal/audio engine dir (--multimodalEngineDir)
+//! @param loraWeightsMap       LoRA weights map (passed through to each runtime)
+//! @param enableCudaGraph      capture decoding CUDA graph per slot when true
+//!
+//! NOTE (Step 2): called from main() to replace the single-runtime init. The
+//! single-session dispatch path then drives slot 0 only (Step 3 fans out).
+void initSlotPool(std::string const& engineDir, std::string const& multimodalEngineDir,
+    std::unordered_map<std::string, std::string>& loraWeightsMap, bool enableCudaGraph)
+{
+    std::lock_guard<std::mutex> const guard(gPoolMutex);
+    int32_t const n = std::max(1, gMaxSlots);
+    gSlotPool.clear();
+    gSlotPool.reserve(static_cast<size_t>(n));
+
+    for (int32_t i = 0; i < n; ++i)
+    {
+        auto slot = std::make_unique<AsrSlot>();
+        slot->slotId = i;
+        slot->inUse.store(false);
+        CUDA_CHECK(cudaStreamCreate(&slot->stream));
+
+        if (i == 0)
+        {
+            // Slot 0: existing path-based vanilla constructor deserializes the
+            // base engine once and loads multimodal/audio + tokenizer + embeds.
+            slot->thinker = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+                engineDir, multimodalEngineDir, loraWeightsMap, slot->stream);
+        }
+        else
+        {
+            // Slots 1..N-1: SHARE slot 0's deserialized base ICudaEngine. Each
+            // still loads its own multimodal/audio runner, tokenizer, embedding
+            // table, and allocates its own IExecutionContext + KV/cache + shared
+            // execution-context memory — only base LLM weights are shared.
+            std::shared_ptr<nvinfer1::ICudaEngine> sharedBase = gSlotPool[0]->thinker->getBaseEngine();
+            slot->thinker = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
+                sharedBase, engineDir, multimodalEngineDir, loraWeightsMap, slot->stream);
+        }
+
+        if (enableCudaGraph && !slot->thinker->captureDecodingCUDAGraph(slot->stream))
+        {
+            LOG_WARNING("CUDA graph capture failed for ASR slot %d, proceeding without.", i);
+        }
+        gSlotPool.push_back(std::move(slot));
+    }
+}
+
+//! Destroy all slot CUDA streams + runtimes. Called at worker shutdown so EOF
+//! / OVS restart releases every slot's GPU resources (spec §6 / R4).
+void destroySlotPool()
+{
+    std::lock_guard<std::mutex> const guard(gPoolMutex);
+    for (auto& slotPtr : gSlotPool)
+    {
+        if (slotPtr->stream != nullptr)
+        {
+            cudaStreamDestroy(slotPtr->stream);
+            slotPtr->stream = nullptr;
+        }
+        slotPtr->thinker.reset();
+    }
+    gSlotPool.clear();
+}
+
 //! Global MelExtractor handle (M4 step 5).  Loaded once at startup if the
 //! caller passed --melSettings / --melFilters (or set the matching env vars).
 //! Null means PCM input is disabled and `pcm_b64` chunks are refused.
@@ -251,16 +507,18 @@ enum OptionId : int
     MULTIMODAL_ENGINE_DIR,
     MEL_SETTINGS,
     MEL_FILTERS,
+    MAX_SLOTS,
     DEBUG,
 };
 
 void printUsage(char const* programName)
 {
     std::cerr << "Usage: " << programName << " --engineDir=<path> --multimodalEngineDir=<path>"
-              << " [--melSettings=<json>] [--melFilters=<bin>] [--debug]\n\n"
+              << " [--melSettings=<json>] [--melFilters=<bin>] [--max_slots=<N>] [--debug]\n\n"
               << "Reads llm_inference-compatible JSON lines from stdin and writes JSON lines to stdout.\n"
               << "Pass --melSettings + --melFilters (or set EDGE_LLM_ASR_MEL_SETTINGS/EDGE_LLM_ASR_MEL_FILTERS)\n"
-              << "to enable PCM-input streaming via `pcm_b64` chunk events.\n";
+              << "to enable PCM-input streaming via `pcm_b64` chunk events.\n"
+              << "--max_slots=<N> sets the ASR decoder slot-pool size (default 4; D1 concurrency).\n";
 }
 
 bool parseArgs(Args& args, int argc, char** argv)
@@ -270,6 +528,7 @@ bool parseArgs(Args& args, int argc, char** argv)
         {"multimodalEngineDir", required_argument, 0, MULTIMODAL_ENGINE_DIR},
         {"melSettings", required_argument, 0, MEL_SETTINGS},
         {"melFilters", required_argument, 0, MEL_FILTERS},
+        {"max_slots", required_argument, 0, MAX_SLOTS},
         {"debug", no_argument, 0, DEBUG},
         {0, 0, 0, 0}};
 
@@ -283,6 +542,12 @@ bool parseArgs(Args& args, int argc, char** argv)
         case MULTIMODAL_ENGINE_DIR: args.multimodalEngineDir = optarg; break;
         case MEL_SETTINGS: args.melSettingsPath = optarg; break;
         case MEL_FILTERS: args.melFiltersPath = optarg; break;
+        case MAX_SLOTS:
+        {
+            int const v = std::atoi(optarg);
+            args.maxSlots = (v >= 1) ? v : 1; // clamp to >=1; 1 == single-session behavior
+            break;
+        }
         case DEBUG: args.debug = true; break;
         default: return false;
         }
@@ -296,6 +561,16 @@ bool parseArgs(Args& args, int argc, char** argv)
     if (args.melFiltersPath.empty())
     {
         if (char const* p = std::getenv("EDGE_LLM_ASR_MEL_FILTERS")) args.melFiltersPath = p;
+    }
+    // D1 slot-pool size env fallback (matches the OVS EDGE_LLM_ASR_MAX_CONCURRENT
+    // convention in spec §4). CLI --max_slots takes precedence when given.
+    if (args.maxSlots == 4)
+    {
+        if (char const* p = std::getenv("EDGE_LLM_ASR_MAX_CONCURRENT"))
+        {
+            int const v = std::atoi(p);
+            if (v >= 1) args.maxSlots = v;
+        }
     }
 
     return !args.engineDir.empty() && !args.multimodalEngineDir.empty();
@@ -659,7 +934,20 @@ HopResult runStreamingHop(std::string const& melPath, std::string const& prefix,
         llmReq.enableThinking = false;
 
         rt::LLMGenerationResponse llmResponse;
-        bool const ok = runtime.handleRequest(llmReq, llmResponse, stream);
+        // Step 3 — SHARED encoder serialization (spec §2 / R2). The audio
+        // encoder currently lives INSIDE each slot's runtime and is invoked as
+        // part of handleRequest (multimodal prefill), so it cannot be isolated
+        // and serialized on its own without a fork-side encoder split. Until
+        // that split lands we conservatively hold gEncoderMutex across the
+        // whole hop: this guarantees two slots never run their encoder passes
+        // concurrently (correctness/safety) at the cost of also serializing the
+        // decode portion. [needs follow-up fork-side encoder split to serialize
+        // ONLY the encoder and let decoders overlap across slots/streams.]
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> const encGuard(gEncoderMutex);
+            ok = runtime.handleRequest(llmReq, llmResponse, stream);
+        }
         result.ok = ok;
         if (ok && !llmResponse.outputTexts.empty())
         {
@@ -723,19 +1011,41 @@ HopResult runHop(std::string const& melPath, int32_t maxGenerateLength,
     return result;
 }
 
-void handleBegin(Json const& input, AsrSessionState& session)
+//! Step 3 — slot-routed begin. Acquires a free slot for this sessionId (or
+//! reuses the one already bound for an idempotent re-begin), binds the
+//! sessionId→slotId map, and initialises that slot's AsrSessionState. Emits a
+//! 4429 pool-saturated error when every slot is busy (replaces the old
+//! single-session `session_already_active` guard).
+void handleBegin(Json const& input)
 {
     std::string const id = input.value("id", "");
-    if (session.active)
+
+    // Idempotent begin: a `begin` for a sessionId that already owns a slot
+    // reuses that slot (we do NOT acquire a second one). This matches the
+    // old single-session semantics where re-begin re-initialised in place.
+    int32_t slotId = lookupSlot(id);
+    if (slotId < 0)
     {
-        Json ev = {{"event", "error"}, {"ok", false}, {"error", "session_already_active"}};
-        if (!id.empty())
+        // No live mapping → claim a fresh slot from the pool.
+        slotId = acquireSlot(id);
+        if (slotId < 0)
         {
-            ev["id"] = id;
+            // Pool saturated: every decoder slot is in use. Surface a 4429-style
+            // structured error so the front-end / session-limiter can back off
+            // (replaces the legacy `session_already_active` single-session guard).
+            Json ev = {{"event", "error"}, {"ok", false}, {"error", "pool_saturated"},
+                {"status", 4429}, {"max_slots", gMaxSlots}};
+            if (!id.empty())
+            {
+                ev["id"] = id;
+            }
+            std::cout << ev.dump() << std::endl;
+            return;
         }
-        std::cout << ev.dump() << std::endl;
-        return;
+        bindSession(id, slotId);
     }
+
+    AsrSessionState& session = gSlotPool[static_cast<size_t>(slotId)]->session;
     session = AsrSessionState{};
     session.sessionId = id;
     session.active = true;
@@ -828,12 +1138,28 @@ std::string dedupAtBoundary(std::string const& fullText, std::string const& newS
     return newSegment;
 }
 
-void handleChunk(Json const& input, AsrSessionState& session,
-    rt::LLMInferenceSpecDecodeRuntime& runtime, cudaStream_t stream,
+void handleChunk(Json const& input,
     std::unordered_map<std::string, std::string>& loraWeightsMap,
     StageTimingCounters& stageCounters, int32_t maxGenerateLength)
 {
     std::string const id = input.value("id", "");
+    // Step 3 — route to the slot bound at begin. A missing mapping means the
+    // session was never begun, already ended, or timed out.
+    int32_t const slotId = lookupSlot(id);
+    if (slotId < 0)
+    {
+        Json ev = {{"event", "error"}, {"ok", false}, {"error", "no_active_session"}};
+        if (!id.empty())
+        {
+            ev["id"] = id;
+        }
+        std::cout << ev.dump() << std::endl;
+        return;
+    }
+    AsrSlot& slot = *gSlotPool[static_cast<size_t>(slotId)];
+    AsrSessionState& session = slot.session;
+    rt::LLMInferenceSpecDecodeRuntime& runtime = *slot.thinker;
+    cudaStream_t const stream = slot.stream;
     if (!session.active)
     {
         Json ev = {{"event", "error"}, {"ok", false}, {"error", "no_active_session"}};
@@ -844,6 +1170,29 @@ void handleChunk(Json const& input, AsrSessionState& session,
         std::cout << ev.dump() << std::endl;
         return;
     }
+
+    // Step 3 — slot release guard. Every terminal path in this handler (error
+    // cleanup AND the last=true final) calls freeSession(session), which clears
+    // session.active. A partial/rotation hop returns with session.active still
+    // true (the session continues on this slot). So at scope exit we release
+    // the slot back to the pool + drop the routing mapping IFF the session
+    // became inactive — i.e. exactly when a terminal path fired. This keeps the
+    // ~7 existing freeSession() cleanup sites untouched while guaranteeing no
+    // slot leak on any exit path.
+    struct SlotReleaseGuard
+    {
+        AsrSessionState& s;
+        int32_t sid;
+        std::string id;
+        ~SlotReleaseGuard()
+        {
+            if (!s.active)
+            {
+                releaseSlot(sid);     // resets slot.session + marks slot free
+                unbindSession(id);    // drop sessionId → slot mapping
+            }
+        }
+    } slotReleaseGuard{session, slotId, id};
     bool const hasMelPath = input.contains("mel_path") && input["mel_path"].is_string();
     bool const hasPcm = input.contains("pcm_b64") && input["pcm_b64"].is_string();
     if (!hasMelPath && !hasPcm)
@@ -1127,12 +1476,18 @@ void handleChunk(Json const& input, AsrSessionState& session,
     std::cout << ev.dump() << std::endl;
 }
 
-void handleEnd(Json const& /*input*/, AsrSessionState& session,
-    rt::LLMInferenceSpecDecodeRuntime& /*runtime*/, cudaStream_t /*stream*/,
-    std::unordered_map<std::string, std::string>& /*loraWeightsMap*/,
-    StageTimingCounters& /*stageCounters*/, int32_t /*maxGenerateLength*/)
+void handleEnd(Json const& input)
 {
-    std::string const id = session.sessionId;
+    std::string const id = input.value("id", "");
+    // Step 3 — route to the slot bound at begin; emit end_ack if unknown.
+    int32_t const slotId = lookupSlot(id);
+    if (slotId < 0)
+    {
+        Json ev = {{"event", "end_ack"}, {"id", id}};
+        std::cout << ev.dump() << std::endl;
+        return;
+    }
+    AsrSessionState& session = gSlotPool[static_cast<size_t>(slotId)]->session;
     // The driver flags the final hop via last=true on a chunk event (which
     // emits the `final` event there). Bare `end` events emit a `final` with
     // whatever fullText we have accumulated and close the session.
@@ -1147,7 +1502,11 @@ void handleEnd(Json const& /*input*/, AsrSessionState& session,
         Json ev = {{"event", "end_ack"}, {"id", id}};
         std::cout << ev.dump() << std::endl;
     }
-    freeSession(session);
+    // Step 3 — release the slot back to the pool and drop the routing mapping.
+    // releaseSlot() performs freeSession() on the slot (token/mel/PCM/decoded
+    // accumulators) so no cross-session KV/state residue survives the reuse.
+    releaseSlot(slotId);
+    unbindSession(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1265,45 +1624,62 @@ int main(int argc, char** argv)
     // SPIKE — enable stage timing so the chunk handler can report per-stage ms.
     setProfilingEnabled(true);
 
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
     auto const initStart = std::chrono::steady_clock::now();
     std::unordered_map<std::string, std::string> loraWeightsMap;
-    auto runtime = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
-        args.engineDir, args.multimodalEngineDir, loraWeightsMap, stream);
     bool const enableGraph = std::getenv("EDGE_LLM_ASR_CUDA_GRAPH") == nullptr
         || std::string(std::getenv("EDGE_LLM_ASR_CUDA_GRAPH")) != "0";
-    if (enableGraph && !runtime->captureDecodingCUDAGraph(stream))
-    {
-        LOG_WARNING("CUDA graph capture failed for ASR worker, proceeding without.");
-    }
-    double const initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
-    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}}.dump() << std::endl;
 
-    // Single-session worker per §15.6. Multi-session is out of scope for P0.
-    AsrSessionState session;
+    // D1 (Step 2): build the N-slot decoder pool. Slot 0 deserializes the base
+    // engine once; slots 1..N-1 SHARE that ICudaEngine via the fork
+    // shared-engine constructor (weight memory paid once, contexts independent).
+    // Each slot owns its own CUDA stream. CUDA-graph capture is per-slot.
+    gMaxSlots = args.maxSlots;
+    initSlotPool(args.engineDir, args.multimodalEngineDir, loraWeightsMap, enableGraph);
+
+    double const initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
+    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}, {"max_slots", gMaxSlots}}.dump() << std::endl;
+
+    // Step 3: begin/chunk/end now route by sessionId across ALL slots (see the
+    // handle* functions, which call lookupSlot/acquireSlot/releaseSlot). The
+    // legacy one-shot path (lines with no `event` field) keeps using slot 0's
+    // runtime + stream — it is a single serial request flow and never touches
+    // the slot pool's session state.
+    AsrSlot& slot0 = *gSlotPool[0];
+    rt::LLMInferenceSpecDecodeRuntime* runtime = slot0.thinker.get(); // one-shot legacy path only
+    cudaStream_t stream = slot0.stream;                              // one-shot legacy path only
     // SPIKE — cumulative stage entry counters; runHop diffs against these.
     StageTimingCounters stageCounters{};
     // SPIKE — per-hop decode budget. Generous default; driver controls hop cadence.
     int32_t const spikeMaxGenerateLength = 200;
 
     // Streaming worker stdin loop. Use poll() with 1 s timeout so we can fire
-    // a per-session idle-timeout check between events (§15.6 step 4).
-    auto const checkIdleTimeout = [&session]() {
-        if (!session.active)
-        {
-            return;
-        }
+    // an idle-timeout sweep between events (§15.6 step 4).
+    //
+    // Step 3 — sweep ALL slots (not just slot 0). Any slot whose session has
+    // been idle past kIdleTimeoutMs is force-closed: emit a timeout event then
+    // release the slot back to the pool and drop its routing mapping. Snapshot
+    // the (sessionId, idleMs) of timed-out slots first, then release outside
+    // the gather to keep the release path identical to the end/error path.
+    auto const checkIdleTimeout = []() {
         auto const now = std::chrono::steady_clock::now();
-        auto const idleMs
-            = std::chrono::duration_cast<std::chrono::milliseconds>(now - session.lastActivity).count();
-        if (idleMs > kIdleTimeoutMs)
+        for (auto& slotPtr : gSlotPool)
         {
-            std::string const sid = session.sessionId;
-            freeSession(session);
-            Json ev = {{"event", "timeout"}, {"id", sid}, {"idle_ms", idleMs}};
-            std::cout << ev.dump() << std::endl;
+            AsrSessionState& s = slotPtr->session;
+            if (!s.active)
+            {
+                continue;
+            }
+            auto const idleMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - s.lastActivity).count();
+            if (idleMs > kIdleTimeoutMs)
+            {
+                std::string const sid = s.sessionId;
+                int32_t const slotId = slotPtr->slotId;
+                releaseSlot(slotId);   // freeSession + mark slot free
+                unbindSession(sid);    // drop sessionId → slot mapping
+                Json ev = {{"event", "timeout"}, {"id", sid}, {"idle_ms", idleMs}};
+                std::cout << ev.dump() << std::endl;
+            }
         }
     };
 
@@ -1359,12 +1735,10 @@ int main(int argc, char** argv)
                 Json err = {{"event", "error"}, {"ok", false},
                     {"error", std::string("json_parse_failed: ") + e.what()}};
                 std::cout << err.dump() << std::endl;
-                // Drop any active session on malformed input — protects against
-                // a stuck client locking the worker.
-                if (session.active)
-                {
-                    freeSession(session);
-                }
+                // Step 3 — malformed input carries no parseable sessionId, so we
+                // cannot target a specific slot to drop. The idle-timeout sweep
+                // reaps any genuinely stuck slot after kIdleTimeoutMs; emitting
+                // the error and continuing is sufficient.
                 continue;
             }
 
@@ -1379,38 +1753,48 @@ int main(int argc, char** argv)
             std::string const event = parsed.value("event", "");
             if (event == "begin")
             {
-                handleBegin(parsed, session);
+                // Step 3 — routes via acquireSlot + binds sessionId → slot.
+                handleBegin(parsed);
             }
             else if (event == "chunk")
             {
-                handleChunk(parsed, session, *runtime, stream, loraWeightsMap, stageCounters,
-                    spikeMaxGenerateLength);
+                // Step 3 — routes via lookupSlot to the slot bound at begin.
+                handleChunk(parsed, loraWeightsMap, stageCounters, spikeMaxGenerateLength);
             }
             else if (event == "end")
             {
-                handleEnd(parsed, session, *runtime, stream, loraWeightsMap, stageCounters,
-                    spikeMaxGenerateLength);
+                // Step 3 — routes via lookupSlot + releases the slot.
+                handleEnd(parsed);
             }
             else
             {
                 Json err = {{"event", "error"}, {"ok", false}, {"error", "unknown_event"},
                     {"received", event}};
-                if (parsed.contains("id"))
+                std::string const evId = parsed.value("id", "");
+                if (!evId.empty())
                 {
-                    err["id"] = parsed["id"];
+                    err["id"] = evId;
                 }
                 std::cout << err.dump() << std::endl;
-                // Unknown event: free any active session for hygiene per §15.6
-                // step 4 error-path cleanup contract.
-                if (session.active)
+                // Step 3 — unknown event: if it names a live session, release
+                // that slot for hygiene per §15.6 step 4 error-path cleanup.
+                if (!evId.empty())
                 {
-                    freeSession(session);
+                    int32_t const evSlot = lookupSlot(evId);
+                    if (evSlot >= 0)
+                    {
+                        releaseSlot(evSlot);
+                        unbindSession(evId);
+                    }
                 }
             }
         }
         checkIdleTimeout();
     }
 
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    // D1 (Step 2): tear down ALL slots (streams + runtimes), not just slot 0.
+    // `stream`/`runtime`/`session` above are references INTO the pool, so we do
+    // NOT destroy them individually here (that would double-free slot 0).
+    destroySlotPool();
     return EXIT_SUCCESS;
 }
