@@ -14,6 +14,7 @@
 #include "requestFileParser.h"
 #include "runtime/llmInferenceSpecDecodeRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include "runtime/slotPool.h"
 #include "tokenizer/tokenizer.h"
 #include <atomic>
 #include <chrono>
@@ -241,121 +242,63 @@ struct AsrSlot
 //! Number of decoder slots. Default 4; overridable via --max_slots CLI.
 int32_t gMaxSlots{4};
 
-//! The slot pool. Sized to gMaxSlots by initSlotPool(). Held via unique_ptr
-//! because AsrSlot contains std::atomic (non-movable), so the vector must not
-//! relocate-move its elements.
-std::vector<std::unique_ptr<AsrSlot>> gSlotPool;
-
-//! Guards slot bring-up/teardown bookkeeping (acquire/release/init/shutdown).
-std::mutex gPoolMutex;
+//! D-2.5: the slot vector, capacity, sessionId→slot routing map (+its mutex),
+//! CAS acquire, bind/unbind/lookup, saturation are now provided by the generic
+//! SlotPool<AsrSlot> template (cpp/runtime/slotPool.h in the TRT-Edge-LLM fork,
+//! included cross-repo via the existing runtime/ include path). What stays in
+//! this worker: runtime/stream construction, the AsrSessionState reset (done
+//! BEFORE release / on begin — RISK POINTs 2 & 3), the single poll thread.
+namespace rt_slotpool = tensorrt_edge_llm::runtime;
+std::unique_ptr<rt_slotpool::SlotPool<AsrSlot>> gPool;
 
 //! Serializes the SHARED audio encoder path across slots (spec §2 / R2).
 //! Held only around the encoder portion of a hop once Step 3 wires routing.
 std::mutex gEncoderMutex;
 
-//! Step 3 — sessionId → slotId routing table.
-//!
-//! Maps the client-supplied stable session id (begin/chunk/end `id`) onto the
-//! slot index that acquireSlot() handed out at begin. chunk/end look the slot
-//! up here; end erases the entry after releaseSlot().
-//!
-//! THREAD-SAFETY NOTE: the product worker drives a SINGLE stdin poll() loop
-//! (one OS thread — see main()), so begin/chunk/end events are processed
-//! strictly serially even when multiple logical sessions are interleaved on
-//! the stream. This map therefore sees no true concurrent access today. It is
-//! still guarded by gSessionMapMutex so the routing layer stays correct if a
-//! future thread-per-connection front-end is added, and because acquire/
-//! release already take gPoolMutex (this mutex orders strictly below it — we
-//! never hold gSessionMapMutex while calling acquire/releaseSlot to avoid any
-//! lock-ordering coupling).
-std::unordered_map<std::string, int32_t> gSessionToSlot;
-std::mutex gSessionMapMutex;
-
 //! Look up the slot index bound to @p sessionId. Returns -1 if no live mapping
 //! exists (session was never begun, already ended, or timed out).
 int32_t lookupSlot(std::string const& sessionId)
 {
-    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
-    auto const it = gSessionToSlot.find(sessionId);
-    return it == gSessionToSlot.end() ? -1 : it->second;
+    return gPool->lookup(sessionId);
 }
 
 //! Bind sessionId → slotId. Caller must already hold a freshly acquired slot.
 void bindSession(std::string const& sessionId, int32_t slotId)
 {
-    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
-    gSessionToSlot[sessionId] = slotId;
+    gPool->bind(sessionId, slotId);
 }
 
 //! Remove the sessionId → slot mapping (end / timeout / error cleanup).
 void unbindSession(std::string const& sessionId)
 {
-    std::lock_guard<std::mutex> const guard(gSessionMapMutex);
-    gSessionToSlot.erase(sessionId);
-}
-
-//! Acquire a free slot for @p sessionId.
-//!
-//! Lock-free claim via atomic compare_exchange on each slot's `inUse`. On
-//! success, resets the slot's session state and stamps the sessionId, then
-//! returns the slot index. Returns -1 when every slot is busy (caller emits a
-//! pool-saturation error / 4429 — wired in Step 3).
-//!
-//! NOTE (Step 2): not yet called from the dispatch loop; defined so Step 3 can
-//! route begin events through it. Same-sessionId remapping (idempotent begin)
-//! is a Step-3 concern and intentionally NOT handled here.
-int32_t acquireSlot(std::string const& sessionId)
-{
-    std::lock_guard<std::mutex> const guard(gPoolMutex);
-    for (auto& slotPtr : gSlotPool)
-    {
-        bool expected = false;
-        if (slotPtr->inUse.compare_exchange_strong(expected, true))
-        {
-            // Reset per-slot session state before reuse so we never read a
-            // prior session's token/mel/KV accumulators (slot reuse contract).
-            freeSession(slotPtr->session);
-            slotPtr->session.sessionId = sessionId;
-            return slotPtr->slotId;
-        }
-    }
-    return -1; // pool saturated
+    gPool->unbind(sessionId);
 }
 
 //! Release a slot back to the free list and reset reusable state.
 //!
-//! Clears the per-slot AsrSessionState via freeSession() (token buffer, mel
-//! accumulators, decoded text, PCM accumulator, etc.) and marks the slot free.
+//! RISK POINT 3 — session reset MUST happen BEFORE the slot is marked free, so
+//! a slot handed back out by a subsequent acquire never carries a prior
+//! session's token/mel/KV accumulators. The generic SlotPool::release() clears
+//! `inUse` ONLY, so this wrapper performs freeSession() FIRST, then release().
+//! Ordering is preserved exactly as the legacy releaseSlot (freeSession →
+//! mark-free).
 //!
-//! [Step 3 NOTE — decoder KV/runtime reset] The fork
-//! LLMInferenceSpecDecodeRuntime exposes beginAsrSession()/endAsrSession()
-//! keyed on a SpecDecodeInferenceContext but NO generic reset()/resetState().
-//! The current worker drives decode via handleRequest (no explicit
-//! begin/endAsrSession), so there is no in-runtime KV state to clear between
-//! reuses on the handleRequest path today. Once Step 3 routes per-slot
-//! begin/end, releaseSlot must also tear down any runtime-level per-session
-//! state (endAsrSession on the slot's inference context, or a runtime reset
-//! API if one is added). Marked [needs Step 3 handling].
+//! [decoder KV/runtime reset] The streaming path drives decode through
+//! runStreamingHop → runtime.handleRequest with NO explicit
+//! beginAsrSession/endAsrSession, so the fork runtime holds no per-session KV
+//! state that survives between handleRequest calls — each hop rebuilds its
+//! prefill from the prefix + mel. There is therefore no in-runtime KV residue
+//! to clear here; the freeSession() below resets all worker-side accumulators.
+//! [confirmed no residue]
 void releaseSlot(int32_t slotId)
 {
-    std::lock_guard<std::mutex> const guard(gPoolMutex);
-    if (slotId < 0 || static_cast<size_t>(slotId) >= gSlotPool.size())
+    AsrSlot* slot = gPool->get(slotId);
+    if (slot == nullptr)
     {
         return;
     }
-    auto& slot = *gSlotPool[static_cast<size_t>(slotId)];
-    freeSession(slot.session); // clears token/mel/PCM/decoded-text accumulators
-    // [Step 3 — KV teardown] The streaming path drives decode through
-    // runStreamingHop → runtime.handleRequest with NO explicit
-    // beginAsrSession/endAsrSession, so the fork runtime holds no per-session KV
-    // state that survives between handleRequest calls — each hop rebuilds its
-    // prefill from the prefix + mel and the runtime's KV/cache manager is
-    // re-driven per request. There is therefore no in-runtime KV residue to
-    // clear here today; the freeSession() above resets all worker-side
-    // accumulators. If a future change routes per-slot begin/endAsrSession
-    // (explicit SpecDecodeInferenceContext sessions), call endAsrSession on the
-    // slot's context HERE before marking the slot free. [confirmed no residue]
-    slot.inUse.store(false);
+    freeSession(slot->session); // RISK POINT 3: reset BEFORE marking free
+    gPool->release(slotId);     // clears inUse only
 }
 
 //! Build the N-slot decoder pool sharing one deserialized base ICudaEngine.
@@ -377,10 +320,9 @@ void releaseSlot(int32_t slotId)
 void initSlotPool(std::string const& engineDir, std::string const& multimodalEngineDir,
     std::unordered_map<std::string, std::string>& loraWeightsMap, bool enableCudaGraph)
 {
-    std::lock_guard<std::mutex> const guard(gPoolMutex);
     int32_t const n = std::max(1, gMaxSlots);
-    gSlotPool.clear();
-    gSlotPool.reserve(static_cast<size_t>(n));
+    gPool = std::make_unique<rt_slotpool::SlotPool<AsrSlot>>(n);
+    auto& slots = gPool->slots();
 
     for (int32_t i = 0; i < n; ++i)
     {
@@ -402,7 +344,7 @@ void initSlotPool(std::string const& engineDir, std::string const& multimodalEng
             // still loads its own multimodal/audio runner, tokenizer, embedding
             // table, and allocates its own IExecutionContext + KV/cache + shared
             // execution-context memory — only base LLM weights are shared.
-            std::shared_ptr<nvinfer1::ICudaEngine> sharedBase = gSlotPool[0]->thinker->getBaseEngine();
+            std::shared_ptr<nvinfer1::ICudaEngine> sharedBase = slots[0]->thinker->getBaseEngine();
             slot->thinker = std::make_unique<rt::LLMInferenceSpecDecodeRuntime>(
                 sharedBase, engineDir, multimodalEngineDir, loraWeightsMap, slot->stream);
         }
@@ -411,7 +353,7 @@ void initSlotPool(std::string const& engineDir, std::string const& multimodalEng
         {
             LOG_WARNING("CUDA graph capture failed for ASR slot %d, proceeding without.", i);
         }
-        gSlotPool.push_back(std::move(slot));
+        slots.push_back(std::move(slot));
     }
 }
 
@@ -419,8 +361,12 @@ void initSlotPool(std::string const& engineDir, std::string const& multimodalEng
 //! / OVS restart releases every slot's GPU resources (spec §6 / R4).
 void destroySlotPool()
 {
-    std::lock_guard<std::mutex> const guard(gPoolMutex);
-    for (auto& slotPtr : gSlotPool)
+    if (!gPool)
+    {
+        return;
+    }
+    // Worker keeps ownership of runtime/stream teardown (OUT of the template).
+    for (auto& slotPtr : gPool->slots())
     {
         if (slotPtr->stream != nullptr)
         {
@@ -429,7 +375,8 @@ void destroySlotPool()
         }
         slotPtr->thinker.reset();
     }
-    gSlotPool.clear();
+    gPool->clear();
+    gPool.reset();
 }
 
 //! Global MelExtractor handle (M4 step 5).  Loaded once at startup if the
@@ -1020,32 +967,31 @@ void handleBegin(Json const& input)
 {
     std::string const id = input.value("id", "");
 
-    // Idempotent begin: a `begin` for a sessionId that already owns a slot
-    // reuses that slot (we do NOT acquire a second one). This matches the
-    // old single-session semantics where re-begin re-initialised in place.
-    int32_t slotId = lookupSlot(id);
+    // RISK POINT 2 — idempotent begin: a `begin` for a sessionId that already
+    // owns a slot reuses that slot (we do NOT acquire a second one); otherwise
+    // a fresh free slot is claimed and bound. The check-then-acquire is atomic
+    // (SlotPool::acquireOrExisting does lookup + CAS-claim + bind under the pool
+    // mutex), matching the old single-session semantics where re-begin
+    // re-initialised in place. Note: the legacy acquireSlot reset the slot's
+    // session on claim, but handleBegin reinitialises `session` below on EVERY
+    // begin (reuse or fresh), so the reset is preserved unconditionally.
+    int32_t const slotId = gPool->acquireOrExisting(id);
     if (slotId < 0)
     {
-        // No live mapping → claim a fresh slot from the pool.
-        slotId = acquireSlot(id);
-        if (slotId < 0)
+        // Pool saturated: every decoder slot is in use. Surface a 4429-style
+        // structured error so the front-end / session-limiter can back off
+        // (replaces the legacy `session_already_active` single-session guard).
+        Json ev = {{"event", "error"}, {"ok", false}, {"error", "pool_saturated"},
+            {"status", 4429}, {"max_slots", gMaxSlots}};
+        if (!id.empty())
         {
-            // Pool saturated: every decoder slot is in use. Surface a 4429-style
-            // structured error so the front-end / session-limiter can back off
-            // (replaces the legacy `session_already_active` single-session guard).
-            Json ev = {{"event", "error"}, {"ok", false}, {"error", "pool_saturated"},
-                {"status", 4429}, {"max_slots", gMaxSlots}};
-            if (!id.empty())
-            {
-                ev["id"] = id;
-            }
-            std::cout << ev.dump() << std::endl;
-            return;
+            ev["id"] = id;
         }
-        bindSession(id, slotId);
+        std::cout << ev.dump() << std::endl;
+        return;
     }
 
-    AsrSessionState& session = gSlotPool[static_cast<size_t>(slotId)]->session;
+    AsrSessionState& session = gPool->get(slotId)->session;
     session = AsrSessionState{};
     session.sessionId = id;
     session.active = true;
@@ -1156,7 +1102,7 @@ void handleChunk(Json const& input,
         std::cout << ev.dump() << std::endl;
         return;
     }
-    AsrSlot& slot = *gSlotPool[static_cast<size_t>(slotId)];
+    AsrSlot& slot = *gPool->get(slotId);
     AsrSessionState& session = slot.session;
     rt::LLMInferenceSpecDecodeRuntime& runtime = *slot.thinker;
     cudaStream_t const stream = slot.stream;
@@ -1487,7 +1433,7 @@ void handleEnd(Json const& input)
         std::cout << ev.dump() << std::endl;
         return;
     }
-    AsrSessionState& session = gSlotPool[static_cast<size_t>(slotId)]->session;
+    AsrSessionState& session = gPool->get(slotId)->session;
     // The driver flags the final hop via last=true on a chunk event (which
     // emits the `final` event there). Bare `end` events emit a `final` with
     // whatever fullText we have accumulated and close the session.
@@ -1644,7 +1590,7 @@ int main(int argc, char** argv)
     // legacy one-shot path (lines with no `event` field) keeps using slot 0's
     // runtime + stream — it is a single serial request flow and never touches
     // the slot pool's session state.
-    AsrSlot& slot0 = *gSlotPool[0];
+    AsrSlot& slot0 = *gPool->get(0);
     rt::LLMInferenceSpecDecodeRuntime* runtime = slot0.thinker.get(); // one-shot legacy path only
     cudaStream_t stream = slot0.stream;                              // one-shot legacy path only
     // SPIKE — cumulative stage entry counters; runHop diffs against these.
@@ -1662,7 +1608,7 @@ int main(int argc, char** argv)
     // the gather to keep the release path identical to the end/error path.
     auto const checkIdleTimeout = []() {
         auto const now = std::chrono::steady_clock::now();
-        for (auto& slotPtr : gSlotPool)
+        for (auto& slotPtr : gPool->slots())
         {
             AsrSessionState& s = slotPtr->session;
             if (!s.active)
