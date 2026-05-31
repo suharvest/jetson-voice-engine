@@ -1,0 +1,1393 @@
+diff --git a/cpp/multimodal/code2WavRunner.cpp b/cpp/multimodal/code2WavRunner.cpp
+index caebac4..10f747e 100644
+--- a/cpp/multimodal/code2WavRunner.cpp
++++ b/cpp/multimodal/code2WavRunner.cpp
+@@ -32,12 +32,32 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cuda_fp16.h>
++#include <chrono>
++#include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+ #include <stdexcept>
+ 
+ using Json = nlohmann::json;
+ 
++namespace
++{
++
++using Clock = std::chrono::steady_clock;
++
++bool code2WavProfileEnabled()
++{
++    char const* env = std::getenv("QWEN3_TTS_CODE2WAV_PROFILE");
++    return env != nullptr && std::string(env) != "0";
++}
++
++double elapsedMs(Clock::time_point start)
++{
++    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
++}
++
++} // namespace
++
+ namespace trt_edgellm
+ {
+ namespace rt
+@@ -360,21 +380,31 @@ bool Code2WavRunner::generateWaveform(
+         = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+     int64_t const maxCodeLen = codesShapeMax.d[2];
+     int64_t waveformLen = 0;
++    bool const profile = code2WavProfileEnabled();
++    auto const totalStart = Clock::now();
++    double prepareMs = 0.0;
++    double inferEnqueueMs = 0.0;
++    double d2hEnqueueMs = 0.0;
++    double syncMs = 0.0;
+ 
+     // Use direct inference if sequence fits in engine's max capacity
+     if (seqLen <= maxCodeLen)
+     {
+         LOG_DEBUG("Direct inference: seqLen=%ld", seqLen);
+ 
++        auto const prepareStart = Clock::now();
+         if (!prepareCodes(codes, stream))
+         {
+             return false;
+         }
++        prepareMs = elapsedMs(prepareStart);
+ 
++        auto const inferStart = Clock::now();
+         if (!infer(stream))
+         {
+             return false;
+         }
++        inferEnqueueMs = elapsedMs(inferStart);
+ 
+         // Get actual output shape from the engine. Code2Wav output can be shorter than
+         // seqLen * upsampleRate because the model trims samples at the boundaries.
+@@ -388,8 +418,10 @@ bool Code2WavRunner::generateWaveform(
+ 
+         outputAudio.waveform
+             = std::make_shared<rt::Tensor>(rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, mWaveformDtype));
++        auto const d2hStart = Clock::now();
+         CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), mOutputWaveform.rawPointer(),
+             math::cast<size_t>(waveformLen) * rt::utils::getTypeSize(mWaveformDtype), cudaMemcpyDeviceToHost, stream));
++        d2hEnqueueMs = elapsedMs(d2hStart);
+     }
+     else
+     {
+@@ -406,11 +438,23 @@ bool Code2WavRunner::generateWaveform(
+ 
+         outputAudio.waveform
+             = std::make_shared<rt::Tensor>(rt::Tensor({1, waveformLen}, rt::DeviceType::kCPU, mWaveformDtype));
++        auto const d2hStart = Clock::now();
+         CUDA_CHECK(cudaMemcpyAsync(outputAudio.waveform->rawPointer(), finalWaveform.rawPointer(),
+             math::cast<size_t>(waveformLen) * rt::utils::getTypeSize(mWaveformDtype), cudaMemcpyDeviceToHost, stream));
++        d2hEnqueueMs = elapsedMs(d2hStart);
+     }
+ 
++    auto const syncStart = Clock::now();
+     CUDA_CHECK(cudaStreamSynchronize(stream));
++    syncMs = elapsedMs(syncStart);
++
++    if (profile)
++    {
++        LOG_WARNING("Qwen3-TTS Code2Wav profile seq_len=%lld waveform_len=%lld direct=%d prepare_ms=%.3f "
++                    "infer_enqueue_ms=%.3f d2h_enqueue_ms=%.3f sync_ms=%.3f total_ms=%.3f",
++            static_cast<long long>(seqLen), static_cast<long long>(waveformLen), seqLen <= maxCodeLen ? 1 : 0,
++            prepareMs, inferEnqueueMs, d2hEnqueueMs, syncMs, elapsedMs(totalStart));
++    }
+ 
+     outputAudio.sampleRate = mConfig.sampleRate;
+     outputAudio.numChannels = 1;
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index d0c01cd..4bd6ba8 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -22,6 +22,7 @@
+ #include "common/safetensorsUtils.h"
+ #include "common/stringUtils.h"
+ #include "kernels/embeddingKernels/embeddingKernels.h"
++#include "kernels/qwen3TtsCpKernels/qwen3TtsCpKernels.h"
+ #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
+ #ifdef CUTE_DSL_GEMM_ENABLED
+ #include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+@@ -32,11 +33,20 @@
+ #include "profiling/timer.h"
+ #include "sampler/sampling.h"
+ #include <algorithm>
++#include <atomic>
++#include <cctype>
+ #include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <cmath>
++#include <condition_variable>
++#include <cstdlib>
+ #include <cuda_runtime.h>
+ #include <filesystem>
+ #include <fstream>
++#include <iterator>
++#include <limits>
++#include <mutex>
+ #include <nlohmann/json.hpp>
+ #include <unordered_set>
+ 
+@@ -93,11 +103,261 @@ bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor&
+ 
+     return true;
+ }
++
++// [Phase 3b-B-1] Read OVS_TTS_WORKER_CONCURRENCY env, clamp to [1,8], log
++// once per engine ctor invocation. Both CodePredictor and Talker engines use
++// this for their SlotPool capacity. Default 1 (preserves Phase 3b-A
++// byte-equivalence). 3b-B-2 will be the first iter that actually sets N>1.
++inline int readTtsWorkerConcurrencyEnv(char const* engineTag)
++{
++    int capacity = 1;
++    if (char const* env = std::getenv("OVS_TTS_WORKER_CONCURRENCY"))
++    {
++        try
++        {
++            int const parsed = std::stoi(env);
++            if (parsed < 1)
++            {
++                LOG_WARNING(
++                    "[%s] OVS_TTS_WORKER_CONCURRENCY=%d below min=1; clamping to 1", engineTag, parsed);
++                capacity = 1;
++            }
++            else if (parsed > 8)
++            {
++                LOG_WARNING(
++                    "[%s] OVS_TTS_WORKER_CONCURRENCY=%d above max=8; clamping to 8", engineTag, parsed);
++                capacity = 8;
++            }
++            else
++            {
++                capacity = parsed;
++            }
++        }
++        catch (std::exception const& e)
++        {
++            LOG_WARNING(
++                "[%s] OVS_TTS_WORKER_CONCURRENCY=\"%s\" not parseable (%s); defaulting to 1",
++                engineTag, env, e.what());
++            capacity = 1;
++        }
++    }
++    LOG_INFO("[%s] SlotPool capacity=%d (OVS_TTS_WORKER_CONCURRENCY)", engineTag, capacity);
++    return capacity;
++}
++
++// Forward-declared from fork highperf/runtime-service tail (b9c57c8 reference
++// runtime); pulled into anonymous namespace so P2-C nested-class constructors
++// can resolve them without porting the full BF16 reference-runtime overhaul.
++
++// =========================================================================
++// Parity-dump helpers (env-gated; no-op when QWEN3_TTS_DUMP_DIR is unset).
++// Writes per-call NPY tensors (FP32 host-converted) + a `_log.json` manifest
++// matching the format produced by wsl2 reference dump
++// (bench/parity/ref_dump_qwen3_customvoice_bf16.tar.gz).
++// =========================================================================
++inline std::string const& qwenDumpDir()
++{
++    static std::string const sDir = []() -> std::string {
++        char const* env = std::getenv("QWEN3_TTS_DUMP_DIR");
++        std::string dir = env ? std::string(env) : std::string();
++        if (!dir.empty())
++        {
++            try
++            {
++                std::filesystem::create_directories(dir);
++            }
++            catch (...)
++            {
++            }
++        }
++        return dir;
++    }();
++    return sDir;
++}
++
++inline std::string safeDotName(std::string s)
++{
++    for (auto& c : s)
++    {
++        if (c == '.' || c == '/' || c == ' ')
++            c = '_';
++    }
++    return s;
++}
++
++// Convert device-side FP16/FP32 buffer to host float32 vector.
++inline std::vector<float> copyTensorToHostFloat(
++    void const* devPtr, size_t numElements, nvinfer1::DataType dtype, cudaStream_t stream)
++{
++    std::vector<float> out(numElements, 0.0f);
++    if (numElements == 0 || devPtr == nullptr)
++        return out;
++    if (dtype == nvinfer1::DataType::kFLOAT)
++    {
++        CUDA_CHECK(cudaMemcpyAsync(out.data(), devPtr, numElements * sizeof(float), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++    }
++    else if (dtype == nvinfer1::DataType::kHALF)
++    {
++        std::vector<__half> tmp(numElements);
++        CUDA_CHECK(cudaMemcpyAsync(tmp.data(), devPtr, numElements * sizeof(__half), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        for (size_t i = 0; i < numElements; ++i)
++            out[i] = __half2float(tmp[i]);
++    }
++    else if (dtype == nvinfer1::DataType::kINT32)
++    {
++        std::vector<int32_t> tmp(numElements);
++        CUDA_CHECK(cudaMemcpyAsync(tmp.data(), devPtr, numElements * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        for (size_t i = 0; i < numElements; ++i)
++            out[i] = static_cast<float>(tmp[i]);
++    }
++    else
++    {
++        LOG_WARNING("copyTensorToHostFloat: unsupported dtype %d, dumping zeros", static_cast<int>(dtype));
++    }
++    return out;
++}
++
++// Write a flat float32 vector as a 1-D NPY file (minimal NPY v1.0 writer).
++inline void writeNpyF32(std::string const& path, std::vector<float> const& data)
++{
++    std::ofstream f(path, std::ios::binary);
++    if (!f)
++    {
++        LOG_WARNING("writeNpyF32: failed to open %s", path.c_str());
++        return;
++    }
++    char const magic[6] = {char(0x93), 'N', 'U', 'M', 'P', 'Y'};
++    f.write(magic, 6);
++    uint8_t ver[2] = {1, 0};
++    f.write(reinterpret_cast<char const*>(ver), 2);
++    std::string header = std::string("{'descr': '<f4', 'fortran_order': False, 'shape': (")
++        + std::to_string(data.size()) + ",), }";
++    // Pad header so total (10-byte preamble + header + '\n') is multiple of 64.
++    size_t const preamble = 10;
++    size_t pad = 64 - ((preamble + header.size() + 1) % 64);
++    header.append(pad, ' ');
++    header.push_back('\n');
++    uint16_t hlen = static_cast<uint16_t>(header.size());
++    f.write(reinterpret_cast<char const*>(&hlen), 2);
++    f.write(header.data(), header.size());
++    f.write(reinterpret_cast<char const*>(data.data()), data.size() * sizeof(float));
++}
++
++// Append one JSON-line manifest entry.
++inline void appendDumpLog(std::string const& jsonLine)
++{
++    auto const& dir = qwenDumpDir();
++    if (dir.empty())
++        return;
++    std::ofstream f(dir + "/_log.json", std::ios::app);
++    if (!f)
++        return;
++    f << jsonLine << "\n";
++}
++
++// Main dump driver. `shape` may be empty (treated as [num]). `callIdx`: 0=prefill, 1=first decode.
++inline void dumpTensor(std::string const& name, std::string const& tensorTag, void const* devPtr,
++    nvinfer1::DataType dtype, std::vector<int64_t> const& shape, cudaStream_t stream, int32_t callIdx = 0)
++{
++    auto const& dir = qwenDumpDir();
++    if (dir.empty() || devPtr == nullptr)
++        return;
++    int64_t numEl = 1;
++    if (shape.empty())
++    {
++        return; // need a shape
++    }
++    for (auto d : shape)
++        numEl *= d;
++    if (numEl <= 0)
++        return;
++
++    constexpr size_t kCap = 4096;
++    constexpr size_t kHalf = 2048;
++    std::vector<float> hostFull = copyTensorToHostFloat(devPtr, static_cast<size_t>(numEl), dtype, stream);
++    bool truncated = false;
++    std::vector<float> dumped;
++    if (hostFull.size() > kCap)
++    {
++        truncated = true;
++        dumped.reserve(2 * kHalf);
++        dumped.insert(dumped.end(), hostFull.begin(), hostFull.begin() + kHalf);
++        dumped.insert(dumped.end(), hostFull.end() - kHalf, hostFull.end());
++    }
++    else
++    {
++        dumped = hostFull;
++    }
++
++    // Basic stats (over the kept portion — same convention as reference).
++    float absmax = 0.0f;
++    double sum = 0.0;
++    for (float v : dumped)
++    {
++        float av = std::fabs(v);
++        if (av > absmax)
++            absmax = av;
++        sum += v;
++    }
++    double mean = dumped.empty() ? 0.0 : sum / static_cast<double>(dumped.size());
++
++    std::string safe = safeDotName(name) + "__" + safeDotName(tensorTag);
++    std::string npyFile = safe + (callIdx == 0 ? "" : std::string("__c") + std::to_string(callIdx)) + ".npy";
++    writeNpyF32(dir + "/" + npyFile, dumped);
++
++    // Compose minimal JSON entry (one line — matches ref _log.json semantics).
++    std::string dtypeStr = (dtype == nvinfer1::DataType::kFLOAT) ? "float32"
++        : (dtype == nvinfer1::DataType::kHALF)                   ? "float16"
++        : (dtype == nvinfer1::DataType::kINT32)                  ? "int32"
++                                                                 : "unknown";
++    std::string shapeStr = "[";
++    for (size_t i = 0; i < shape.size(); ++i)
++    {
++        shapeStr += std::to_string(shape[i]);
++        if (i + 1 < shape.size())
++            shapeStr += ", ";
++    }
++    shapeStr += "]";
++
++    char buf[512];
++    std::snprintf(buf, sizeof(buf),
++        "{\"name\":\"%s\",\"tensor\":\"%s\",\"shape\":%s,\"dtype\":\"%s\",\"absmax\":%.6g,\"mean\":%.6g,\"npy\":\"%s\","
++        "\"truncated\":%s,\"call_idx\":%d}",
++        name.c_str(), tensorTag.c_str(), shapeStr.c_str(), dtypeStr.c_str(), absmax, mean, npyFile.c_str(),
++        truncated ? "true" : "false", callIdx);
++    appendDumpLog(std::string(buf));
++}
++
+ } // anonymous namespace
+ 
+ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+     std::string const& tokenizerDir, cudaStream_t stream)
+     : mStream(stream)
++{
++    // Path-based init: deserialize both engines from disk (no shared engines).
++    initializeCommon(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream);
++}
++
++Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
++    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine, std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
++    : mStream(stream)
++{
++    // Shared-engine init (TTS slot-pool, D2): reuse the supplied Talker + CodePredictor engines instead of
++    // deserializing from disk. All other initialization is identical to the path-based constructor.
++    ELLM_CHECK(sharedTalkerEngine != nullptr, "Shared Talker engine must be non-null");
++    ELLM_CHECK(sharedCodePredictorEngine != nullptr, "Shared CodePredictor engine must be non-null");
++    initializeCommon(talkerEngineDir, codePredictorEngineDir, tokenizerDir, stream, std::move(sharedTalkerEngine),
++        std::move(sharedCodePredictorEngine));
++}
++
++void Qwen3OmniTTSRuntime::initializeCommon(std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream,
++    std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
++    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
+     LOG_INFO("Initializing Qwen3-Omni Talker runner");
+@@ -116,7 +376,8 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
+     bool const configValid = validateAndFillConfig(talkerEngineDir);
+     ELLM_CHECK(configValid, "Failed to validate and fill config");
+ 
+-    bool const runnersInitialized = initializeEngineRunners(talkerEngineDir, codePredictorEngineDir);
++    bool const runnersInitialized = initializeEngineRunners(
++        talkerEngineDir, codePredictorEngineDir, std::move(sharedTalkerEngine), std::move(sharedCodePredictorEngine));
+     ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
+ 
+     // Setup shared execution context memory for Talker and CodePredictor engines.
+@@ -225,8 +486,9 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
+     }
+ }
+ 
+-bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+-    std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
++bool Qwen3OmniTTSRuntime::initializeEngineRunners(std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
++    std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine)
+ {
+     // Load Talker LLM engine
+     std::filesystem::path talkerEnginePath = std::filesystem::path(talkerEngineDir) / "llm.engine";
+@@ -237,7 +499,19 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+     try
+     {
+         std::unordered_map<std::string, std::string> emptyLoraMap;
+-        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
++        if (sharedTalkerEngine != nullptr)
++        {
++            // TTS slot-pool (D2): build the Talker runner from the shared, already-deserialized engine so this
++            // slot reuses the Talker engine weights while owning its own execution context / KV state.
++            mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(
++                std::move(sharedTalkerEngine), talkerConfigPath, emptyLoraMap, mStream);
++            LOG_INFO("Talker LLM runner initialized from shared engine (TTS slot-pool).");
++        }
++        else
++        {
++            mTalkerLLMRunner
++                = std::make_unique<LLMEngineRunner>(talkerEnginePath, talkerConfigPath, emptyLoraMap, mStream);
++        }
+         mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
+ 
+         LOG_INFO("Talker LLM engine loaded: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
+@@ -262,8 +536,18 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+     try
+     {
+         std::unordered_map<std::string, std::string> emptyLoraMap;
+-        mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
+-            codePredictorEnginePath, codePredictorConfigPath, emptyLoraMap, mStream);
++        if (sharedCodePredictorEngine != nullptr)
++        {
++            // TTS slot-pool (D2): build the CodePredictor runner from the shared, already-deserialized engine.
++            mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
++                std::move(sharedCodePredictorEngine), codePredictorConfigPath, emptyLoraMap, mStream);
++            LOG_INFO("CodePredictor runner initialized from shared engine (TTS slot-pool).");
++        }
++        else
++        {
++            mCodePredictorRunner = std::make_unique<LLMEngineRunner>(
++                codePredictorEnginePath, codePredictorConfigPath, emptyLoraMap, mStream);
++        }
+ 
+         // NOTE: CodePredictor ONNX now outputs FP32 logits directly (lm_head + cast in ONNX),
+         // so standard logits shape validation applies.
+@@ -358,6 +642,22 @@ bool Qwen3OmniTTSRuntime::validateAndFillConfig(std::string const& talkerEngineD
+     mTalkerConfig.codecThinkEosId = configJson["codec_think_eos_id"].get<int32_t>();
+     mTalkerConfig.codecPadId = configJson["codec_pad_id"].get<int32_t>();
+     mTalkerConfig.codecBosId = configJson["codec_bos_id"].get<int32_t>();
++
++    // CustomVoice: language-conditioned prefill path needs codec_think_id + codec_language_id map.
++    // Both fields are optional; if absent the runtime falls back to the legacy no-language path.
++    if (configJson.contains("codec_think_id"))
++    {
++        mTalkerConfig.codecThinkId = configJson["codec_think_id"].get<int32_t>();
++    }
++    if (configJson.contains("codec_language_id") && configJson["codec_language_id"].is_object())
++    {
++        for (auto const& [k, v] : configJson["codec_language_id"].items())
++        {
++            mTalkerConfig.codecLanguageId[k] = v.get<int32_t>();
++        }
++    }
++    LOG_INFO("CustomVoice language config: codecThinkId=%d, codecLanguageId entries=%zu", mTalkerConfig.codecThinkId,
++        mTalkerConfig.codecLanguageId.size());
+     // Support both codec_eos_token_id (original) and codec_eos_id (legacy) for backward compatibility
+     if (configJson.contains("codec_eos_token_id"))
+     {
+@@ -600,8 +900,9 @@ bool Qwen3OmniTTSRuntime::allocateBuffer()
+             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mCodePredictorHiddenStatesBuffer");
+         mTalkerLastHidden = rt::Tensor(
+             {maxBS, talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "mTalkerLastHidden");
+-        mCodecHiddensBuffer = rt::Tensor({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
+-            nvinfer1::DataType::kHALF, "mCodecHiddensBuffer");
++
++        // [Phase B C1] mCodecHiddensBuffer is now allocated per-request as a local
++        // in handleAudioGeneration / generation helpers. See header comment for rationale.
+ 
+         // Trailing text hidden buffer: [maxBS * (maxSeqLen+1), H] — per-batch regions for Omni multi-batch
+         mStreamingTrailingHidden = rt::Tensor({maxBS * (maxSeqLen + 1), talkerHiddenSize}, rt::DeviceType::kGPU,
+@@ -750,8 +1051,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
+     LOG_INFO("TTS embeddings initialized");
+ }
+ 
+-bool Qwen3OmniTTSRuntime::projectToTalkerInput(
+-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
++bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId,
++    rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
+ {
+     int64_t const seqLen = thinkerEmbed.getShape()[0];
+     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+@@ -759,22 +1060,99 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
+ 
+     // N = text tokens after stripping 3-token role prefix and 5-token suffix
+     int64_t const N = seqLen - kAssistantPrefixLen - kAssistantTrailingSuffix;
+-    // Non-streaming prefill: 8 fixed prefix rows + N text rows + 2 suffix rows
+-    outputSeqLen = kNonStreamingPrefixRows + N + 2; // = seqLen + 2
+-    LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
+-        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
++    // Non-streaming prefill: kFixedPrefixLen rows + N text rows + 2 suffix rows.
++    // langId >= 0 uses the 9-row CustomVoice language prefix; otherwise 8-row legacy prefix.
++    int64_t const kFixedPrefixLen = (langId >= 0) ? 9 : kNonStreamingPrefixRows;
++    outputSeqLen = kFixedPrefixLen + N + 2;
++    LOG_INFO(
++        "projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d, "
++        "langId=%d, prefixRows=%ld",
++        seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId, langId, kFixedPrefixLen);
+ 
+-    // Project all tokens via text_projection MLP
++    // Project tokens via text_projection MLP — split into role[:3] + body[3:3+N] to match Python
++    // reference batching. Single 12-row call exposed a CuTe DSL kernel bug where row 1 produced
++    // wrong values (row 0 matched ref to fp16 noise, row 1 max_diff 0.65 vs absmax 0.83).
+     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
+     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
+-    kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
+-        mMLPWorkspace, stream);
++    {
++        auto* thinkerPtr
++            = static_cast<__half*>(const_cast<void*>(thinkerEmbed.rawPointer()));
++        auto* projectedPtr = static_cast<__half*>(mProjectedBuffer.rawPointer());
++        auto* wsPtr = static_cast<__half*>(mMLPWorkspace.rawPointer());
++
++        // Role prefix [0:3]
++        rt::Tensor thinkerRole(thinkerPtr, {kAssistantPrefixLen, thinkerHiddenSize}, rt::DeviceType::kGPU,
++            nvinfer1::DataType::kHALF);
++        rt::Tensor projectedRole(projectedPtr, {kAssistantPrefixLen, hiddenSize}, rt::DeviceType::kGPU,
++            nvinfer1::DataType::kHALF);
++        rt::Tensor wsRole(wsPtr, {kAssistantPrefixLen, thinkerHiddenSize}, rt::DeviceType::kGPU,
++            nvinfer1::DataType::kHALF);
++        kernel::invokeTalkerMLP(thinkerRole, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
++            projectedRole, wsRole, stream);
++
++        // Body [3:3+N]
++        if (N > 0)
++        {
++            int64_t const off = kAssistantPrefixLen;
++            rt::Tensor thinkerBody(thinkerPtr + off * thinkerHiddenSize, {N, thinkerHiddenSize},
++                rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
++            rt::Tensor projectedBody(projectedPtr + off * hiddenSize, {N, hiddenSize}, rt::DeviceType::kGPU,
++                nvinfer1::DataType::kHALF);
++            rt::Tensor wsBody(wsPtr + off * thinkerHiddenSize, {N, thinkerHiddenSize}, rt::DeviceType::kGPU,
++                nvinfer1::DataType::kHALF);
++            kernel::invokeTalkerMLP(thinkerBody, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias,
++                projectedBody, wsBody, stream);
++        }
++    }
++    if (!qwenDumpDir().empty())
++    {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        dumpTensor("text_projection", "out", mProjectedBuffer.rawPointer(), mProjectedBuffer.getDataType(),
++            {seqLen, hiddenSize}, stream, 0);
++    }
+ 
+     // Fused kernel: build complete non-streaming prefill buffer
+     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
+     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
+-        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
+-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
++        mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
++        mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, langId,
++        static_cast<int32_t>(N), output, stream);
++    if (!qwenDumpDir().empty())
++    {
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        dumpTensor("talker_inputs_embeds", "out", output.rawPointer(), output.getDataType(),
++            {1, outputSeqLen, hiddenSize}, stream, 0);
++    }
++
++    // Diagnostic override: load Python-computed talker_inputs_embeds [outputSeqLen, hiddenSize] FP32
++    // from binary file and replace post-kernel result. Used to bisect kernel bug vs downstream bugs.
++    if (char const* p = std::getenv("QWEN3_TTS_PRELOAD_TALKER_EMBEDS"))
++    {
++        std::ifstream f(p, std::ios::binary);
++        if (f)
++        {
++            size_t const n = static_cast<size_t>(outputSeqLen) * static_cast<size_t>(hiddenSize);
++            std::vector<float> hostFp32(n);
++            f.read(reinterpret_cast<char*>(hostFp32.data()), static_cast<std::streamsize>(n * sizeof(float)));
++            if (static_cast<size_t>(f.gcount()) == n * sizeof(float))
++            {
++                std::vector<__half> hostFp16(n);
++                for (size_t i = 0; i < n; ++i)
++                {
++                    hostFp16[i] = __float2half(hostFp32[i]);
++                }
++                CUDA_CHECK(cudaMemcpyAsync(output.rawPointer(), hostFp16.data(), n * sizeof(__half),
++                    cudaMemcpyHostToDevice, stream));
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                LOG_INFO("Overrode talker_inputs_embeds from %s (%zu floats)", p, n);
++            }
++            else
++            {
++                LOG_WARNING("QWEN3_TTS_PRELOAD_TALKER_EMBEDS: expected %zu bytes, got %ld — skipping",
++                    n * sizeof(float), static_cast<long>(f.gcount()));
++            }
++        }
++    }
+ 
+     return true;
+ }
+@@ -874,7 +1252,8 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorPrefillStep(rt::Tensor const& code
+ }
+ 
+ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex,
+-    int32_t generationStep, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream)
++    int32_t generationStep, rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates,
++    rt::Tensor& codecHiddensBuffer, cudaStream_t stream)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::executeCodePredictorDecodingStep", nvtx_colors::ORANGE);
+ 
+@@ -887,12 +1266,12 @@ bool Qwen3OmniTTSRuntime::executeCodePredictorDecodingStep(int32_t tokenId, int3
+     kernel::embeddingLookup(
+         mCodePredictorCodecIds, mCodePredictorEmbeddingTables[embedIdx], std::nullopt, mRawCodecEmbed, stream);
+ 
+-    // Save raw (2048-dim) embedding to mCodecHiddensBuffer for residual connection
++    // Save raw (2048-dim) embedding to codecHiddensBuffer for residual connection
+     // Position mapping: generationStep 1->pos 1, 2->pos 2, ..., (mNumRvqLayers-1)->pos (mNumRvqLayers-1)
+     if (generationStep >= 1 && generationStep <= mNumRvqLayers - 1)
+     {
+         int64_t const H = mTalkerConfig.talkerHiddenSize;
+-        __half* dst = static_cast<__half*>(mCodecHiddensBuffer.rawPointer()) + generationStep * H;
++        __half* dst = static_cast<__half*>(codecHiddensBuffer.rawPointer()) + generationStep * H;
+         CUDA_CHECK(
+             cudaMemcpyAsync(dst, mRawCodecEmbed.rawPointer(), H * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
+     }
+@@ -1030,9 +1409,33 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
+         speakerId = getSpeakerIdByName(request.speakerName);
+     }
+ 
+-    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
++    // CustomVoice language conditioning: resolve language string -> codec token ID.
++    // Lower-case the request string; lookup in codecLanguageId map. -1 means use legacy no-language path.
++    int32_t langId = -1;
++    if (!request.language.empty())
++    {
++        std::string langLc = request.language;
++        std::transform(langLc.begin(), langLc.end(), langLc.begin(),
++            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++        auto it = mTalkerConfig.codecLanguageId.find(langLc);
++        if (it != mTalkerConfig.codecLanguageId.end())
++        {
++            langId = it->second;
++            LOG_INFO("CustomVoice language conditioning enabled: language=\"%s\" -> codec_id=%d", langLc.c_str(),
++                langId);
++        }
++        else
++        {
++            LOG_WARNING(
++                "Requested language=\"%s\" not found in codec_language_id map (size=%zu); "
++                "falling back to no-language prefill path",
++                langLc.c_str(), mTalkerConfig.codecLanguageId.size());
++        }
++    }
++
++    // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2 or +3 w/ lang)
+     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
++    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, langId, mTalkerInputEmbeds, outSeqLen, stream))
+     {
+         LOG_ERROR("MLP projection failed");
+         return false;
+@@ -1059,6 +1462,14 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+     response.numFramesPerSample.clear();
+     response.success = false;
+ 
++    // [Phase B C1] Per-request codec hiddens buffer for the residual connection.
++    // Previously this was a runtime-global member (`mCodecHiddensBuffer`) which
++    // races on `cudaMemsetAsync` when more than one request is in flight.
++    // Allocating per-call keeps the lifetime tied to the request so concurrent
++    // generations cannot collide.
++    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
++        nvinfer1::DataType::kHALF, "codecHiddensBuffer");
++
+     // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
+     auto const& req0 = requests[0];
+     float const talkerTemperature = (req0.talkerTemperature > 0) ? req0.talkerTemperature : 0.9f;
+@@ -1104,6 +1515,23 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+                 return false;
+             }
+         }
++        if (!qwenDumpDir().empty() && b == 0)
++        {
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            auto hsShape = mTalkerHiddenStatesBuffer.getShape();
++            std::vector<int64_t> hsDims;
++            for (int32_t d = 0; d < hsShape.getNumDims(); ++d)
++                hsDims.push_back(hsShape[d]);
++            dumpTensor("model", "out_last_hidden_state", mTalkerHiddenStatesBuffer.rawPointer(),
++                mTalkerHiddenStatesBuffer.getDataType(), hsDims, stream, 0);
++            // Also dump full prefill logits for completeness.
++            auto lgShape = mTalkerLogits.getShape();
++            std::vector<int64_t> lgDims;
++            for (int32_t d = 0; d < lgShape.getNumDims(); ++d)
++                lgDims.push_back(lgShape[d]);
++            dumpTensor("talker_lm_head", "out", mTalkerLogits.rawPointer(), mTalkerLogits.getDataType(), lgDims, stream,
++                0);
++        }
+ 
+         kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+             mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
+@@ -1127,8 +1555,33 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+     }
+ 
+     std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
++
++    // Wire optional streaming hooks from each request (empty/disabled by default = identical behavior).
++    std::vector<PerBatchStreamingHooks> streamingHooks;
++    bool anyStreaming = false;
++    for (auto const& r : requests)
++    {
++        if (r.codecChunkFrames > 0 && r.onAudioChunkReady)
++        {
++            anyStreaming = true;
++            break;
++        }
++    }
++    if (anyStreaming)
++    {
++        streamingHooks.resize(activeBatchSize);
++        for (int32_t b = 0; b < activeBatchSize; ++b)
++        {
++            streamingHooks[b].codecChunkFrames = requests[b].codecChunkFrames;
++            streamingHooks[b].subsequentChunkFrames = requests[b].subsequentChunkFrames;
++            streamingHooks[b].onAudioChunkReady = requests[b].onAudioChunkReady;
++            streamingHooks[b].shouldCancel = requests[b].shouldCancel;
++        }
++    }
++
+     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
+-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
++            predictorSamplingParams, repetitionPenalty, trailingPtrs, codecHiddensBuffer, stream,
++            /*prefillSeqLens=*/{}, streamingHooks))
+     {
+         return false;
+     }
+@@ -1163,6 +1616,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
+     response.numFramesPerSample.clear();
+     response.success = false;
+ 
++    // [Phase B C1] Per-request codec hiddens buffer (see handleAudioGeneration for rationale).
++    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
++        nvinfer1::DataType::kHALF, "codecHiddensBuffer");
++
+     // Sampling params from requests[0], applied uniformly (matches LLMInferenceSpecDecodeRuntime design)
+     auto const& req0 = requests[0];
+     float const talkerTemperature = (req0.talkerTemperature > 0) ? req0.talkerTemperature : 0.9f;
+@@ -1328,7 +1785,7 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
+     }
+ 
+     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
+-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, perBatchSeqLen))
++            predictorSamplingParams, repetitionPenalty, trailingPtrs, codecHiddensBuffer, stream, perBatchSeqLen))
+     {
+         return false;
+     }
+@@ -1379,8 +1836,9 @@ bool Qwen3OmniTTSRuntime::handleAudioGenerationFromThinker(
+ 
+ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize,
+     int32_t maxFrames, SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
+-    float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
+-    std::vector<int64_t> const& prefillSeqLens)
++    float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens,
++    rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens,
++    std::vector<PerBatchStreamingHooks> const& streamingHooks)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runTalkerGenerationLoop", nvtx_colors::PURPLE);
+ 
+@@ -1442,8 +1900,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
+                 }
+ 
+                 std::vector<int32_t> frameCodes;
+-                if (!runCodePredictorGenerationForFrame(
+-                        states[b].codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
++                if (!runCodePredictorGenerationForFrame(states[b].codecToken, mTalkerLastHidden,
++                        predictorSamplingParams, frameCodes, codecHiddensBuffer, stream))
+                 {
+                     LOG_ERROR("CodePredictor failed for batch %d frame %d", b, globalFrame);
+                     states[b].finished = true;
+@@ -1459,8 +1917,8 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
+                     static_cast<__half*>(mResidualEmbedBuffer.rawPointer()) + b * mTalkerConfig.talkerHiddenSize,
+                     rt::Coords{1, 1, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+ 
+-                if (!computeResidualConnection(
+-                        states[b].rvqCodes.back(), trailingTextHiddens[b], globalFrame, residualSlice, stream))
++                if (!computeResidualConnection(states[b].rvqCodes.back(), trailingTextHiddens[b], globalFrame,
++                        residualSlice, codecHiddensBuffer, stream))
+                 {
+                     LOG_ERROR("Residual connection failed for batch %d frame %d", b, globalFrame);
+                     states[b].finished = true;
+@@ -1534,6 +1992,32 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
+                 states[b].codecToken = hostTokens[b];
+                 states[b].talkerFrames++;
+ 
++                // ===== Standalone-TTS streaming: cancel + per-chunk emission =====
++                bool const hasHook = (b < static_cast<int32_t>(streamingHooks.size()));
++                if (hasHook)
++                {
++                    auto const& hook = streamingHooks[b];
++                    if (hook.shouldCancel && hook.shouldCancel())
++                    {
++                        states[b].finished = true;
++                        unfinished--;
++                        continue;
++                    }
++                    // Adaptive chunk size: first emitted chunk uses codecChunkFrames (low TTFA),
++                    // subsequent chunks use subsequentChunkFrames if set (>0), else fall back to codecChunkFrames.
++                    int32_t const threshold = (states[b].lastChunkEnd == 0 || hook.subsequentChunkFrames <= 0)
++                        ? hook.codecChunkFrames
++                        : hook.subsequentChunkFrames;
++                    if (hook.codecChunkFrames > 0 && hook.onAudioChunkReady
++                        && (states[b].talkerFrames - states[b].lastChunkEnd) >= threshold)
++                    {
++                        std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
++                            states[b].rvqCodes.begin() + states[b].talkerFrames);
++                        hook.onAudioChunkReady(chunk, b, false);
++                        states[b].lastChunkEnd = states[b].talkerFrames;
++                    }
++                }
++
+                 if (states[b].codecToken == codecEosId || states[b].talkerFrames >= maxFrames)
+                 {
+                     states[b].finished = true;
+@@ -1544,6 +2028,27 @@ bool Qwen3OmniTTSRuntime::runTalkerGenerationLoop(std::vector<PerBatchTalkerStat
+         }
+     }
+ 
++    // ===== Flush remainder chunks (standalone-TTS streaming path) =====
++    for (int32_t b = 0; b < activeBatchSize; ++b)
++    {
++        if (b < static_cast<int32_t>(streamingHooks.size()))
++        {
++            auto const& hook = streamingHooks[b];
++            if (hook.onAudioChunkReady && states[b].lastChunkEnd < states[b].talkerFrames)
++            {
++                std::vector<std::vector<int32_t>> chunk(states[b].rvqCodes.begin() + states[b].lastChunkEnd,
++                    states[b].rvqCodes.begin() + states[b].talkerFrames);
++                hook.onAudioChunkReady(chunk, b, true);
++                states[b].lastChunkEnd = states[b].talkerFrames;
++            }
++            else if (hook.onAudioChunkReady && states[b].lastChunkEnd == states[b].talkerFrames)
++            {
++                // Emit empty final marker so consumers know stream ended without unflushed frames.
++                hook.onAudioChunkReady(std::vector<std::vector<int32_t>>{}, b, true);
++            }
++        }
++    }
++
+     for (int32_t b = 0; b < activeBatchSize; ++b)
+     {
+         bool const hitEos = (states[b].codecToken == codecEosId);
+@@ -1560,6 +2065,12 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
+ {
+     int32_t const codecEosId = mTalkerConfig.codecEosId;
+ 
++    // [Phase B C1] Per-frame codec hiddens buffer (streaming path).
++    // C2 will hoist this into a slot-owned buffer; for now keep it local to satisfy
++    // the new per-request signatures.
++    rt::Tensor codecHiddensBuffer({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}, rt::DeviceType::kGPU,
++        nvinfer1::DataType::kHALF, "codecHiddensBufferStreaming");
++
+     // Ensure batch=1 shape for CodePredictor KV cache reset (streaming path is per-batch)
+     check::check(mHostReuseKVCacheLengths.reshape({1}), "Tensor reshape failed");
+     mHostReuseKVCacheLengths.dataPointer<int32_t>()[0] = 0;
+@@ -1572,7 +2083,8 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
+     }
+ 
+     std::vector<int32_t> frameCodes;
+-    if (!runCodePredictorGenerationForFrame(codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, stream))
++    if (!runCodePredictorGenerationForFrame(
++            codecToken, mTalkerLastHidden, predictorSamplingParams, frameCodes, codecHiddensBuffer, stream))
+     {
+         LOG_ERROR("CodePredictor generation failed at frame %d", frameIdx);
+         return false;
+@@ -1580,7 +2092,8 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
+ 
+     rvqCodes.push_back(std::move(frameCodes));
+ 
+-    if (!computeResidualConnection(rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, stream))
++    if (!computeResidualConnection(
++            rvqCodes.back(), trailingPtr, frameIdx, mResidualEmbedBuffer, codecHiddensBuffer, stream))
+     {
+         LOG_ERROR("Residual connection failed at frame %d", frameIdx);
+         return false;
+@@ -1616,13 +2129,14 @@ bool Qwen3OmniTTSRuntime::runSingleTalkerDecodeFrame(int32_t& codecToken, Sampli
+ }
+ 
+ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
+-    SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream)
++    SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, rt::Tensor& codecHiddensBuffer,
++    cudaStream_t stream)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::runCodePredictorGenerationForFrame", nvtx_colors::ORANGE);
+ 
+     // Original model logic:
+-    // - codes: code_0 (from Talker) + code_1..code_N (from CodePredictor) = mNumCodesPerFrame codes
+-    // - hidden_states: written directly to mCodecHiddensBuffer
++    // - codes: code_0 (from Talker) + code_1..code_(N-1) (from CodePredictor) = mNumCodesPerFrame codes
++    // - hidden_states: written directly to codecHiddensBuffer (per-request, passed in)
+ 
+     outputCodes.clear();
+     outputCodes.reserve(mNumCodesPerFrame);
+@@ -1675,6 +2189,18 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+         check::check(mCodePredictorHiddenStatesBuffer.reshape({1, 2, mTalkerConfig.codePredictorHiddenSize}),
+             "Tensor reshape failed");
+ 
++        // Parity dump: CP input embeds (post small_to_mtp_projection / concat) for FIRST frame only.
++        {
++            static std::atomic<int> sCpDumpedFrame{0};
++            int prev = sCpDumpedFrame.fetch_add(1);
++            if (prev == 0 && !qwenDumpDir().empty())
++            {
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                dumpTensor("code_predictor_small_to_mtp_projection", "out", mCodePredictorPrefillInput.rawPointer(),
++                    mCodePredictorPrefillInput.getDataType(), {1, 2, mTalkerConfig.codePredictorHiddenSize}, stream, 0);
++            }
++        }
++
+         // NOTE: CodePredictor ONNX outputs FP32 logits directly (lm_head + cast in ONNX)
+         // generationStep=0 corresponds to code_1 (using lm_head_0)
+         if (!executeCodePredictorPrefillStep(
+@@ -1682,6 +2208,21 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+         {
+             return false;
+         }
++        {
++            static std::atomic<int> sCpHsDumpedFrame{0};
++            int prev = sCpHsDumpedFrame.fetch_add(1);
++            if (prev == 0 && !qwenDumpDir().empty())
++            {
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                auto sh = mCodePredictorHiddenStatesBuffer.getShape();
++                std::vector<int64_t> dims;
++                for (int32_t d = 0; d < sh.getNumDims(); ++d)
++                    dims.push_back(sh[d]);
++                dumpTensor("code_predictor_model", "out_last_hidden_state",
++                    mCodePredictorHiddenStatesBuffer.rawPointer(), mCodePredictorHiddenStatesBuffer.getDataType(), dims,
++                    stream, 0);
++            }
++        }
+ 
+         // Sample code_1
+         trt_edgellm::topKtopPSamplingFromLogits(
+@@ -1694,8 +2235,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+         outputCodes.push_back(code); // code_1
+     } // end kCODEPREDICTOR_PREFILL scope
+ 
+-    // ========== Write embedding lookups to mCodecHiddensBuffer for residual connection ==========
+-    // mCodecHiddensBuffer layout: [1, mNumCodesPerFrame, H]
++    // ========== Write embedding lookups to codecHiddensBuffer for residual connection ==========
++    // codecHiddensBuffer layout: [1, mNumCodesPerFrame, H]
+     // Position 0:  embed(code_0)  using Talker's embedding   - filled in computeResidualConnection
+     // Position 1..(mNumRvqLayers-1): codec_embedding[step-1](code_step)
+     //   — filled here (input embeddings, NOT engine hidden states)
+@@ -1706,9 +2247,10 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+     //   hid[0] = inputs_embeds for each decode step = codec_embedding[step-1](code_step)
+     //   NOT the transformer output (last layer hidden states)
+ 
+-    // mCodecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
++    // codecHiddensBuffer stores raw (2048-dim) codec embeddings for the residual connection
+     check::check(
+-        mCodecHiddensBuffer.reshape({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
++        codecHiddensBuffer.reshape({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize}), "Tensor reshape failed");
++    CUDA_CHECK(cudaMemsetAsync(codecHiddensBuffer.rawPointer(), 0, codecHiddensBuffer.getMemoryCapacity(), stream));
+ 
+     // ========== Decoding loop: generate code_2 to code_(mNumRvqLayers) ==========
+     {
+@@ -1726,8 +2268,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+             int32_t const embeddingIdx = step - 2; // step=2->embed[0], step=3->embed[1], ...
+             int32_t const lmHeadIdx = step - 1;    // step=2->lm_head[1], step=3->lm_head[2], ...
+ 
+-            if (!executeCodePredictorDecodingStep(
+-                    code, embeddingIdx, lmHeadIdx, mCodePredictorLogits, mCodePredictorHiddenStatesBuffer, stream))
++            if (!executeCodePredictorDecodingStep(code, embeddingIdx, lmHeadIdx, mCodePredictorLogits,
++                    mCodePredictorHiddenStatesBuffer, codecHiddensBuffer, stream))
+             {
+                 return false;
+             }
+@@ -1749,7 +2291,8 @@ bool Qwen3OmniTTSRuntime::runCodePredictorGenerationForFrame(int32_t codecToken,
+ }
+ 
+ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const& codes,
+-    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream)
++    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual,
++    rt::Tensor const& codecHiddensBuffer, cudaStream_t stream)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnection", nvtx_colors::BLUE);
+ 
+@@ -1758,6 +2301,7 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const&
+     //       inputs_embeds += trailing_text_hidden[:, generation_step]
+     //   else:
+     //       inputs_embeds += tts_pad_embed
++    // [Phase B C1] codecHiddensBuffer is per-request (was global mCodecHiddensBuffer).
+ 
+     check::check(static_cast<int32_t>(codes.size()) == mNumCodesPerFrame,
+         "Expected " + std::to_string(mNumCodesPerFrame) + " codes, got " + std::to_string(codes.size()));
+@@ -1781,13 +2325,34 @@ bool Qwen3OmniTTSRuntime::computeResidualConnection(std::vector<int32_t> const&
+         }
+     }
+ 
+-    kernel::invokeResidualConnection(mCodecHiddensBuffer, mTalkerEmbeddingTable,
++    kernel::invokeResidualConnection(codecHiddensBuffer, mTalkerEmbeddingTable,
+         mCodePredictorEmbeddingTables[mNumRvqLayers - 1], codes[0], codes[mNumRvqLayers], addend, outputResidual,
+         stream);
+ 
+     return true;
+ }
+ 
++// [Phase B C1] Host-side residual connection (net new function — no CUDA kernel).
++// Uses HEAD's trailingTextHidden / generationStep addend logic (NOT fork's mTrailingTextLen path).
++// Currently a stub: routes through the GPU path with a synchronous copy if needed.
++// Real callers will be wired up in subsequent commits; for now keep parity with the
++// GPU `computeResidualConnection` so the symbol exists and the build links.
++bool Qwen3OmniTTSRuntime::computeResidualConnectionHost(std::vector<int32_t> const& codes,
++    rt::Tensor const* trailingTextHidden, int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream)
++{
++    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::computeResidualConnectionHost", nvtx_colors::BLUE);
++
++    // Allocate a transient per-call codecHiddensBuffer matching the GPU path,
++    // since the host-side path does not have access to a request-scoped buffer.
++    rt::Tensor codecHiddensBufferLocal({1, mNumCodesPerFrame, mTalkerConfig.talkerHiddenSize},
++        rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "codecHiddensBufferHostLocal");
++    CUDA_CHECK(cudaMemsetAsync(
++        codecHiddensBufferLocal.rawPointer(), 0, codecHiddensBufferLocal.getMemoryCapacity(), stream));
++
++    return computeResidualConnection(
++        codes, trailingTextHidden, generationStep, outputResidual, codecHiddensBufferLocal, stream);
++}
++
+ bool Qwen3OmniTTSRuntime::extractTalkerLastHidden(
+     rt::Tensor const& talkerHiddenStates, rt::Tensor& outputLastHidden, cudaStream_t stream)
+ {
+@@ -2019,9 +2584,12 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
+         rt::Tensor assistantSlice(const_cast<__half*>(assistantProjPtr), rt::Coords{assistantInputLen, hiddenSize},
+             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+ 
++        // Omni segment path: language conditioning is not (yet) propagated through Omni; pass langId=-1
++        // to keep the legacy 8-row prefix.
+         kernel::invokeAssistantPreamble(assistantSlice, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
+-            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
+-            mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, 1, preambleScratch, stream);
++            mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkId, mTalkerConfig.codecThinkBosId,
++            mTalkerConfig.codecThinkEosId, speakerId, mTalkerConfig.codecPadId, mTalkerConfig.codecBosId,
++            /*langId=*/-1, /*textLen=*/1, preambleScratch, stream);
+ 
+         __half* const aOut = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + userTotalLen * hiddenSize;
+         CUDA_CHECK(cudaMemcpyAsync(aOut, scratchPtr, kAssistantRestructuredLen * hiddenSize * sizeof(__half),
+@@ -2317,7 +2885,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceSpecDecodeRuntim
+                 {
+                     std::vector<std::vector<int32_t>> chunk(
+                         state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+-                    streamingConfig.onAudioChunkReady(chunk);
++                    streamingConfig.onAudioChunkReady(chunk, 0, false);
+                     state.lastChunkEnd = state.talkerFrames;
+                 }
+             }
+@@ -2375,7 +2943,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceSpecDecodeRuntim
+             {
+                 std::vector<std::vector<int32_t>> chunk(
+                     state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+-                streamingConfig.onAudioChunkReady(chunk);
++                streamingConfig.onAudioChunkReady(chunk, 0, false);
+                 state.lastChunkEnd = state.talkerFrames;
+             }
+         }
+@@ -2384,7 +2952,7 @@ bool Qwen3OmniTTSRuntime::handleStreamingGeneration(LLMInferenceSpecDecodeRuntim
+         {
+             std::vector<std::vector<int32_t>> remainder(
+                 state.rvqCodes.begin() + state.lastChunkEnd, state.rvqCodes.begin() + state.talkerFrames);
+-            streamingConfig.onAudioChunkReady(remainder);
++            streamingConfig.onAudioChunkReady(remainder, 0, true);
+         }
+     }
+     else
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index 94fa578..74da63f 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -23,9 +23,14 @@
+ #include "runtime/llmInferenceSpecDecodeRuntime.h"
+ #include "runtime/llmRuntimeUtils.h"
+ #include "tokenizer/tokenizer.h"
++#include <NvInferRuntime.h>
++#include <filesystem>
++#include <functional>
+ #include <memory>
++#include <random>
+ #include <string>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ namespace trt_edgellm
+@@ -84,6 +89,8 @@ constexpr int32_t kVideoTokenId = 151656;   //!< Video placeholder token
+ class Qwen3OmniTTSRuntime
+ {
+ public:
++    using FrameCallback = std::function<void(std::vector<int32_t> const& frameCodes, int32_t totalFrames)>;
++
+     /*!
+      * @brief Construct and fully initialize the TTS runtime
+      * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
+@@ -95,11 +102,59 @@ public:
+     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+         std::string const& tokenizerDir, cudaStream_t stream);
+ 
++    /*!
++     * @brief Construct a TTS runtime that SHARES the Talker + CodePredictor ICudaEngines (TTS slot-pool, D2).
++     *
++     * Mirrors the ASR slot-pool shared-engine constructor (LLMInferenceSpecDecodeRuntime). Builds N TTS
++     * slots that share one deserialized Talker engine and one deserialized CodePredictor engine (saving
++     * weight memory) while each slot owns independent IExecutionContexts, KV/cache state, and workspace
++     * tensors (mTalkerInputEmbeds etc., which are instance members → naturally isolated per slot).
++     *
++     * The supplied engines must come from another live runtime (via getTalkerEngine() / getCodePredictorEngine()),
++     * whose deserializing owner (the runtime built with the path-based constructor) MUST outlive every runtime
++     * built this way, because that owner holds the TensorRT IRuntime backing the engines.
++     *
++     * All non-engine initialization (config, weights, embedding tables, workspace, tokenizer) is performed
++     * exactly like the path-based constructor — only the Talker + CodePredictor engine weights are shared.
++     *
++     * @param sharedTalkerEngine        Shared, already-deserialized Talker engine (must be non-null)
++     * @param sharedCodePredictorEngine Shared, already-deserialized CodePredictor engine (must be non-null)
++     * @param talkerEngineDir Directory containing talker engine, MLP weights, embedding table, etc.
++     * @param codePredictorEngineDir Directory containing code_predictor engine and codec embeddings
++     * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
++     * @param stream CUDA stream for operations
++     * @throws std::runtime_error if either engine is null or any initialization step fails
++     */
++    Qwen3OmniTTSRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine, std::string const& talkerEngineDir,
++        std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream);
++
+     //! @brief Destructor
+     ~Qwen3OmniTTSRuntime();
+ 
++    //! @brief Get the shared Talker TensorRT engine backing this runtime (TTS slot-pool, D2).
++    //! @return Shared pointer to the Talker ICudaEngine, for constructing additional slot runtimes that share it.
++    //! @note Valid only while this runtime (the deserializing owner) is alive.
++    std::shared_ptr<nvinfer1::ICudaEngine> getTalkerEngine() const noexcept
++    {
++        return mTalkerLLMRunner ? mTalkerLLMRunner->getEngine() : nullptr;
++    }
++
++    //! @brief Get the shared CodePredictor TensorRT engine backing this runtime (TTS slot-pool, D2).
++    //! @return Shared pointer to the CodePredictor ICudaEngine, for constructing additional slot runtimes.
++    //! @note Valid only while this runtime (the deserializing owner) is alive.
++    std::shared_ptr<nvinfer1::ICudaEngine> getCodePredictorEngine() const noexcept
++    {
++        return mCodePredictorRunner ? mCodePredictorRunner->getEngine() : nullptr;
++    }
++
+     // ========== Core API ==========
+ 
++    // Forward-declared streaming chunk callback (defined again below for clarity).
++    // 3-parameter signature: (chunkRvqCodes [numFrames][16], batchIdx, isFinal).
++    using AudioChunkCallback = std::function<void(
++        std::vector<std::vector<int32_t>> const& chunkRvqCodes, int32_t batchIdx, bool isFinal)>;
++
+     /*!
+      * @brief Talker audio generation request structure
+      *
+@@ -116,16 +171,39 @@ public:
+         int32_t talkerTopK{0};          //!< Talker top-K (0 = default 50)
+         float talkerTopP{0};            //!< Talker top-P (0 = default 1.0)
+         float repetitionPenalty{1.05f}; //!< Repetition penalty applied to seen codec tokens (1.0 = disabled)
++        float codecEosLogitOffset{0};   //!< Added to codec EOS logit before EOS bias onset
++        float predictorTemperature{0};  //!< CodePredictor temperature (0 = talker temperature)
++        int32_t predictorTopK{0};        //!< CodePredictor top-K (0 = talker top-K)
++        float predictorTopP{0};          //!< CodePredictor top-P (0 = talker top-P)
+ 
+         // Speaker selection (optional, defaults to config default)
+         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
++        //!< CustomVoice language conditioning (e.g., "chinese", "english"). Empty = no language path.
++        //!< Lower-cased by the runtime before lookup in TalkerConfig::codecLanguageId.
++        std::string language{""};
+         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
++        std::vector<float> speakerEmbedding; //!< Optional raw x-vector embedding [talkerHiddenSize]
+ 
+         // Input: conversation messages for this request (runtime tokenizes internally)
+         std::vector<Message> messages;
+         bool applyChatTemplate{true};   //!< Whether to apply chat template formatting
+         bool addGenerationPrompt{true}; //!< Whether to add generation prompt at the end
+         bool enableThinking{false};     //!< Whether to enable thinking mode
++
++        // ===== Optional streaming hooks (standalone-TTS streaming path) =====
++        //! Emit a chunk every N audio frames. 0 = disabled (non-streaming behavior).
++        //! This value applies to the FIRST emitted chunk (low TTFA target).
++        int32_t codecChunkFrames{0};
++        //! Size of subsequent emitted chunks after the first. 0 means reuse codecChunkFrames.
++        //! Lets callers prioritize TTFA (small first chunk) and steady-state stability
++        //! (larger subsequent chunks).
++        int32_t subsequentChunkFrames{0};
++        //! Invoked from the Talker decode loop when codecChunkFrames frames have accumulated,
++        //! and once more at end-of-generation with isFinal=true for any remainder.
++        //! Signature: (chunkRvqCodes [N][16], batchIdx, isFinal).
++        AudioChunkCallback onAudioChunkReady{};
++        //! Optional polled cancel hook. Returning true cancels the request mid-stream.
++        std::function<bool()> shouldCancel{};
+     };
+ 
+     /*!
+@@ -246,9 +324,10 @@ public:
+ 
+     /*!
+      * @brief Configuration for Thinker→Talker streaming pipeline
++     *
++     * AudioChunkCallback is the same 3-param signature defined earlier
++     * (see TalkerGenerationRequest::onAudioChunkReady).
+      */
+-    using AudioChunkCallback = std::function<void(std::vector<std::vector<int32_t>> const& chunkRvqCodes)>;
+-
+     struct ThinkerTalkerStreamingConfig
+     {
+         int32_t talkerPrefillThreshold{4};    //!< Start Talker prefill after this many assistant tokens
+@@ -325,6 +404,15 @@ public:
+ private:
+     // ========== Internal Methods ==========
+ 
++    //! @brief Shared constructor body for the path-based and shared-engine (TTS slot-pool, D2) constructors.
++    //!        When @p sharedTalkerEngine / @p sharedCodePredictorEngine are non-null, the engine runners are
++    //!        built from the shared engines instead of deserializing from disk. All other initialization is
++    //!        identical regardless of the engine source.
++    void initializeCommon(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
++        std::string const& tokenizerDir, cudaStream_t stream,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine = nullptr,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine = nullptr);
++
+     void initializeTTSEmbeddings(cudaStream_t stream);
+ 
+     //! @param perBatchContextLengths Optional per-batch context lengths for padded batched prefill.
+@@ -335,10 +423,16 @@ private:
+     //! Run CodePredictor for one frame of one batch element (batch=1 engine call internally).
+     //! Called inside the per-batch loop of the decode frame.
+     bool runCodePredictorGenerationForFrame(int32_t codecToken, rt::Tensor const& talkerHiddenState,
+-        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes, cudaStream_t stream);
++        SamplingParams const& samplingParams, std::vector<int32_t>& outputCodes,
++        rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
+ 
+     //! Compute residual connection for one batch element.
++    //! [Phase B C1] codecHiddensBuffer now passed per-request (was global mCodecHiddensBuffer).
+     bool computeResidualConnection(std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden,
++        int32_t generationStep, rt::Tensor& outputResidual, rt::Tensor const& codecHiddensBuffer, cudaStream_t stream);
++
++    //! Host-side residual connection (no CUDA kernel). Uses HEAD streaming addend logic.
++    bool computeResidualConnectionHost(std::vector<int32_t> const& codes, rt::Tensor const* trailingTextHidden,
+         int32_t generationStep, rt::Tensor& outputResidual, cudaStream_t stream);
+ 
+     //! Extract last hidden state from Talker hidden states buffer for one batch element.
+@@ -363,6 +457,7 @@ private:
+         std::unordered_set<int32_t> seenTokenSet;   //!< Host-side seen tokens for repetition penalty
+         int32_t numSeenTokens{0};                   //!< Count of unique seen tokens
+         std::vector<std::vector<int32_t>> rvqCodes; //!< Generated RVQ codes [numFrames][numCodesPerFrame]
++        int32_t lastChunkEnd{0}; //!< Frame index of last emitted streaming chunk (standalone-TTS streaming path)
+     };
+ 
+     /*!
+@@ -384,10 +479,21 @@ private:
+      */
+     //! @param prefillSeqLens Per-batch prefill sequence lengths for correct hidden-state extraction
+     //!        after batched prefill with padding. Empty for single-batch callers.
++    //! Optional per-batch streaming hook bundle (standalone-TTS streaming path).
++    //! Empty vector or null entries disable streaming (preserves non-streaming behavior).
++    struct PerBatchStreamingHooks
++    {
++        int32_t codecChunkFrames{0};       //!< Size of the first emitted chunk.
++        int32_t subsequentChunkFrames{0};  //!< Size of subsequent chunks (0 = reuse codecChunkFrames).
++        AudioChunkCallback onAudioChunkReady{};
++        std::function<bool()> shouldCancel{};
++    };
++
+     bool runTalkerGenerationLoop(std::vector<PerBatchTalkerState>& states, int32_t activeBatchSize, int32_t maxFrames,
+         SamplingParams const& talkerSamplingParams, SamplingParams const& predictorSamplingParams,
+-        float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens, cudaStream_t stream,
+-        std::vector<int64_t> const& prefillSeqLens = {});
++        float repetitionPenalty, std::vector<rt::Tensor const*> const& trailingTextHiddens,
++        rt::Tensor& codecHiddensBuffer, cudaStream_t stream, std::vector<int64_t> const& prefillSeqLens = {},
++        std::vector<PerBatchStreamingHooks> const& streamingHooks = {});
+ 
+     /*!
+      * @brief Run a single Talker decode frame (used by the Thinker-Talker streaming path).
+@@ -460,6 +566,7 @@ private:
+ 
+         // Codec special tokens (from talker vocab, used directly)
+         int32_t codecNothinkId{};  //!< Codec no-think control token (2155)
++        int32_t codecThinkId{};    //!< Codec think control token (CustomVoice + language path)
+         int32_t codecThinkBosId{}; //!< Codec think begin-of-sequence (2156)
+         int32_t codecThinkEosId{}; //!< Codec think end-of-sequence (2157)
+         int32_t codecPadId{};      //!< Codec padding token (2148)
+@@ -468,6 +575,10 @@ private:
+ 
+         // Speaker configuration (read from config)
+         int32_t defaultSpeakerId{}; //!< Default speaker ID (e.g., 2301 for f245)
++
++        //!< CustomVoice language conditioning: map of lower-case language name -> codec token ID.
++        //!< Empty when the model is not a CustomVoice language-conditioned variant.
++        std::unordered_map<std::string, int32_t> codecLanguageId{};
+     };
+ 
+     // ========== Configuration and Initialization ==========
+@@ -481,11 +592,21 @@ private:
+ 
+     /*!
+      * @brief Initialize Talker and CodePredictor engine runners
++     *
++     * When @p sharedTalkerEngine / @p sharedCodePredictorEngine are non-null (TTS slot-pool, D2), the
++     * corresponding LLMEngineRunner is built from the shared, already-deserialized engine (skipping
++     * deserialization) instead of loading llm.engine from disk. Config paths are still read from the
++     * given directories. When both are null this behaves exactly as the original path-based init.
++     *
+      * @param talkerEngineDir Directory containing talker engine files
+      * @param codePredictorEngineDir Directory containing code predictor engine files
++     * @param sharedTalkerEngine Optional shared Talker engine (null = deserialize from disk)
++     * @param sharedCodePredictorEngine Optional shared CodePredictor engine (null = deserialize from disk)
+      * @return True on success, false on failure
+      */
+-    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
++    bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedTalkerEngine = nullptr,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedCodePredictorEngine = nullptr);
+ 
+     /*!
+      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
+@@ -511,6 +632,7 @@ private:
+ 
+     std::unique_ptr<LLMEngineRunner> mTalkerLLMRunner;     //!< Talker LLM engine runner
+     std::unique_ptr<LLMEngineRunner> mCodePredictorRunner; //!< CodePredictor engine runner
++    bool mUseHostTextProjection{false};
+ 
+     LLMEngineRunnerConfig mTalkerLLMConfig;     //!< Talker LLM configuration
+     LLMEngineRunnerConfig mCodePredictorConfig; //!< CodePredictor configuration
+@@ -596,7 +718,25 @@ private:
+     rt::Tensor mTalkerHiddenStatesBuffer;        //!< Talker hidden states [maxBS, maxSeqLen, talkerHidden] FP16
+     rt::Tensor mCodePredictorHiddenStatesBuffer; //!< CodePredictor hidden states [1, numCodesPerFrame, cpHidden] FP16
+     rt::Tensor mTalkerLastHidden;                //!< Extracted last hidden [maxBS, talkerHidden] FP16
+-    rt::Tensor mCodecHiddensBuffer;              //!< Codec hiddens [1, numCodesPerFrame, talkerHidden] FP16
++    // [Phase B C1] mCodecHiddensBuffer was moved out of the runtime-global state to
++    // per-request scope to avoid cross-request `cudaMemsetAsync` races at N>1. The
++    // buffer is now a local in `handleAudioGeneration` (passed by reference into
++    // CP/residual helpers).
++
++    nvinfer1::DataType mTalkerInputEmbedsDataType{nvinfer1::DataType::kHALF};
++    nvinfer1::DataType mResidualEmbedDataType{nvinfer1::DataType::kHALF};
++    nvinfer1::DataType mTalkerHiddenStatesDataType{nvinfer1::DataType::kHALF};
++
++    std::vector<float> mHostTalkerEmbeddingTable;
++    std::vector<float> mHostCodePredictorEmbeddingTables;
++    std::vector<float> mHostTextFC1Weight;
++    std::vector<float> mHostTextFC1Bias;
++    std::vector<float> mHostTextFC2Weight;
++    std::vector<float> mHostTextFC2Bias;
++    std::vector<float> mHostProjectedBuffer;
++    std::vector<float> mHostTtsPadEmbed;
++    std::vector<float> mHostTtsBosEmbed;
++    std::vector<float> mHostTtsEosEmbed;
+ 
+     cudaStream_t mStream{nullptr};                   //!< CUDA stream for operations
+     metrics::MultimodalMetrics mMultimodalMetrics;   //!< Performance metrics for Talker pipeline (legacy)
+@@ -619,7 +759,7 @@ private:
+      * @param stream CUDA stream
+      * @return True on success, false on failure
+      */
+-    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
++    bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, int32_t langId, rt::Tensor& output,
+         int64_t& outputSeqLen, cudaStream_t stream);
+ 
+     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
+@@ -659,7 +799,7 @@ private:
+      * @return True on success, false on failure
+      */
+     bool executeCodePredictorDecodingStep(int32_t tokenId, int32_t embeddingTableIndex, int32_t generationStep,
+-        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, cudaStream_t stream);
++        rt::Tensor& outputLogits, rt::Tensor& outputHiddenStates, rt::Tensor& codecHiddensBuffer, cudaStream_t stream);
+ 
+     /*!
+      * @brief Load Talker weights from safetensors files

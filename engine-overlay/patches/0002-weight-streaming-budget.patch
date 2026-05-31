@@ -1,0 +1,680 @@
+diff --git a/cpp/builder/builderUtils.cpp b/cpp/builder/builderUtils.cpp
+index d443a7c..9cb5c3f 100644
+--- a/cpp/builder/builderUtils.cpp
++++ b/cpp/builder/builderUtils.cpp
+@@ -266,6 +266,22 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
+     config->setFlag(nvinfer1::BuilderFlag::kMONITOR_MEMORY);
+ #endif
+ 
++    // Limit workspace memory pool to avoid OOM on memory-constrained devices
++    // (e.g. Jetson Orin NX with 15 GB unified memory).  TRT tactic profiling
++    // otherwise requests 2-3.5 GB of workspace, which + weight memory > total.
++    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 4ULL << 30);  // 4 GiB
++
++    // Stream weights instead of loading all into GPU memory at once (TRT 10+).
++    // On unified-memory Jetson this avoids pinning the full ONNX weight buffer.
++    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
++
++    // Limit tactics to cuBLAS / cuBLAS-LT to reduce profiling memory pressure.
++    // Full tactic set includes cuDNN / edge-mask convolution tactics that
++    // require 2+ GiB of scratch space, which is infeasible on 15 GB Orin NX.
++    auto tacticSources = 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS)
++                       | 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS_LT);
++    config->setTacticSources(tacticSources);
++
+     return config;
+ }
+ 
+diff --git a/cpp/runtime/eagleDraftEngineRunner.cpp b/cpp/runtime/eagleDraftEngineRunner.cpp
+index 89a9f3b..97ef555 100644
+--- a/cpp/runtime/eagleDraftEngineRunner.cpp
++++ b/cpp/runtime/eagleDraftEngineRunner.cpp
+@@ -137,6 +137,11 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
+     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+ 
++    // Apply weight streaming budget (no-op unless EDGELLM_WEIGHT_STREAMING_BUDGET is set
++    // AND the engine was built with kWEIGHT_STREAMING).
++    // MUST happen before createExecutionContext per TensorRT requirements.
++    rt::applyWeightStreamingBudget(mEngine.get(), "EagleDraftEngineRunner");
++
+     // Use single executionContext for both prefill and generation.
+     // Context memory is user-managed to enable sharing with other engines.
+     // The caller must provide shared context memory via setContextMemory() before execution.
+diff --git a/cpp/runtime/llmEngineRunner.cpp b/cpp/runtime/llmEngineRunner.cpp
+index d8fc7f5..5652e6d 100644
+--- a/cpp/runtime/llmEngineRunner.cpp
++++ b/cpp/runtime/llmEngineRunner.cpp
+@@ -143,9 +143,14 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+         LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
+         throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
+     }
+-    mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
++    mEngine = std::shared_ptr<nvinfer1::ICudaEngine>(
+         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+ 
++    // Apply weight streaming budget (no-op unless EDGELLM_WEIGHT_STREAMING_BUDGET is set
++    // AND the engine was built with kWEIGHT_STREAMING).
++    // MUST happen before createExecutionContext per TensorRT requirements.
++    rt::applyWeightStreamingBudget(mEngine.get(), "LLMEngineRunner");
++
+     // Use single executionContext for both prefill and generation.
+     // Context memory is user-managed to enable sharing with other engines.
+     // The caller must provide shared context memory via setContextMemory() before execution.
+@@ -402,6 +407,310 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+     CUDA_CHECK(cudaStreamSynchronize(stream));
+ }
+ 
++//! Shared-engine constructor (ASR slot-pool, D1).
++//!
++//! Mirrors the path-based constructor above, with three deliberate differences:
++//!   1. It does NOT create an IRuntime (mRuntime stays null) and does NOT deserialize an engine;
++//!      it adopts the supplied shared ICudaEngine instead.
++//!   2. It does NOT re-apply applyWeightStreamingBudget — the deserializing owner already applied
++//!      the (optional) weight-streaming budget once, before any execution context existed. Re-applying
++//!      it here, after other runners already hold execution contexts on the same engine, is unsafe.
++//!   3. Everything from createExecutionContext(kUSER_MANAGED) onward is identical to the path-based
++//!      constructor, so each shared-engine runner builds its own independent execution context, KV/cache
++//!      manager, rope cache, and runtime tensors. Context memory remains user-managed and must be supplied
++//!      per-runner via setContextMemory() before execution (see LLMInferenceSpecDecodeRuntime).
++LLMEngineRunner::LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine,
++    std::filesystem::path const& configPath, std::unordered_map<std::string, std::string> const& loraWeightsMap,
++    cudaStream_t stream)
++{
++    if (engine == nullptr)
++    {
++        LOG_ERROR("Shared-engine LLMEngineRunner constructed with a null ICudaEngine");
++        throw std::runtime_error("Shared-engine LLMEngineRunner constructed with a null ICudaEngine");
++    }
++
++    LOG_INFO("Loading config file %s", configPath.string().c_str());
++
++    // Parse configuration from JSON file
++    Json configJson;
++    std::ifstream configFileStream(configPath);
++    if (!configFileStream.is_open())
++    {
++        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
++        throw std::runtime_error("Failed to open config file: " + configPath.string());
++    }
++    try
++    {
++        configJson = Json::parse(configFileStream);
++        configFileStream.close();
++    }
++    catch (Json::parse_error const& e)
++    {
++        LOG_ERROR("Failed to parse config file with error: %s", e.what());
++        throw std::runtime_error("Failed to parse config file: " + configPath.string());
++    }
++
++    if (!this->initializeConfigFromJson(configJson))
++    {
++        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
++        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
++    }
++
++    // Adopt the shared, already-deserialized engine. mRuntime intentionally stays null: the deserializing
++    // owner keeps its IRuntime alive for the engine's lifetime. Weight streaming budget was already applied
++    // by that owner and must NOT be re-applied here.
++    LOG_INFO("Reusing shared TensorRT engine (slot-pool runner)");
++    mEngine = std::move(engine);
++
++    // Use single executionContext for both prefill and generation.
++    // Context memory is user-managed to enable sharing with other engines.
++    // The caller must provide shared context memory via setContextMemory() before execution.
++    mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
++        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
++
++    if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
++    {
++        mTRTExecutionContext->setProfiler(&trt_edgellm::layerProfiler::LayerProfiler::getInstance());
++    }
++
++    if (!this->validateConfigFromEngine())
++    {
++        LOG_ERROR("Failed to match config file %s with the shared engine", configPath.string().c_str());
++        throw std::runtime_error(
++            "Failed to match config file " + configPath.string() + " with the shared engine");
++    }
++
++    RopeConfig const& ropeConfig = mConfig.ropeConfig;
++    switch (ropeConfig.type)
++    {
++    case RopeType::kLongRope:
++    {
++        LOG_DEBUG("Initialize long Rope CosSinCache.");
++        check::check(ropeConfig.longRope.has_value() && ropeConfig.longRope.value().originalMaxPositionEmbeddings != -1,
++            "longRope is not set correctly");
++
++        rt::Tensor shortCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
++            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::shortCosSinCache");
++        rt::Tensor longCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
++            rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::longCosSinCache");
++        bool const initRopeStatus
++            = initializeLongRopeCosSinCache(shortCosSinCache, longCosSinCache, ropeConfig, stream);
++        if (!initRopeStatus)
++        {
++            LOG_ERROR("Failed to initialize long Rope CosSinCache.");
++            throw std::runtime_error("Failed to initialize long Rope CosSinCache.");
++        }
++        if (mConfig.maxKVCacheCapacity <= ropeConfig.longRope.value().originalMaxPositionEmbeddings)
++        {
++            mPosEncCosSinCache = std::move(shortCosSinCache);
++        }
++        else
++        {
++            mPosEncCosSinCache = std::move(longCosSinCache);
++        }
++        break;
++    }
++    case RopeType::kMRope:
++    {
++        this->mPosEncCosSinCache
++            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.rotaryDim},
++                rt::DeviceType::kGPU, DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
++
++        // Initialize MRoPE cache for all batch slots using text-only sequential positions.
++        kernel::initializeTextOnlyMRopeCosSin(mPosEncCosSinCache.dataPointer<float>(), ropeConfig.rotaryTheta,
++            mConfig.rotaryDim, mConfig.maxKVCacheCapacity, mConfig.maxSupportedBatchSize, stream);
++        break;
++    }
++    case RopeType::kNoRope:
++    {
++        LOG_DEBUG("No RoPE: initializing identity CosSinCache (cos=1, sin=0).");
++        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
++            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
++        bool const initStatus = initializeNopeCosSinCache(mPosEncCosSinCache, stream);
++        if (!initStatus)
++        {
++            LOG_ERROR("Failed to initialize identity CosSinCache.");
++            throw std::runtime_error("Failed to initialize identity CosSinCache.");
++        }
++        break;
++    }
++    default:
++    {
++        LOG_DEBUG("Initialize persistent Rope CosSinCache.");
++        this->mPosEncCosSinCache = rt::Tensor({1, mConfig.maxKVCacheCapacity, mConfig.rotaryDim}, rt::DeviceType::kGPU,
++            DataType::kFLOAT, "LLMEngineRunner::mPosEncCosSinCache");
++        bool const initRopeStatus = initializeRopeCosSinCache(mPosEncCosSinCache, ropeConfig, stream);
++        if (!initRopeStatus)
++        {
++            LOG_ERROR("Failed to initialize persistent Rope CosSinCache.");
++            throw std::runtime_error("Failed to initialize persistent Rope CosSinCache.");
++        }
++        break;
++    }
++    }
++    // Bind RopeCosSin cache
++    bool setRopeCosSinCacheStatus{true};
++    setRopeCosSinCacheStatus
++        &= mTRTExecutionContext->setTensorAddress(binding_names::kRopeCosSin, mPosEncCosSinCache.rawPointer());
++    if (!setRopeCosSinCacheStatus)
++    {
++        LOG_ERROR("Failed to set rope cos sin cache to the engine");
++        throw std::runtime_error("Failed to set rope cos sin cache to the engine");
++    }
++
++    if (!validateKVCacheType())
++    {
++        LOG_ERROR("Failed to validate KV cache type");
++        throw std::runtime_error("Failed to validate KV cache type");
++    }
++
++    // Detect KV cache storage dtype from engine bindings.
++    nvinfer1::DataType kvCacheType = getKVCacheType();
++
++    DataType const recurrentStateType = (mConfig.numLinearAttnLayers > 0) ? getRecurrentStateType() : DataType::kHALF;
++    DataType const convStateType = (mConfig.numLinearAttnLayers > 0) ? getConvStateType() : DataType::kHALF;
++
++    // MTP intermediate state seq_len: only allocated when the engine is an MTP base
++    // MTP kernels require maxVerifyTreeSize <= 8 (kMTPMaxSeqLen).
++    int32_t const maxIntermediateSeqLen
++        = (mConfig.mtpBase && mConfig.numLinearAttnLayers > 0) ? mConfig.maxVerifyTreeSize : 0;
++    if (maxIntermediateSeqLen > 8)
++    {
++        LOG_ERROR("MTP base model requires maxVerifyTreeSize <= 8, got %d", maxIntermediateSeqLen);
++        throw std::runtime_error("MTP maxVerifyTreeSize exceeds kernel limit (8)");
++    }
++
++    // Build HybridCacheManager config from parsed per-layer configuration
++    int32_t const numAttnLayers = static_cast<int32_t>(mConfig.kvLayerConfigs.size());
++    rt::KVCacheManager::Config kvCacheConfig{
++        numAttnLayers, mConfig.maxSupportedBatchSize, mConfig.maxKVCacheCapacity, mConfig.kvLayerConfigs, kvCacheType};
++    rt::MambaCacheManager::Config mambaConfig{mConfig.numLinearAttnLayers, mConfig.maxSupportedBatchSize,
++        mConfig.recurrentStateNumHeads, mConfig.recurrentStateHeadDim, mConfig.recurrentStateSize, mConfig.convDim,
++        mConfig.convKernel, maxIntermediateSeqLen, recurrentStateType, convStateType};
++    rt::HybridCacheManager::Config cacheManagerConfig{
++        mConfig.layerTypes, kvCacheConfig, mambaConfig, mConfig.maxSupportedBatchSize};
++    this->mCacheManager = rt::HybridCacheManager(cacheManagerConfig, stream);
++
++    // Instantiate other GPU memory input that needed by the Engine execution.
++    this->mSequenceContextLengths = rt::Tensor({mConfig.maxSupportedBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
++        "LLMEngineRunner::mSequenceContextLengths");
++    CUDA_CHECK(
++        cudaMemsetAsync(mSequenceContextLengths.rawPointer(), 0, mSequenceContextLengths.getMemoryCapacity(), stream));
++
++    if (mConfig.enableEagleSpecDecode)
++    {
++        // For EAGLE: last_token_ids is 2D [batch_size, num_selected_tokens] to support multi-batch
++        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
++            rt::DeviceType::kGPU, DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
++        CUDA_CHECK(
++            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
++        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize},
++            rt::DeviceType::kCPU, DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
++        // Allocate position IDs to support both prefill and tree decoding
++        int32_t const maxSeqLen = std::max(mConfig.maxSupportedInputLength, mConfig.maxVerifyTreeSize);
++        this->mEagleBasePositionIds = rt::Tensor({mConfig.maxSupportedBatchSize, maxSeqLen}, rt::DeviceType::kGPU,
++            DataType::kINT32, "LLMEngineRunner::mEagleBasePositionIds");
++        CUDA_CHECK(
++            cudaMemsetAsync(mEagleBasePositionIds.rawPointer(), 0, mEagleBasePositionIds.getMemoryCapacity(), stream));
++        int32_t const packedMaskSize = divUp(mConfig.maxVerifyTreeSize, 32);
++        this->mEagleBasePackedMask
++            = rt::Tensor({mConfig.maxSupportedBatchSize, mConfig.maxVerifyTreeSize, packedMaskSize},
++                rt::DeviceType::kGPU, DataType::kINT32, "LLMEngineRunner::mEagleBasePackedMask");
++        CUDA_CHECK(
++            cudaMemsetAsync(mEagleBasePackedMask.rawPointer(), 0, mEagleBasePackedMask.getMemoryCapacity(), stream));
++    }
++    else
++    {
++        this->mSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kGPU,
++            DataType::kINT64, "LLMEngineRunner::mSelectTokenIndices");
++        CUDA_CHECK(
++            cudaMemsetAsync(mSelectTokenIndices.rawPointer(), 0, mSelectTokenIndices.getMemoryCapacity(), stream));
++        this->mHostSelectTokenIndices = rt::Tensor({mConfig.maxSupportedBatchSize, 1}, rt::DeviceType::kCPU,
++            DataType::kINT64, "LLMEngineRunner::mHostSelectTokenIndices");
++    }
++
++    // Add the LoRA weights to the engine.
++    if (isLoraWeightsSupported())
++    {
++        for (auto const& [loraWeightsName, loraWeightsPath] : loraWeightsMap)
++        {
++            if (loraWeightsPath.empty())
++            {
++                continue;
++            }
++            if (!this->addLoraWeights(loraWeightsName, loraWeightsPath, stream))
++            {
++                LOG_ERROR("Failed to add LoRA weights: %s", loraWeightsName.c_str());
++                throw std::runtime_error("Failed to add LoRA weights: " + loraWeightsName);
++            }
++        }
++    }
++
++    // Initialize the dummy tensor as TensorRT does not support nullptr for binding
++    std::vector<int64_t> dummyInputSizes = {
++        static_cast<int64_t>(
++            mConfig.maxSupportedBatchSize), // attention mask/attention position IDs/KV cache start index
++        static_cast<int64_t>(getMaxLoraWeightsDimension() * kEMPTY_LORA_RANK), // LoRA weights
++    };
++
++    // Add deepstack_embeds size for generation profile
++    if (mConfig.numDeepstackFeatures > 0)
++    {
++        int64_t const deepstackSeqLen = mConfig.enableEagleSpecDecode ? mConfig.maxVerifyTreeSize : 1;
++        int64_t const deepstackSize
++            = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * deepstackSeqLen * mConfig.hiddenSize;
++        dummyInputSizes.push_back(deepstackSize);
++    }
++
++    int64_t maxDummyElements = *std::max_element(dummyInputSizes.begin(), dummyInputSizes.end());
++    mDummyInputTensor = rt::Tensor(
++        {maxDummyElements}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF, "LLMEngineRunner::mDummyInputTensor");
++    // Initialize dummy tensor memory to zero
++    CUDA_CHECK(cudaMemsetAsync(mDummyInputTensor.rawPointer(), 0, mDummyInputTensor.getMemoryCapacity(), stream));
++
++    // Allocate dummy output tensor for hidden_states when the engine has that output binding.
++    {
++        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
++        if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
++        {
++            int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
++            int64_t dummyOutputSize = static_cast<int64_t>(mConfig.maxSupportedBatchSize) * outputHiddenDim;
++            mDummyOutputTensor = rt::Tensor({dummyOutputSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF,
++                "LLMEngineRunner::mDummyOutputTensor");
++            LOG_INFO("Allocated dummy hidden_states output buffer: %lld elements (engineHasHiddenStates=%d)",
++                dummyOutputSize, engineHasHiddenStates);
++        }
++    }
++
++    // Initialize kKVCacheStartIndex to dummy tensor for both profiles to avoid "address not set" error
++    {
++        bool setKVCacheStartIndexStatus{true};
++        setKVCacheStartIndexStatus &= mTRTExecutionContext->setTensorAddress(
++            binding_names::kKVCacheStartIndex, mDummyInputTensor.rawPointer());
++        setKVCacheStartIndexStatus &= mTRTExecutionContext->setInputShape(
++            binding_names::kKVCacheStartIndex, rt::Coords{mConfig.maxSupportedBatchSize}.getTRTDims());
++        if (!setKVCacheStartIndexStatus)
++        {
++            LOG_ERROR("Failed to set kKVCacheStartIndex dummy tensor for initialization");
++            throw std::runtime_error("Failed to set kKVCacheStartIndex dummy tensor for initialization");
++        }
++    }
++    // Reset the LoRA weights to zero tensors.
++    if (!this->resetLoraWeights())
++    {
++        LOG_ERROR("Failed to initialize LoRA weights to zero tensors");
++        throw std::runtime_error("Failed to initialize LoRA weights to zero tensors");
++    }
++
++    // Synchronize the stream to ensure all the operations have completed.
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++}
++
++std::shared_ptr<nvinfer1::ICudaEngine> LLMEngineRunner::getEngine() const noexcept
++{
++    return mEngine;
++}
++
+ int64_t LLMEngineRunner::getRequiredContextMemorySize() const
+ {
+     return mEngine->getDeviceMemorySizeV2();
+@@ -446,6 +755,11 @@ nvinfer1::DataType LLMEngineRunner::getConvStateType() const
+     return mEngine->getTensorDataType(name.c_str());
+ }
+ 
++nvinfer1::DataType LLMEngineRunner::getTensorDataType(std::string const& name) const
++{
++    return mEngine->getTensorDataType(name.c_str());
++}
++
+ bool LLMEngineRunner::validateKVCacheType() const
+ {
+     // Sanity check: ensure KV-cache precision (dtype) is consistent across all layers (and both past/present).
+diff --git a/cpp/runtime/llmEngineRunner.h b/cpp/runtime/llmEngineRunner.h
+index 6b8a8f0..108656c 100644
+--- a/cpp/runtime/llmEngineRunner.h
++++ b/cpp/runtime/llmEngineRunner.h
+@@ -102,6 +102,24 @@ public:
+     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+ 
++    /*!
++     * @brief Construct LLM engine runner from an already-deserialized, shared ICudaEngine (ASR slot-pool, D1).
++     *
++     * Reuses the supplied engine instead of deserializing a new one, so N runners can share one set of
++     * engine weights while each builds its own user-managed IExecutionContext. The deserializing owner of
++     * @p engine (the runner created via the path-based constructor) MUST outlive every runner built this way,
++     * because it owns the TensorRT IRuntime that backs the engine. This overload does NOT own an IRuntime.
++     *
++     * @param engine Shared, already-deserialized TensorRT engine (must be non-null)
++     * @param configPath Path to model configuration file
++     * @param loraWeightsMap Map of LoRA weight names to file paths
++     * @param stream CUDA stream for operations
++     * @throws std::runtime_error If @p engine is null, configuration parsing, or initialization fails, or a
++     * CUDA operation fails
++     */
++    LLMEngineRunner(std::shared_ptr<nvinfer1::ICudaEngine> engine, std::filesystem::path const& configPath,
++        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
++
+     //! @brief Destructor
+     ~LLMEngineRunner() noexcept;
+ 
+@@ -132,6 +150,12 @@ public:
+     //! @return Engine configuration structure
+     LLMEngineRunnerConfig getEngineConfig() const noexcept;
+ 
++    //! @brief Get the shared TensorRT engine backing this runner (ASR slot-pool, D1).
++    //! @return Shared pointer to the ICudaEngine. Allows constructing additional runners that share these
++    //! engine weights via the shared-engine constructor overload.
++    //! @note The returned engine is only valid while this runner (the deserializing owner) is alive.
++    std::shared_ptr<nvinfer1::ICudaEngine> getEngine() const noexcept;
++
+     //! @brief Bind a dynamic lm_head weight tensor to the engine
+     //!
+     //! Used by CodePredictor to select which lm_head to use for each RVQ layer.
+@@ -246,9 +270,16 @@ public:
+     //! Key to uniquely identify a captured CUDA graph for the base model verification step
+     using BaseGraphKey = std::tuple<int64_t, uintptr_t, uintptr_t, uintptr_t, std::string>;
+ 
++    //! @brief Get the dtype of an engine tensor by name
++    nvinfer1::DataType getTensorDataType(std::string const& name) const;
++
+ private:
+     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
+-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
++    //! TensorRT engine. shared_ptr so multiple LLMEngineRunner instances (ASR slot-pool, D1) can share
++    //! one deserialized ICudaEngine (saving weight memory) while each owns an independent execution context.
++    //! For the deserializing constructor this runner also keeps mRuntime alive; the shared-engine overload
++    //! relies on the original deserializing owner keeping its mRuntime alive for the engine's lifetime.
++    std::shared_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine (shared across runners)
+     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
+ 
+     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
+diff --git a/cpp/runtime/llmRuntimeUtils.cpp b/cpp/runtime/llmRuntimeUtils.cpp
+index f82db09..6430ab2 100644
+--- a/cpp/runtime/llmRuntimeUtils.cpp
++++ b/cpp/runtime/llmRuntimeUtils.cpp
+@@ -23,10 +23,27 @@
+ #include "common/stringUtils.h"
+ #include "kernels/posEncoding/initializeCosSinCache.h"
+ #include "runtime/streaming.h" // For SlotStreamState (explicit compactVector instantiation)
++#include <NvInferRuntime.h>
++#include <cctype>
++#include <cstdint>
++#include <cstdlib>
+ #include <optional>
+ #include <ostream>
+ #include <sstream>
+ #include <stdexcept>
++#include <string>
++
++// Local helpers to silence -Wdeprecated-declarations around the (still functional)
++// V1 weight-streaming getter, which TRT 10 marks TRT_DEPRECATED but never replaced
++// with a V2 variant. Scoped to the single call site.
++#if defined(__GNUC__) || defined(__clang__)
++#define EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED                                                                            \
++    _Pragma("GCC diagnostic push") _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"")
++#define EDGELLM_DIAG_POP _Pragma("GCC diagnostic pop")
++#else
++#define EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED
++#define EDGELLM_DIAG_POP
++#endif
+ 
+ using namespace nvinfer1;
+ namespace trt_edgellm
+@@ -34,6 +51,115 @@ namespace trt_edgellm
+ namespace rt
+ {
+ 
++namespace
++{
++//! Parse EDGELLM_WEIGHT_STREAMING_BUDGET into a budget value (bytes).
++//! See header for accepted formats. Returns nullopt if unset/empty.
++std::optional<int64_t> parseWeightStreamingBudgetEnv(int64_t streamableSize, int64_t minimumBudget)
++{
++    char const* raw = std::getenv("EDGELLM_WEIGHT_STREAMING_BUDGET");
++    if (raw == nullptr)
++    {
++        return std::nullopt;
++    }
++    std::string s(raw);
++    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
++    {
++        s.pop_back();
++    }
++    if (s.empty())
++    {
++        return std::nullopt;
++    }
++    std::string lower = s;
++    for (auto& c : lower)
++    {
++        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    }
++    if (lower == "off")
++    {
++        return streamableSize;
++    }
++    if (lower == "min" || lower == "-1")
++    {
++        return minimumBudget;
++    }
++    char const suffix = lower.back();
++    int64_t mult = 1;
++    std::string numPart = lower;
++    if (suffix == 'g')
++    {
++        mult = static_cast<int64_t>(1) << 30;
++        numPart = lower.substr(0, lower.size() - 1);
++    }
++    else if (suffix == 'm')
++    {
++        mult = static_cast<int64_t>(1) << 20;
++        numPart = lower.substr(0, lower.size() - 1);
++    }
++    try
++    {
++        long long const v = std::stoll(numPart);
++        return static_cast<int64_t>(v) * mult;
++    }
++    catch (std::exception const&)
++    {
++        LOG_WARNING("EDGELLM_WEIGHT_STREAMING_BUDGET=%s could not be parsed; ignoring.", raw);
++        return std::nullopt;
++    }
++}
++} // namespace
++
++void applyWeightStreamingBudget(nvinfer1::ICudaEngine* engine, char const* tag)
++{
++    if (engine == nullptr)
++    {
++        return;
++    }
++    int64_t const streamableSize = engine->getStreamableWeightsSize();
++    if (streamableSize <= 0)
++    {
++        // Engine not built with kWEIGHT_STREAMING; nothing to do.
++        return;
++    }
++    // Note: TensorRT 10 ships setWeightStreamingBudgetV2() but did NOT introduce
++    // a V2 variant of the minimum-budget getter; the V1 getter is still the
++    // canonical way to query the minimum (it returns the same value used to
++    // clamp V2 budgets).
++    EDGELLM_DIAG_PUSH_IGNORE_DEPRECATED
++    int64_t const minBudget = engine->getMinimumWeightStreamingBudget();
++    EDGELLM_DIAG_POP
++    auto envBudget = parseWeightStreamingBudgetEnv(streamableSize, minBudget);
++    if (!envBudget.has_value())
++    {
++        LOG_INFO("[%s] Weight streaming AVAILABLE (streamable=%lld bytes, min=%lld bytes) but "
++                 "EDGELLM_WEIGHT_STREAMING_BUDGET not set; engine will load full weights.",
++            tag, static_cast<long long>(streamableSize), static_cast<long long>(minBudget));
++        return;
++    }
++    int64_t budget = envBudget.value();
++    if (budget < minBudget)
++    {
++        LOG_WARNING("[%s] Requested weight-streaming budget %lld < minimum %lld; clamping to minimum.", tag,
++            static_cast<long long>(budget), static_cast<long long>(minBudget));
++        budget = minBudget;
++    }
++    if (budget > streamableSize)
++    {
++        LOG_WARNING("[%s] Requested weight-streaming budget %lld > streamable %lld; clamping to streamable.", tag,
++            static_cast<long long>(budget), static_cast<long long>(streamableSize));
++        budget = streamableSize;
++    }
++    bool const ok = engine->setWeightStreamingBudgetV2(budget);
++    LOG_INFO("[%s] Weight streaming: budget=%lld / streamable=%lld bytes (min=%lld), setOK=%d", tag,
++        static_cast<long long>(budget), static_cast<long long>(streamableSize), static_cast<long long>(minBudget),
++        static_cast<int>(ok));
++    if (!ok)
++    {
++        LOG_ERROR("[%s] setWeightStreamingBudgetV2(%lld) returned false.", tag, static_cast<long long>(budget));
++    }
++}
++
+ std::ostream& operator<<(std::ostream& os, RopeType const& type)
+ {
+     switch (type)
+@@ -503,7 +629,7 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
+ }
+ 
+ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+-    std::optional<int32_t> imageTokenId, int32_t vocabSize)
++    std::optional<int32_t> imageTokenId, int32_t vocabSize, int32_t audioIndexBase)
+ {
+     auto const shape = inputIds.getShape();
+     check::check(shape.getNumDims() == 2, "inputIds must be 2D tensor");
+@@ -515,7 +641,13 @@ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<i
+     int32_t const* inputIdsPtr = inputIds.dataPointer<int32_t>();
+     int32_t* indicesPtr = multimodalIndices.dataPointer<int32_t>();
+ 
+-    int32_t audioIndex = 0;
++    // audioIndexBase != 0 supports chunked-prefill streaming: the embedding kernel
++    // (cpp/kernels/embeddingKernels/embeddingKernels.cu:413) reads
++    // audioEmbeds[multimodalIdx * hiddenSize] directly, so encoding the cumulative
++    // offset into multimodalIdx lets the kernel index a cumulative audioEmbeds
++    // tensor without any kernel-signature change. Default 0 preserves one-shot
++    // behavior bit-exactly.
++    int32_t audioIndex = audioIndexBase;
+     int32_t imageIndex = 0;
+ 
+     for (int64_t b = 0; b < batchSize; ++b)
+diff --git a/cpp/runtime/llmRuntimeUtils.h b/cpp/runtime/llmRuntimeUtils.h
+index 3ed0241..c4cd46b 100644
+--- a/cpp/runtime/llmRuntimeUtils.h
++++ b/cpp/runtime/llmRuntimeUtils.h
+@@ -32,11 +32,39 @@
+ #include <variant>
+ #include <vector>
+ 
++// Forward declaration to avoid pulling NvInfer headers into every TU that includes this util header.
++namespace nvinfer1
++{
++class ICudaEngine;
++}
++
+ namespace trt_edgellm
+ {
+ namespace rt
+ {
+ 
++//! Apply weight-streaming budget to a TensorRT engine based on the
++//! EDGELLM_WEIGHT_STREAMING_BUDGET environment variable.
++//!
++//! No-op when:
++//!   - engine is null, or
++//!   - the engine was not built with `kWEIGHT_STREAMING` (streamableWeightsSize() == 0), or
++//!   - the env var is unset.
++//!
++//! Must be called AFTER deserializeCudaEngine and BEFORE createExecutionContext
++//! (per TensorRT API contract for setWeightStreamingBudgetV2).
++//!
++//! Env var formats (case-insensitive):
++//!   - "<N>"       : N bytes
++//!   - "<N>g"      : N GiB
++//!   - "<N>m"      : N MiB
++//!   - "off"       : disable streaming (budget = streamable size; all weights in GPU mem)
++//!   - "min" / "-1": minimum budget (maximum streaming, smallest GPU footprint)
++//!
++//! @param engine  Deserialized TRT engine (non-owning).
++//! @param tag     Short identifier used in log messages (e.g. "LLMEngineRunner").
++void applyWeightStreamingBudget(nvinfer1::ICudaEngine* engine, char const* tag);
++
+ /*!
+  * @brief Message with role and contents
+  */
+@@ -326,10 +354,16 @@ int32_t clampMaxGenerateLengthForKVCapacity(std::vector<int32_t> const& effectiv
+  * @param audioTokenId Special token ID for audio, or std::nullopt if no audio
+  * @param imageTokenId Special token ID for image, or std::nullopt if no image
+  * @param vocabSize Vocabulary size (tokens >= vocabSize are treated as image tokens)
++ * @param audioIndexBase Starting offset for audio embedding indexing. Default 0
++ *        preserves single-shot prefill semantics. For chunked/streaming prefill,
++ *        callers pass the cumulative count of audio rows consumed by prior chunks
++ *        so the kernel reads the correct row of a cumulative audioEmbeds tensor
++ *        (kernel reads `audioEmbeds[multimodalIdx * hiddenSize]`,
++ *        cpp/kernels/embeddingKernels/embeddingKernels.cu:413).
+  * @return multimodalIndices tensor on CPU [batchSize, seqLen]
+  */
+ rt::Tensor generateMultimodalIndices(rt::Tensor const& inputIds, std::optional<int32_t> audioTokenId,
+-    std::optional<int32_t> imageTokenId, int32_t vocabSize);
++    std::optional<int32_t> imageTokenId, int32_t vocabSize, int32_t audioIndexBase = 0);
+ 
+ } // namespace rt
+ } // namespace trt_edgellm

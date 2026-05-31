@@ -1,0 +1,1454 @@
+diff --git a/experimental/server/api_server.py b/experimental/server/api_server.py
+index 6b221b2..6f7e61c 100644
+--- a/experimental/server/api_server.py
++++ b/experimental/server/api_server.py
+@@ -25,6 +25,9 @@ Usage (standalone)::
+     python -m experimental.server \\
+         --model Qwen/Qwen3-1.7B --port 8000
+ 
++    python -m experimental.server \\
++        --engine-dir /path/to/llm_engine --port 8000
++
+ Usage (from LLM object)::
+ 
+     from experimental.server import LLM
+@@ -33,10 +36,15 @@ Usage (from LLM object)::
+ """
+ 
+ import argparse
++import asyncio
++import copy
+ import json
+ import logging
++import queue as _queue
++import re
++import threading
+ import uuid
+-from typing import Any, Dict, Optional
++from typing import Any, Dict, List, Optional
+ 
+ logger = logging.getLogger("edgellm.api_server")
+ 
+@@ -44,6 +52,13 @@ THINK_OPEN_TAG = "<think>"
+ THINK_CLOSE_TAG = "</think>"
+ IM_END_TOKEN = "<|im_end|>"
+ 
++TOOL_CALL_OPEN = "<tool_call>"
++TOOL_CALL_CLOSE = "</tool_call>"
++_TOOL_CALL_RE = re.compile(
++    re.escape(TOOL_CALL_OPEN) + r"\s*(.*?)\s*" + re.escape(TOOL_CALL_CLOSE),
++    re.DOTALL,
++)
++
+ 
+ def _split_reasoning_and_content(text: str):
+     """Split model output into (reasoning_content, content) around <think> tags."""
+@@ -56,10 +71,352 @@ def _split_reasoning_and_content(text: str):
+     return None, text.strip() if text.strip() else None
+ 
+ 
++# ---------------------------------------------------------------------------
++# Tool-calling (Qwen3-format) helpers
++#
++# The compiled C++ runtime applies a static prefix/suffix-per-role template
++# (``processed_chat_template.json``) which has no notion of OpenAI ``tools``.
++# To support tool-calling without modifying the C++ runtime, we render the
++# tool schema into a Qwen3-style "# Tools" system block in Python and inject
++# it as the leading system message before the request reaches the runtime.
++# On the response side we parse ``<tool_call>{...}</tool_call>`` blocks out
++# of the generated text and emit them as OpenAI ``tool_calls`` entries.
++# ---------------------------------------------------------------------------
++
++
++def _render_tools_system_block(tools: List[Dict[str, Any]],
++                               existing_system: str = "") -> str:
++    """Build the Qwen3 tool-system prompt text.
++
++    Mirrors the upstream Qwen3 chat_template.jinja ``{% if tools %}`` branch.
++    """
++    parts: List[str] = []
++    if existing_system:
++        parts.append(existing_system + "\n\n")
++    parts.append(
++        "# Tools\n\n"
++        "You may call one or more functions to assist with the user query."
++        "\n\nYou are provided with function signatures within "
++        "<tools></tools> XML tags:\n<tools>")
++    for tool in tools:
++        parts.append("\n" + json.dumps(tool, ensure_ascii=False))
++    parts.append(
++        "\n</tools>\n\nFor each function call, return a json object with "
++        "function name and arguments within <tool_call></tool_call> XML "
++        "tags:\n<tool_call>\n"
++        "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
++        "</tool_call>")
++    return "".join(parts)
++
++
++def _flatten_message_for_runtime(msg: Dict[str, Any]) -> Dict[str, Any]:
++    """Convert OpenAI tool-call / tool-result messages into plain text.
++
++    The C++ runtime only understands ``system|user|assistant`` roles with
++    string-or-multimodal content. We rewrite:
++        - ``role=tool``                 -> user with ``<tool_response>...``
++        - ``assistant`` w/ tool_calls   -> assistant with ``<tool_call>...``
++    """
++    role = msg.get("role")
++    if role == "tool":
++        out = {
++            "role": "user",
++            "content": ("<tool_response>\n" + str(msg.get("content", "")) +
++                        "\n</tool_response>"),
++        }
++        return out
++    if role == "assistant" and msg.get("tool_calls"):
++        text_parts: List[str] = []
++        content = msg.get("content") or ""
++        if isinstance(content, str) and content:
++            text_parts.append(content)
++        for tc in msg.get("tool_calls", []):
++            fn = tc.get("function", tc) if isinstance(tc, dict) else {}
++            name = fn.get("name", "")
++            args = fn.get("arguments", "")
++            if isinstance(args, str):
++                args_str = args
++            else:
++                args_str = json.dumps(args, ensure_ascii=False)
++            text_parts.append(
++                f"<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "
++                f"{args_str}}}\n</tool_call>")
++        return {"role": "assistant", "content": "\n".join(text_parts)}
++    return msg
++
++
++def _inject_tools_and_normalize(
++        messages: List[Dict[str, Any]],
++        tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
++    """Return a new messages list with tool schema injected and tool/tool_call
++    messages flattened so the C++ runtime can handle them.
++    """
++    flat = [_flatten_message_for_runtime(copy.deepcopy(m)) for m in messages]
++    if not tools:
++        return flat
++
++    existing_system = ""
++    if flat and flat[0].get("role") == "system":
++        sys_content = flat[0].get("content", "")
++        if isinstance(sys_content, str):
++            existing_system = sys_content
++        elif isinstance(sys_content, list):
++            existing_system = "".join(
++                p.get("text", "") if isinstance(p, dict) else str(p)
++                for p in sys_content)
++        rendered = _render_tools_system_block(tools, existing_system)
++        flat[0] = {"role": "system", "content": rendered}
++    else:
++        rendered = _render_tools_system_block(tools, "")
++        flat = [{"role": "system", "content": rendered}] + flat
++    return flat
++
++
++def _tool_call_from_json_obj(obj: Any, idx: int) -> Optional[Dict[str, Any]]:
++    """Build an OpenAI ``tool_calls`` entry from a raw {name,arguments} dict."""
++    if not isinstance(obj, dict):
++        return None
++    name = obj.get("name")
++    if not isinstance(name, str) or not name:
++        return None
++    if "arguments" not in obj and "parameters" not in obj:
++        return None
++    args_obj = obj.get("arguments", obj.get("parameters", {}))
++    if isinstance(args_obj, str):
++        arguments_str = args_obj
++    else:
++        arguments_str = json.dumps(args_obj, ensure_ascii=False)
++    return {
++        "id": f"call_{uuid.uuid4().hex[:8]}",
++        "type": "function",
++        "index": idx,
++        "function": {
++            "name": name,
++            "arguments": arguments_str,
++        },
++    }
++
++
++def _extract_tool_calls(text: str):
++    """Pull tool-call payloads out of model output.
++
++    Handles both the canonical Qwen3 ``<tool_call>{...}</tool_call>`` wrapping
++    *and* the common AWQ/quantized failure mode where the model drops the XML
++    tags and emits the raw ``{"name": ..., "arguments": ...}`` JSON. The
++    fallback is conservative: it only triggers when the stripped text starts
++    with ``{`` and parses to a dict with both ``name`` and ``arguments``.
++
++    Returns ``(tool_calls_list, remaining_text)`` where ``tool_calls_list`` is
++    a list of OpenAI-shaped ``tool_calls`` dicts, and ``remaining_text`` is
++    the text with the tool-call payload stripped (used as ``content``).
++    """
++    tool_calls: List[Dict[str, Any]] = []
++    cleaned_parts: List[str] = []
++    last_end = 0
++    for match in _TOOL_CALL_RE.finditer(text):
++        cleaned_parts.append(text[last_end:match.start()])
++        last_end = match.end()
++        body = match.group(1).strip()
++        try:
++            obj = json.loads(body)
++        except json.JSONDecodeError:
++            obj = None
++        tc = _tool_call_from_json_obj(obj, len(tool_calls))
++        if tc is not None:
++            tool_calls.append(tc)
++        else:
++            # Preserve raw text on malformed tool_call body.
++            cleaned_parts.append(match.group(0))
++    cleaned_parts.append(text[last_end:])
++    cleaned = "".join(cleaned_parts).strip()
++
++    # Fallback: model dropped the <tool_call> XML wrapper but emitted the
++    # bare JSON payload. Only attempt when no XML-form calls were found and
++    # the entire cleaned text is one JSON object that looks like a call.
++    if not tool_calls and cleaned.startswith("{") and cleaned.endswith("}"):
++        try:
++            obj = json.loads(cleaned)
++        except json.JSONDecodeError:
++            obj = None
++        tc = _tool_call_from_json_obj(obj, 0)
++        if tc is not None:
++            tool_calls.append(tc)
++            cleaned = ""
++
++    return tool_calls, cleaned
++
++
++class _ToolCallStreamParser:
++    """Incremental scanner for ``<tool_call>{...}</tool_call>`` blocks.
++
++    The goal is **early emit of the function name delta** so downstream
++    consumers (voice preamble, UI spinners, etc.) can react ~one token after
++    the model commits to a tool call, instead of waiting for the entire
++    arguments JSON to materialize.
++
++    State machine (per tool_call index):
++        TEXT              — outside any <tool_call> block
++        IN_TOOL_BODY      — saw opening tag, scanning for "name" key
++        IN_NAME_STRING    — inside the name string literal
++        NAME_EMITTED      — name flushed; just wait for closing </tool_call>
++
++    Cross-chunk safety: only the un-consumed tail is held in ``_buf``; once
++    a closing tag (or completed name) is consumed, the corresponding prefix
++    is dropped so the buffer cannot grow unboundedly.
++
++    On the canonical tool-call delta emitted at stream end the caller will
++    re-emit ``function.name`` for the same index; the OpenAI-compatible
++    client (runner.py:_ToolCallAcc) overwrites ``slot.name`` with the same
++    string — harmless duplicate.
++    """
++
++    _NAME_KEY_RE = re.compile(r'"name"\s*:\s*"')
++
++    def __init__(self) -> None:
++        self._state = "TEXT"
++        self._buf = ""
++        self._idx = -1            # current tool_call index (incremented on open)
++        self._name_chars: List[str] = []
++        # Track whether the current open block came from the XML wrapper
++        # (``<tool_call>...</tool_call>``) or the bare-JSON fallback path
++        # (AWQ/quantized models often drop the wrapper). Bare-JSON has no
++        # explicit closing tag, so we transition back to TEXT immediately
++        # after emitting the name.
++        self._in_xml_wrapper = False
++
++    def feed(self, text: str) -> List[Dict[str, Any]]:
++        """Consume new text; return list of partial tool_calls deltas to emit.
++
++        Each returned dict is the inner ``delta`` payload (matching the
++        canonical shape at line ~851) — caller wraps it in ``_sse_chunk``.
++        Currently only emits a name-only partial. Arguments and id are filled
++        by the canonical end-of-stream delta.
++        """
++        emits: List[Dict[str, Any]] = []
++        if not text:
++            return emits
++        self._buf += text
++        # Loop because one chunk may complete several state transitions.
++        while True:
++            if self._state == "TEXT":
++                pos_xml = self._buf.find(TOOL_CALL_OPEN)
++                # Bare-JSON fallback: detect a ``{"name":`` style opening
++                # anywhere in the buffer. This is the common AWQ failure
++                # mode where the model drops <tool_call>...</tool_call>
++                # entirely. Conservative: only triggers when the JSON
++                # appears to start with ``{`` and contains a name key
++                # before any text-like content.
++                pos_bare = -1
++                m_bare = self._NAME_KEY_RE.search(self._buf)
++                if m_bare is not None:
++                    # Walk back to the nearest ``{`` to confirm we're
++                    # inside an object.
++                    brace = self._buf.rfind("{", 0, m_bare.start())
++                    if brace != -1:
++                        between = self._buf[brace + 1:m_bare.start()].strip()
++                        # Allow only whitespace between '{' and '"name"'
++                        # (the typical bare-JSON head: ``{"name":``).
++                        # If the model emitted some other key first,
++                        # we'll still match on the canonical end-of-
++                        # stream path; here we stay conservative.
++                        if between == "":
++                            pos_bare = brace
++                if pos_xml == -1 and pos_bare == -1:
++                    keep = len(TOOL_CALL_OPEN) - 1
++                    if len(self._buf) > keep:
++                        self._buf = self._buf[-keep:] if keep > 0 else ""
++                    break
++                # Prefer whichever opens earlier in the buffer.
++                use_xml = pos_xml != -1 and (
++                    pos_bare == -1 or pos_xml <= pos_bare)
++                if use_xml:
++                    self._buf = self._buf[pos_xml + len(TOOL_CALL_OPEN):]
++                    self._in_xml_wrapper = True
++                    self._state = "IN_TOOL_BODY"
++                else:
++                    # Skip into the JSON body just past the '{'.
++                    self._buf = self._buf[pos_bare + 1:]
++                    self._in_xml_wrapper = False
++                    self._state = "IN_TOOL_BODY"
++                self._idx += 1
++                self._name_chars = []
++                continue
++            if self._state == "IN_TOOL_BODY":
++                m = self._NAME_KEY_RE.search(self._buf)
++                if not m:
++                    # Same boundary-safety trick: keep enough tail for a
++                    # split ``"name":"`` sequence (worst case 9 chars).
++                    keep = 16
++                    if len(self._buf) > keep:
++                        self._buf = self._buf[-keep:]
++                    break
++                self._buf = self._buf[m.end():]
++                self._state = "IN_NAME_STRING"
++                continue
++            if self._state == "IN_NAME_STRING":
++                # Scan for unescaped closing quote.
++                i = 0
++                while i < len(self._buf):
++                    ch = self._buf[i]
++                    if ch == "\\" and i + 1 < len(self._buf):
++                        self._name_chars.append(self._buf[i:i + 2])
++                        i += 2
++                        continue
++                    if ch == '"':
++                        # Name complete — emit partial delta.
++                        name = "".join(self._name_chars)
++                        # Unescape common JSON escapes for the emitted name.
++                        try:
++                            name = json.loads('"' + name + '"')
++                        except json.JSONDecodeError:
++                            pass
++                        self._buf = self._buf[i + 1:]
++                        self._state = "NAME_EMITTED"
++                        if name:
++                            emits.append({
++                                "tool_calls": [{
++                                    "index": self._idx,
++                                    "type": "function",
++                                    "function": {
++                                        "name": name,
++                                        "arguments": "",
++                                    },
++                                }]
++                            })
++                        break
++                    self._name_chars.append(ch)
++                    i += 1
++                else:
++                    # Consumed all buffer chars into name; nothing left.
++                    self._buf = ""
++                    break
++                # state transitioned; loop again
++                continue
++            if self._state == "NAME_EMITTED":
++                if self._in_xml_wrapper:
++                    pos = self._buf.find(TOOL_CALL_CLOSE)
++                    if pos == -1:
++                        keep = len(TOOL_CALL_CLOSE) - 1
++                        if len(self._buf) > keep:
++                            self._buf = self._buf[-keep:] if keep > 0 else ""
++                        break
++                    self._buf = self._buf[pos + len(TOOL_CALL_CLOSE):]
++                    self._state = "TEXT"
++                    continue
++                # Bare-JSON: no explicit close. Drop buffer and return to
++                # TEXT — we don't try to detect multiple bare-JSON tool
++                # calls (the AWQ fallback only ever emits one).
++                self._buf = ""
++                self._state = "TEXT"
++                continue
++            break  # pragma: no cover - unreachable
++        return emits
++
++
+ def _create_app(llm_instance):
+     """Create a FastAPI app backed by the given LLM instance."""
+     try:
+-        from fastapi import FastAPI
++        from fastapi import FastAPI, Request
+         from fastapi.responses import JSONResponse, StreamingResponse
+     except ImportError as exc:
+         raise RuntimeError("FastAPI is required for the server. "
+@@ -92,20 +449,177 @@ def _create_app(llm_instance):
+             }],
+         }
+ 
++    @app.get("/metrics")
++    def metrics():
++        return {
++            "profiling_enabled": llm_instance.get_profiling_enabled(),
++            "prefill": llm_instance.get_prefill_metrics(),
++        }
++
++    @app.post("/v1/cache/system_prompt")
++    def cache_system_prompt(body: Dict[str, Any]):
++        # Optional ``tools`` (OpenAI schema). When provided alongside a
++        # ``system_prompt`` (or messages), render them into the cached prefix
++        # so that subsequent /v1/chat/completions requests carrying the same
++        # tools list hit the radix-tree prefix cache instead of re-prefilling
++        # the ~400 tokens of tool schema every turn.
++        tools = body.get("tools") or None
++        has_tools = bool(tools)
++        messages_branch = False
++        if body.get("formatted_system_prompt") or body.get("formatted_prefix"):
++            # Caller pre-formatted everything; trust it as-is. Tools must be
++            # baked in by caller in this mode.
++            prompt = body.get("formatted_system_prompt") or body["formatted_prefix"]
++        elif body.get("prompt"):
++            prompt = body["prompt"]
++        elif isinstance(body.get("messages"), list) and len(body["messages"]) >= 2:
++            # Prefix-consistent warmup: render the same prefix that
++            # /v1/chat/completions would emit via
++            # ``_build_prefix_formatted_request`` (messages[:-1] slice +
++            # ``make_prefix_formatted_request``). This guarantees the cached
++            # KV prefix is *byte-identical* to the first real chat turn so
++            # Run 1 hits the radix-tree prefix cache.
++            try:
++                msgs = body["messages"]
++                if has_tools:
++                    msgs = _inject_tools_and_normalize(msgs, tools)
++                else:
++                    msgs = [_flatten_message_for_runtime(m) for m in msgs]
++                enable_thinking = bool(body.get("enable_thinking", False))
++                formatted = _build_prefix_formatted_request(
++                    llm_instance,
++                    body,
++                    msgs,
++                    enable_thinking,
++                )
++                prompt = formatted["formatted_system_prompt"]
++                messages_branch = True
++            except Exception as exc:
++                logger.exception("messages-branch prefix render failed")
++                return JSONResponse(status_code=500,
++                                    content={"error": str(exc)})
++        elif body.get("system_prompt") is not None or has_tools:
++            try:
++                if has_tools:
++                    # Build a synthetic [system] messages list with tools
++                    # injected, then format the full message (system role
++                    # prefix/suffix included) so the cached KV covers
++                    # system + tools spec as one contiguous prefix.
++                    sys_text = body.get("system_prompt", "") or ""
++                    base_messages = [{"role": "system", "content": sys_text}]
++                    injected = _inject_tools_and_normalize(base_messages, tools)
++                    prompt = llm_instance.format_messages(
++                        injected,
++                        add_generation_prompt=False,
++                        enable_thinking=False,
++                    )
++                else:
++                    prompt = llm_instance.format_system_prompt(
++                        body.get("system_prompt", ""))
++            except Exception as exc:
++                logger.exception("System prompt formatting failed")
++                return JSONResponse(status_code=500,
++                                    content={"error": str(exc)})
++        elif body.get("messages"):
++            try:
++                messages = body["messages"]
++                if has_tools:
++                    injected = _inject_tools_and_normalize(messages, tools)
++                    # Only cache the leading system block (post-injection)
++                    # so the prefix matches what chat_completions emits.
++                    prompt = llm_instance.format_messages(
++                        [injected[0]] if injected and injected[0].get("role") == "system" else injected,
++                        add_generation_prompt=False,
++                        enable_thinking=False,
++                    )
++                else:
++                    prompt = llm_instance.format_system_prompt_from_messages(
++                        messages)
++            except Exception as exc:
++                logger.exception("System prompt formatting failed")
++                return JSONResponse(status_code=500,
++                                    content={"error": str(exc)})
++        else:
++            prompt = ""
++        if not prompt:
++            return JSONResponse(
++                status_code=400,
++                content={
++                    "error":
++                    "formatted_system_prompt, formatted_prefix, prompt, system_prompt, "
++                    "tools, or messages with a leading system message is required"
++                },
++            )
++        lora_weights_name = body.get("lora_weights_name",
++                                     body.get("lora_name", ""))
++        try:
++            cached = llm_instance.save_system_prompt_kv_cache(
++                prompt,
++                lora_weights_name,
++            )
++        except Exception as exc:
++            logger.exception("System prompt cache warmup failed")
++            return JSONResponse(status_code=500, content={"error": str(exc)})
++        return {
++            "object": "cache.system_prompt",
++            "cached": cached,
++            "lora_weights_name": lora_weights_name,
++            "has_tools": has_tools,
++            "tools_count": len(tools) if has_tools else 0,
++            "prompt_chars": len(prompt),
++            "messages_branch": messages_branch,
++        }
++
++    # NOTE: ``/v1/warmup`` was removed (commit P9+P10 follow-up). The
++    # endpoint was superseded by ``EdgeLLMBackend.warmup()`` in the
++    # voice-arm client, which warms via ``/v1/cache/system_prompt`` plus
++    # a 1-token ``/v1/chat/completions`` stream — exactly the path the
++    # first real turn takes, so the warm is shape-accurate. Reintroducing
++    # ``/v1/warmup`` is only justified if a future client cannot drive
++    # ``/v1/chat/completions`` itself (so far none).
++
+     @app.post("/v1/chat/completions")
+-    def chat_completions(body: Dict[str, Any]):
++    def chat_completions(body: Dict[str, Any], request: Request):
+         messages = body.get("messages", [])
+         if not messages:
+             return JSONResponse(status_code=400,
+                                 content={"error": "messages required"})
+ 
++        # OpenAI ``tools`` / ``tool_choice`` support. The compiled C++ runtime
++        # cannot render the OpenAI tools schema directly (its template is a
++        # static prefix/suffix-per-role JSON, no Jinja). We inject a
++        # Qwen3-format "# Tools" system block here and parse <tool_call>...
++        # </tool_call> back out of the response below.
++        tools = body.get("tools") or None
++        if tools:
++            try:
++                messages = _inject_tools_and_normalize(messages, tools)
++            except Exception as exc:
++                logger.exception("Tool prompt rendering failed")
++                return JSONResponse(
++                    status_code=400,
++                    content={"error": f"Invalid tools schema: {exc}"})
++        else:
++            # Still normalize any tool_calls / tool messages already in
++            # history so the runtime never sees an unsupported role.
++            messages = [
++                _flatten_message_for_runtime(m) for m in messages
++            ]
++
+         temperature = body.get("temperature", 0.7)
+         top_p = body.get("top_p", 0.9)
+         top_k = body.get("top_k", 50)
+         max_tokens = body.get("max_tokens", 2048)
+         stream = body.get("stream", False)
+         enable_thinking = body.get("enable_thinking", False)
++        save_system_prompt_kv_cache = body.get(
++            "save_system_prompt_kv_cache", body.get("cache_prompt", False))
++        save_prefix_cache = body.get("save_prefix_cache", False)
++        prefix_cache = body.get("prefix_cache", save_prefix_cache)
++        lora_weights_name = body.get("lora_weights_name",
++                                     body.get("lora_name", ""))
+         disable_spec_decode = body.get("disable_spec_decode", False)
++        return_cache_metrics = body.get("return_cache_metrics", False)
+ 
+         rt = llm_instance._rt
+         from .engine import _convert_messages_to_cpp, _load_image_buffers
+@@ -120,20 +634,51 @@ def _create_app(llm_instance):
+ 
+         image_buffers = _load_image_buffers(rt, messages)
+ 
+-        request = rt.LLMGenerationRequest()
++        # NOTE: do NOT shadow the FastAPI ``request`` parameter (line 158).
++        # The disconnect watcher in _generate_stream_sse needs the original
++        # Starlette Request to poll is_disconnected(); rebinding the name
++        # here would silently break the watcher.
++        trt_request = rt.LLMGenerationRequest()
+         req = rt.Request(messages=cpp_messages)
+         req.image_buffers = image_buffers
+-        request.requests = [req]
+-        request.temperature = temperature
+-        request.top_p = top_p
+-        request.top_k = top_k
+-        request.max_generate_length = max_tokens
+-        request.apply_chat_template = True
+-        request.add_generation_prompt = True
+-        request.enable_thinking = enable_thinking
+-        request.disable_spec_decode = disable_spec_decode
++        trt_request.requests = [req]
++        trt_request.temperature = temperature
++        trt_request.top_p = top_p
++        trt_request.top_k = top_k
++        trt_request.max_generate_length = max_tokens
++        trt_request.apply_chat_template = True
++        trt_request.add_generation_prompt = True
++        trt_request.enable_thinking = enable_thinking
++        trt_request.save_system_prompt_kv_cache = (
++            save_system_prompt_kv_cache or save_prefix_cache)
++        trt_request.lora_weights_name = lora_weights_name
++        trt_request.disable_spec_decode = disable_spec_decode
++
++        formatted_prefix = ""
++        formatted_complete = ""
++        if prefix_cache:
++            try:
++                formatted = _build_prefix_formatted_request(
++                    llm_instance,
++                    body,
++                    messages,
++                    enable_thinking,
++                )
++                formatted_prefix = formatted["formatted_system_prompt"]
++                formatted_complete = formatted["formatted_complete_request"]
++                formatted_request = rt.FormattedRequest()
++                formatted_request.formatted_system_prompt = formatted_prefix
++                formatted_request.formatted_complete_request = formatted_complete
++                trt_request.formatted_requests = [formatted_request]
++            except Exception as exc:
++                logger.exception("Prefix cache formatting failed")
++                return JSONResponse(status_code=400,
++                                    content={"error": str(exc)})
+ 
+         response_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
++        before_metrics = (
++            llm_instance.get_prefill_metrics()
++            if return_cache_metrics else None)
+ 
+         if stream:
+             from .engine import SamplingParams
+@@ -144,16 +689,25 @@ def _create_app(llm_instance):
+                 top_k=top_k,
+                 max_tokens=max_tokens,
+                 enable_thinking=enable_thinking,
++                save_system_prompt_kv_cache=(
++                    save_system_prompt_kv_cache or save_prefix_cache),
++                lora_weights_name=lora_weights_name,
+                 disable_spec_decode=disable_spec_decode,
++                formatted_system_prompt=formatted_prefix,
++                formatted_complete_request=formatted_complete,
+             )
+ 
+             return StreamingResponse(
+                 _generate_stream_sse(
++                    request,                # FastAPI Request for disconnect watcher
+                     llm_instance,
+                     messages,
+                     params,
+                     response_id,
+                     enable_thinking,
++                    before_metrics,
++                    return_cache_metrics,
++                    tools_enabled=bool(tools),
+                 ),
+                 media_type="text/event-stream",
+                 headers={
+@@ -163,7 +717,7 @@ def _create_app(llm_instance):
+             )
+ 
+         try:
+-            response = llm_instance._runtime.handle_request(request)
++            response = llm_instance._runtime.handle_request(trt_request)
+         except Exception as exc:
+             logger.exception("Inference failed")
+             return JSONResponse(status_code=500, content={"error": str(exc)})
+@@ -172,16 +726,35 @@ def _create_app(llm_instance):
+         output_text = raw_text.replace(IM_END_TOKEN, "")
+         output_ids = response.output_ids[0] if response.output_ids else []
+         completion_tokens = len(output_ids)
++        after_metrics = (
++            llm_instance.get_prefill_metrics()
++            if return_cache_metrics else None)
+ 
+         reasoning, answer = _split_reasoning_and_content(output_text)
+ 
+         message_body: Dict[str, Any] = {"role": "assistant"}
+         if reasoning is not None:
+             message_body["reasoning"] = reasoning
+-        message_body["content"] = (
+-            (answer if answer is not None else reasoning) or "")
++        answer_text = (answer if answer is not None else reasoning) or ""
+ 
+-        return {
++        finish_reason = "stop"
++        if tools:
++            tcs, cleaned = _extract_tool_calls(answer_text)
++            if tcs:
++                # Strip ``index`` (only meaningful in streaming deltas) for
++                # the non-stream OpenAI shape.
++                message_body["tool_calls"] = [
++                    {k: v for k, v in tc.items() if k != "index"}
++                    for tc in tcs
++                ]
++                message_body["content"] = cleaned or None
++                finish_reason = "tool_calls"
++            else:
++                message_body["content"] = answer_text
++        else:
++            message_body["content"] = answer_text
++
++        result = {
+             "id":
+             response_id,
+             "object":
+@@ -189,16 +762,54 @@ def _create_app(llm_instance):
+             "choices": [{
+                 "index": 0,
+                 "message": message_body,
+-                "finish_reason": "stop",
++                "finish_reason": finish_reason,
+             }],
+             "usage": {
+                 "completion_tokens": completion_tokens,
+             },
+         }
++        cache_metrics = _cache_metrics_delta(before_metrics, after_metrics)
++        if cache_metrics is not None:
++            result["cache_metrics"] = cache_metrics
++        return result
+ 
+     return app
+ 
+ 
++def _build_prefix_formatted_request(
++    llm_instance,
++    body: Dict[str, Any],
++    messages,
++    enable_thinking: bool,
++) -> Dict[str, str]:
++    """Build formatted prefix and complete request for prefix-cache mode."""
++    if body.get("formatted_prefix") and body.get("formatted_complete_request"):
++        return {
++            "formatted_system_prompt": body["formatted_prefix"],
++            "formatted_complete_request": body["formatted_complete_request"],
++        }
++
++    if body.get("prefix_messages") is not None:
++        prefix_messages = body["prefix_messages"]
++        suffix_messages = messages
++    else:
++        if len(messages) < 2:
++            raise ValueError(
++                "prefix_cache requires prefix_messages or at least two messages")
++        prefix_messages = messages[:-1]
++        suffix_messages = messages[-1:]
++
++    if not isinstance(prefix_messages, list) or not isinstance(
++            suffix_messages, list):
++        raise ValueError("prefix_messages and messages must be arrays")
++
++    return llm_instance.make_prefix_formatted_request(
++        prefix_messages,
++        suffix_messages,
++        enable_thinking=enable_thinking,
++    )
++
++
+ class _ThinkingStateMachine:
+     """Tracks <think>...</think> boundaries across streaming deltas."""
+ 
+@@ -256,39 +867,247 @@ class _ThinkingStateMachine:
+             self._buf = ""
+ 
+ 
+-def _generate_stream_sse(llm_instance, messages, params, response_id,
+-                         enable_thinking):
+-    """Yield real SSE chunks via StreamChannel streaming."""
++def _cache_metrics_delta(before_metrics, after_metrics):
++    if before_metrics is None or after_metrics is None:
++        return None
++    return {
++        "prefill": {
++            "reused_tokens": after_metrics["reused_tokens"]
++            - before_metrics["reused_tokens"],
++            "computed_tokens": after_metrics["computed_tokens"]
++            - before_metrics["computed_tokens"],
++        }
++    }
++
++
++async def _generate_stream_sse(request, llm_instance, messages, params,
++                               response_id, enable_thinking,
++                               before_metrics=None,
++                               return_cache_metrics: bool = False,
++                               tools_enabled: bool = False):
++    """Yield real SSE chunks via StreamChannel streaming.
++
++    Runs the synchronous ``generate_stream`` iteration in a background
++    thread and forwards chunks via a thread-safe queue. A concurrent
++    asyncio task polls ``request.is_disconnected()``; when the HTTP
++    client drops the connection mid-stream (voice-agent barge-in is the
++    canonical trigger) the watcher sets a stop flag, the drain thread
++    breaks out of the ``for`` loop on the next chunk boundary and calls
++    ``gen.close()`` from inside the same thread — which raises
++    GeneratorExit at engine.py's ``yield`` and runs the ``finally``:
++    ``channel.cancel()`` propagates the cancel into the TRT runtime, the
++    C++ worker returns within hundreds of ms, and ``worker.join()``
++    completes. Without this, the worker keeps generating tokens on the
++    single engine context after every disconnect and the *next*
++    /v1/chat/completions request crashes the engine with::
++
++        [TensorRT] Error Code 1: Myelin (Called with an already loaded
++        binary graph.)
++    """
+     yield _sse_chunk(response_id, {"role": "assistant"})
+ 
+     sm = _ThinkingStateMachine(enable_thinking)
+     finish_reason: Optional[str] = None
+ 
++    gen = llm_instance.generate_stream(messages, params)
++    # Unbounded queue: an LLM turn produces at most max_tokens chunks,
++    # each ~50 bytes — bounded in practice by the engine's max_seq_len,
++    # which is what the length-guard middleware already enforces. A
++    # bounded Queue would let drain block on put() after the consumer
++    # disconnects, and stop_flag would never be observed in time.
++    chunk_q: _queue.Queue = _queue.Queue()
++    stop_flag = threading.Event()
++    disconnected = False
++
++    def _drain():
++        try:
++            for delta in gen:
++                if stop_flag.is_set():
++                    break
++                chunk_q.put_nowait(("delta", delta))
++                if stop_flag.is_set():
++                    break
++        except Exception as exc:  # noqa: BLE001
++            try:
++                chunk_q.put_nowait(("error", exc))
++            except _queue.Full:  # pragma: no cover - unbounded queue
++                pass
++        finally:
++            # close() from the same thread as next() — safe (no
++            # "generator already executing" race) and guarantees
++            # engine.py's finally runs even on the natural exit path.
++            try:
++                gen.close()
++            except Exception:  # pragma: no cover - cleanup must not raise
++                pass
++            try:
++                chunk_q.put_nowait(("done", None))
++            except _queue.Full:  # pragma: no cover - unbounded queue
++                pass
++
++    drain_thread = threading.Thread(
++        target=_drain, daemon=True, name="sse-drain")
++    drain_thread.start()
++
++    loop = asyncio.get_running_loop()
++
++    async def _watch_disconnect():
++        nonlocal disconnected
++        # Poll every 100 ms — well below per-token latency, so the
++        # drain thread sees the stop flag within a single chunk
++        # boundary after the client drops. Cancel latency after
++        # ``stop_flag`` is set is bounded by ``StreamChannel.wait_pop``'s
++        # 200 ms timeout in engine.py:752, so total disconnect→TRT-cancel
++        # is at worst ~300 ms.
++        while not stop_flag.is_set():
++            try:
++                if await request.is_disconnected():
++                    disconnected = True
++                    stop_flag.set()
++                    logger.info(
++                        "client disconnected mid-stream; cancelling LLM "
++                        "generation (response_id=%s)", response_id)
++                    return
++            except asyncio.CancelledError:
++                # The outer task got cancelled (normal shutdown path
++                # when streaming finishes naturally) — let it propagate
++                # so the watcher stops cleanly.
++                raise
++            except (ConnectionResetError, OSError, RuntimeError):
++                # Network-layer errors during is_disconnected() probing
++                # are themselves a strong signal the peer is gone.
++                # Treat as disconnected rather than spinning.
++                disconnected = True
++                stop_flag.set()
++                logger.info(
++                    "client probe raised network error; treating as "
++                    "disconnected (response_id=%s)", response_id)
++                return
++            # Other exceptions (notably AttributeError from wrong-type
++            # ``request`` shadowing the FastAPI parameter — see the
++            # comment at chat_completions where trt_request is named to
++            # NOT collide with the FastAPI parameter) are programming
++            # errors we want surfaced, NOT swallowed.
++            await asyncio.sleep(0.1)
++
++    watcher = asyncio.create_task(_watch_disconnect())
++
++    # When tools are enabled, buffer all assistant ``content`` until the
++    # stream finishes, then emit ``tool_calls`` (or content) atomically.
++    # Mid-stream <tool_call> XML must not leak to the OpenAI SDK client —
++    # it would be interpreted as raw assistant content and the eval would
++    # never see a structured tool_call.
++    content_buf: List[str] = []
++    tool_parser = _ToolCallStreamParser() if tools_enabled else None
++
+     try:
+-        for delta in llm_instance.generate_stream(messages, params):
++        while True:
++            try:
++                kind, val = await loop.run_in_executor(None, chunk_q.get)
++            except asyncio.CancelledError:
++                stop_flag.set()
++                raise
++            if kind == "done":
++                break
++            if kind == "error":
++                logger.error("Streaming inference failed: %r", val)
++                finish_reason = "error"
++                break
++            delta = val
+             if delta.text:
+                 for field, text in sm.feed(delta.text):
+-                    yield _sse_chunk(response_id, {field: text})
++                    if tools_enabled and field == "content":
++                        content_buf.append(text)
++                        # Early-emit any tool_call name deltas as soon as
++                        # the streaming parser can identify them, so that
++                        # latency-sensitive consumers (voice preamble,
++                        # spinners) can react ~one token after the model
++                        # commits — instead of waiting for the full JSON
++                        # arguments to materialize at end-of-stream.
++                        for partial in tool_parser.feed(text):
++                            yield _sse_chunk(response_id, partial)
++                    else:
++                        yield _sse_chunk(response_id, {field: text})
+             if delta.finished:
+                 finish_reason = delta.finish_reason or "stop"
+-    except Exception:
+-        logger.exception("Streaming inference failed")
+-        finish_reason = "error"
++            if disconnected:
++                break
++    finally:
++        stop_flag.set()
++        watcher.cancel()
++        try:
++            await watcher
++        except (asyncio.CancelledError, Exception):  # noqa: BLE001
++            pass
+ 
++    if disconnected and finish_reason is None:
++        finish_reason = "cancelled"
++
++    # If the client disconnected, downstream send() will fail anyway —
++    # still yield the trailing frames so a graceful close (e.g. server
++    # shutdown) drains the SSE protocol cleanly.
+     for field, text in sm.flush():
+-        yield _sse_chunk(response_id, {field: text})
++        if tools_enabled and field == "content":
++            content_buf.append(text)
++            if tool_parser is not None:
++                for partial in tool_parser.feed(text):
++                    yield _sse_chunk(response_id, partial)
++        else:
++            yield _sse_chunk(response_id, {field: text})
++
++    if tools_enabled:
++        full_text = "".join(content_buf)
++        tcs, cleaned = _extract_tool_calls(full_text)
++        if tcs:
++            for tc in tcs:
++                # Emit each tool_call as a single delta with name + full
++                # JSON arguments — the OpenAI SDK accumulates ``arguments``
++                # across deltas, so one-shot is fine.
++                tc_delta = {
++                    "tool_calls": [{
++                        "index": tc["index"],
++                        "id": tc["id"],
++                        "type": "function",
++                        "function": {
++                            "name": tc["function"]["name"],
++                            "arguments": tc["function"]["arguments"],
++                        },
++                    }]
++                }
++                yield _sse_chunk(response_id, tc_delta)
++            if finish_reason in (None, "stop"):
++                finish_reason = "tool_calls"
++            if cleaned:
++                # Trailing/leading non-tool text (rare). Emit as content so
++                # nothing is silently dropped.
++                yield _sse_chunk(response_id, {"content": cleaned})
++        else:
++            if full_text:
++                yield _sse_chunk(response_id, {"content": full_text})
+ 
+-    yield _sse_chunk(response_id, {}, finish_reason=finish_reason or "stop")
++    after_metrics = (
++        llm_instance.get_prefill_metrics()
++        if return_cache_metrics else None)
++    cache_metrics = _cache_metrics_delta(before_metrics, after_metrics)
++    yield _sse_chunk(
++        response_id,
++        {},
++        finish_reason=finish_reason or "stop",
++        cache_metrics=cache_metrics,
++    )
+     yield "data: [DONE]\n\n"
+ 
+ 
+ def _sse_chunk(response_id: str,
+                delta: dict,
+-               finish_reason: Optional[str] = None):
++               finish_reason: Optional[str] = None,
++               cache_metrics: Optional[Dict[str, Any]] = None):
+     choice: Dict[str, Any] = {"delta": delta, "index": 0}
+     if finish_reason:
+         choice["finish_reason"] = finish_reason
+     payload = {"id": response_id, "choices": [choice]}
++    if cache_metrics is not None:
++        payload["cache_metrics"] = cache_metrics
+     return f"data: {json.dumps(payload)}\n\n"
+ 
+ 
+@@ -320,9 +1139,34 @@ def main():
+         description="TensorRT Edge-LLM OpenAI-compatible server")
+     parser.add_argument(
+         "--model",
+-        required=True,
++        default="",
+         help="HuggingFace model ID or local checkpoint path",
+     )
++    parser.add_argument(
++        "--onnx-dir",
++        default="",
++        help="Existing LLM ONNX directory; build engine then serve",
++    )
++    parser.add_argument(
++        "--visual-onnx-dir",
++        default="",
++        help="Existing visual ONNX directory for VLM serving",
++    )
++    parser.add_argument(
++        "--engine-dir",
++        default="",
++        help="Existing LLM engine directory; load directly",
++    )
++    parser.add_argument(
++        "--visual-engine-dir",
++        default="",
++        help="Existing visual engine directory for VLM serving",
++    )
++    parser.add_argument(
++        "--served-model-name",
++        default="",
++        help="Model id returned by /v1/models and chat completions",
++    )
+     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+     parser.add_argument("--port", type=int, default=8000, help="Bind port")
+     parser.add_argument(
+@@ -354,6 +1198,12 @@ def main():
+         default="",
+         help="Pre-built speculative decoding engine dir (EAGLE or MTP)",
+     )
++    parser.add_argument(
++        "--enable-profiling",
++        action="store_true",
++        default=False,
++        help="Enable runtime metrics such as prefill cache reuse counters",
++    )
+     parser.add_argument("--draft-top-k",
+                         type=int,
+                         default=10,
+@@ -366,21 +1216,40 @@ def main():
+                         type=int,
+                         default=60,
+                         help="Speculative decoding: verification tree size")
++    parser.add_argument(
++        "--weight-streaming-budget",
++        default=None,
++        help=(
++            "TensorRT weight streaming budget. Accepts: integer bytes, "
++            "'<N>g' GiB, '<N>m' MiB, 'off' (disable streaming, keep all weights "
++            "on GPU), 'min'/'-1' (minimum budget = max streaming, smallest "
++            "GPU footprint). Has no effect unless the engine was built with "
++            "kWEIGHT_STREAMING. Default: unset (full weights resident)."
++        ),
++    )
+     args = parser.parse_args()
+ 
+     from .engine import LLM
+ 
+     llm = LLM(
+         model=args.model,
++        onnx_dir=args.onnx_dir,
++        visual_onnx_dir=args.visual_onnx_dir,
++        engine_dir=args.engine_dir,
++        visual_engine_dir=args.visual_engine_dir,
+         max_input_len=args.max_input_len,
+         max_batch_size=args.max_batch_size,
+         max_kv_cache_capacity=args.max_kv_cache_capacity,
+         use_trt_native_ops=args.use_trt_native_ops,
+         eagle_engine_dir=args.spec_decode_engine_dir,
++        model_id=args.served_model_name,
+         draft_top_k=args.draft_top_k,
+         draft_step=args.draft_step,
+         verify_tree_size=args.verify_tree_size,
++        weight_streaming_budget=args.weight_streaming_budget,
+     )
++    if args.enable_profiling:
++        llm.set_profiling_enabled(True)
+     llm.serve(host=args.host, port=args.port)
+ 
+ 
+diff --git a/experimental/server/engine.py b/experimental/server/engine.py
+index 891f910..065e0e9 100644
+--- a/experimental/server/engine.py
++++ b/experimental/server/engine.py
+@@ -74,7 +74,11 @@ class SamplingParams:
+     top_k: int = 50
+     max_tokens: int = 2048
+     enable_thinking: bool = False
++    save_system_prompt_kv_cache: bool = False
++    lora_weights_name: str = ""
+     disable_spec_decode: bool = False
++    formatted_system_prompt: str = ""
++    formatted_complete_request: str = ""
+ 
+ 
+ @dataclass
+@@ -206,7 +210,10 @@ def _import_runtime():
+     search_dirs = [
+         project_root / "experimental" / "pybind" / "build",
+         project_root / "build" / "pybind",
++        project_root / "build_container" / "pybind",
+     ]
++    if os.environ.get("EDGELLM_PYBIND_DIR"):
++        search_dirs.insert(0, Path(os.environ["EDGELLM_PYBIND_DIR"]))
+     search_dirs.extend(project_root.glob("build/lib.*"))
+     for cand_dir in search_dirs:
+         if not cand_dir.is_dir():
+@@ -278,9 +285,11 @@ class LLM:
+         max_kv_cache_capacity: int = 8192,
+         use_trt_native_ops: bool = False,
+         eagle_engine_dir: str = "",
++        model_id: str = "",
+         draft_top_k: int = 10,
+         draft_step: int = 6,
+         verify_tree_size: int = 60,
++        weight_streaming_budget: Optional[str] = None,
+     ):
+         sources = sum(bool(s) for s in (model, onnx_dir, engine_dir))
+         if sources != 1:
+@@ -288,12 +297,34 @@ class LLM:
+                 "Exactly one of 'model', 'onnx_dir', or 'engine_dir' "
+                 "must be provided.")
+ 
+-        self._model_id = (model or os.path.basename(onnx_dir)
++        self._model_id = (model_id or model or os.path.basename(onnx_dir)
+                           or os.path.basename(engine_dir))
+         self._eagle_engine_dir = eagle_engine_dir
+         self._draft_top_k = draft_top_k
+         self._draft_step = draft_step
+         self._verify_tree_size = verify_tree_size
++        # TRT weight streaming budget. Forwarded to the C++ runtime via the
++        # EDGELLM_WEIGHT_STREAMING_BUDGET env var, which is consumed inside
++        # LLMEngineRunner / EagleDraftEngineRunner constructors. Setting it
++        # in __init__ (before _load_runtime) guarantees the runtime sees it
++        # at the deserializeCudaEngine -> createExecutionContext seam.
++        # Accepted values: "<N>" bytes, "<N>g" GiB, "<N>m" MiB, "off", "min" / "-1".
++        # Has no effect if the engine was not built with kWEIGHT_STREAMING.
++        self._weight_streaming_budget = weight_streaming_budget
++        if weight_streaming_budget is not None and weight_streaming_budget != "":
++            os.environ["EDGELLM_WEIGHT_STREAMING_BUDGET"] = str(
++                weight_streaming_budget)
++            logger.info(
++                "Weight streaming budget requested: %s "
++                "(applied via EDGELLM_WEIGHT_STREAMING_BUDGET env var; "
++                "engine must be built with kWEIGHT_STREAMING for this to take effect).",
++                weight_streaming_budget,
++            )
++        self._chat_template: Optional[Dict[str, Any]] = None
++        # The C++ runtime owns one TRT execution context and mutable prompt
++        # KV-cache maps. Serialize every runtime entry point, including cache
++        # warmup, so /v1/cache/system_prompt cannot race chat completions.
++        self._runtime_lock = threading.Lock()
+ 
+         if engine_dir:
+             self._init_from_engine(engine_dir, visual_engine_dir)
+@@ -325,11 +356,15 @@ class LLM:
+                           visual_engine_dir: str) -> None:
+         """Load from pre-built engine directories (no export, no build)."""
+         from .engine_layout import (find_visual_engine_dir,
++                                    validate_eagle_engine_dir,
+                                     validate_llm_engine_dir,
+                                     validate_visual_engine_dir)
+ 
+         if not validate_llm_engine_dir(engine_dir):
+-            raise ValueError(f"llm.engine not found in: {engine_dir}")
++            if not validate_eagle_engine_dir(engine_dir):
++                raise ValueError(
++                    f"Neither llm.engine nor eagle_base.engine found in: {engine_dir}"
++                )
+         self._engine_dir = engine_dir
+         self._model_dir = engine_dir
+         self._is_vlm = False
+@@ -451,6 +486,14 @@ class LLM:
+                         self._visual_engine_dir)
+         eagle = self._eagle_engine_dir
+         if eagle:
++            if self._verify_tree_size < self._draft_step + 1:
++                raise ValueError(
++                    f"verify_tree_size ({self._verify_tree_size}) must be >= "
++                    f"draft_step + 1 ({self._draft_step + 1}). Kernel guard at "
++                    f"cpp/kernels/speculative/eagleAcceptKernels.cu:381 requires "
++                    f"maxDepth <= numTokens, where maxDepth = draft_step + 1 "
++                    f"and numTokens = verify_tree_size."
++                )
+             logger.info(
+                 "Eagle spec-decode enabled (top_k=%d, step=%d, tree=%d)",
+                 self._draft_top_k,
+@@ -650,9 +693,14 @@ class LLM:
+             request.apply_chat_template = True
+             request.add_generation_prompt = True
+             request.enable_thinking = params.enable_thinking
++            self._attach_formatted_request(request, params)
++            request.save_system_prompt_kv_cache = (
++                params.save_system_prompt_kv_cache)
++            request.lora_weights_name = params.lora_weights_name
+             request.disable_spec_decode = params.disable_spec_decode
+ 
+-            response = self._runtime.handle_request(request)
++            with self._runtime_lock:
++                response = self._runtime.handle_request(request)
+             text = response.output_texts[0] if response.output_texts else ""
+             ids = response.output_ids[0] if response.output_ids else []
+             reason = ("length" if len(ids) >= params.max_tokens else "stop")
+@@ -709,6 +757,10 @@ class LLM:
+         request.apply_chat_template = True
+         request.add_generation_prompt = True
+         request.enable_thinking = params.enable_thinking
++        self._attach_formatted_request(request, params)
++        request.save_system_prompt_kv_cache = (
++            params.save_system_prompt_kv_cache)
++        request.lora_weights_name = params.lora_weights_name
+         request.disable_spec_decode = params.disable_spec_decode
+ 
+         _FINISH_REASON_MAP = {
+@@ -722,7 +774,8 @@ class LLM:
+ 
+         def _run():
+             try:
+-                self._runtime.handle_request(request)
++                with self._runtime_lock:
++                    self._runtime.handle_request(request)
+             except Exception as exc:
+                 error_holder[0] = exc
+                 channel.cancel()
+@@ -747,7 +800,23 @@ class LLM:
+                 if chunk.finished:
+                     break
+         finally:
+-            worker.join(timeout=5.0)
++            # If the consumer closes us early (HTTP client disconnect,
++            # voice-agent barge-in) the generator's GeneratorExit lands
++            # here. Without an explicit channel.cancel() the C++ worker
++            # keeps tokenising on the TRT runtime — which (a) wastes GPU
++            # cycles and (b) holds the engine context, so the very next
++            # /v1/chat/completions request races the still-running
++            # worker and crashes with "Myelin: already loaded binary
++            # graph". Cancelling the channel signals the runtime to
++            # return ASAP; worker.join then completes quickly. The
++            # 30 s ceiling is just a safety net — under normal cancel
++            # propagation handle_request returns within hundreds of ms.
++            try:
++                if not channel.is_finished():
++                    channel.cancel()
++            except Exception:  # pragma: no cover - cancel must never raise
++                pass
++            worker.join(timeout=30.0)
+ 
+         if error_holder[0] is not None:
+             raise error_holder[0]
+@@ -767,6 +836,139 @@ class LLM:
+ 
+         run_server(self, host=host, port=port)
+ 
++    def save_system_prompt_kv_cache(
++        self,
++        formatted_system_prompt: str,
++        lora_weights_name: str = "",
++    ) -> bool:
++        """Pre-generate and cache KV states for a formatted system prompt."""
++        with self._runtime_lock:
++            return bool(
++                self._runtime.save_system_prompt_kv_cache(
++                    formatted_system_prompt,
++                    lora_weights_name,
++                ))
++
++    def format_system_prompt(self, system_prompt: str) -> str:
++        """Format a raw system prompt using processed_chat_template.json."""
++        template = self._load_chat_template()
++        system_role = template.get("roles", {}).get("system", {})
++        prefix = system_role.get("prefix", "")
++        suffix = system_role.get("suffix", "")
++        return f"{prefix}{system_prompt}{suffix}"
++
++    def format_messages(
++        self,
++        messages: List[Dict[str, Any]],
++        *,
++        add_generation_prompt: bool = False,
++        enable_thinking: bool = False,
++    ) -> str:
++        """Format OpenAI-style text messages using processed_chat_template.json."""
++        template = self._load_chat_template()
++        roles = template.get("roles", {})
++        chunks = []
++        for message in messages:
++            role = message.get("role", "")
++            role_template = roles.get(role)
++            if role_template is None:
++                raise ValueError(f"Unknown role in chat template: {role}")
++            chunks.append(role_template.get("prefix", ""))
++            chunks.append(_message_content_to_text(message))
++            chunks.append(role_template.get("suffix", ""))
++        if add_generation_prompt:
++            if enable_thinking and template.get("generation_prompt_thinking"):
++                chunks.append(template["generation_prompt_thinking"])
++            else:
++                chunks.append(template.get("generation_prompt", ""))
++        return "".join(chunks)
++
++    def format_system_prompt_from_messages(
++        self,
++        messages: List[Dict[str, Any]],
++    ) -> str:
++        """Extract the leading system message and format it for KV cache."""
++        if not messages or messages[0].get("role") != "system":
++            return ""
++        content = messages[0].get("content", "")
++        if isinstance(content, str):
++            system_prompt = content
++        elif isinstance(content, list):
++            parts = []
++            for item in content:
++                if isinstance(item, str):
++                    parts.append(item)
++                elif isinstance(item, dict) and item.get("type") == "text":
++                    parts.append(item.get("text", ""))
++            system_prompt = "".join(parts)
++        else:
++            system_prompt = ""
++        return self.format_system_prompt(system_prompt)
++
++    def make_prefix_formatted_request(
++        self,
++        prefix_messages: List[Dict[str, Any]],
++        suffix_messages: List[Dict[str, Any]],
++        *,
++        enable_thinking: bool = False,
++    ) -> Dict[str, str]:
++        """Build a formatted prefix-cache request from message segments."""
++        formatted_prefix = self.format_messages(
++            prefix_messages,
++            add_generation_prompt=False,
++            enable_thinking=enable_thinking,
++        )
++        formatted_suffix = self.format_messages(
++            suffix_messages,
++            add_generation_prompt=True,
++            enable_thinking=enable_thinking,
++        )
++        return {
++            "formatted_system_prompt": formatted_prefix,
++            "formatted_complete_request": formatted_prefix + formatted_suffix,
++        }
++
++    def _load_chat_template(self) -> Dict[str, Any]:
++        """Load processed_chat_template.json from the active engine/model dir."""
++        if self._chat_template is not None:
++            return self._chat_template
++        template_path = Path(self._model_dir) / "processed_chat_template.json"
++        if not template_path.is_file():
++            raise FileNotFoundError(
++                f"processed_chat_template.json not found in {self._model_dir}")
++        with template_path.open() as f:
++            self._chat_template = json.load(f)
++        return self._chat_template
++
++    def set_profiling_enabled(self, enabled: bool) -> None:
++        """Enable or disable runtime profiling counters."""
++        self._rt.set_profiling_enabled(enabled)
++
++    def get_profiling_enabled(self) -> bool:
++        """Return whether runtime profiling counters are enabled."""
++        return bool(self._rt.get_profiling_enabled())
++
++    def get_prefill_metrics(self) -> Dict[str, int]:
++        """Return accumulated prefill cache metrics."""
++        metrics = self._runtime.get_prefill_metrics()
++        return {
++            "reused_tokens": int(metrics.reused_tokens),
++            "computed_tokens": int(metrics.computed_tokens),
++        }
++
++    def _attach_formatted_request(
++        self,
++        request: Any,
++        params: SamplingParams,
++    ) -> None:
++        """Attach preformatted request text when prefix-cache mode is used."""
++        if not params.formatted_complete_request:
++            return
++        formatted = self._rt.FormattedRequest()
++        formatted.formatted_system_prompt = params.formatted_system_prompt
++        formatted.formatted_complete_request = params.formatted_complete_request
++        request.formatted_requests = [formatted]
++
+     # ------------------------------------------------------------------
+     # Properties
+     # ------------------------------------------------------------------
+@@ -828,6 +1030,25 @@ def _convert_messages_to_cpp(rt_module, messages: List[Dict[str, Any]]):
+     return cpp_messages
+ 
+ 
++def _message_content_to_text(message: Dict[str, Any]) -> str:
++    """Return the text-only content used by prefix-cache formatting."""
++    content = message.get("content", "")
++    if isinstance(content, str):
++        return content
++    if isinstance(content, list):
++        parts = []
++        for item in content:
++            if isinstance(item, str):
++                parts.append(item)
++            elif isinstance(item, dict) and item.get("type", "text") == "text":
++                parts.append(item.get("text", ""))
++            else:
++                raise ValueError(
++                    "Prefix cache formatting currently supports text content only")
++        return "".join(parts)
++    raise ValueError("Prefix cache formatting currently supports text content only")
++
++
+ def _load_image_buffers(rt_module, messages: List[Dict[str, Any]]):
+     """Load image files referenced in messages into ImageData buffers."""
+     images = []

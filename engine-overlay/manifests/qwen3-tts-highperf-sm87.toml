@@ -1,0 +1,35 @@
+# voxedge-engine build manifest — qwen3-tts-highperf-sm87
+# PLACEHOLDER: fill on Jetson build host (build-verify DEFERRED).
+[upstream]
+pin    = "364769036fc83351d9d0aac4cc064a8e56a83178"  # TensorRT-Edge-LLM v0.7.1
+remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
+
+[patches]
+# applied in order by build.sh
+order = [
+  "0001-orin-tegra-build-compat.patch",
+  "0002-weight-streaming-budget.patch",
+  "0003-asr-streaming-session.patch",
+  "0004-tts-slotpool-concurrency.patch",
+  "0005-customvoice-language-conditioning.patch",
+  "0006-server-sse-disconnect-and-openai-api.patch",
+  "0007-server-openai-api-docs.patch",
+  "0008-build-misc-example-registration.patch",
+]
+
+[target]
+device  = "jetson-orin"   # sm_87
+cuda    = ""              # TODO fill on build host
+tensorrt= ""              # TODO
+
+[addon]
+digest  = ""              # TODO: sha256 of addon/ tree
+
+[export]
+# TODO: export/quant params (ONNX ref, W8A16/AWQ flags, etc.)
+
+[artifacts]
+# TODO: produced binary/.so/.engine names + md5
+
+[hf]
+repo = ""                 # TODO: HF repo/rev/SHA

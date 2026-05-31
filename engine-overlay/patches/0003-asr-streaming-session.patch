@@ -1,0 +1,1652 @@
+diff --git a/cpp/multimodal/audioRunner.cpp b/cpp/multimodal/audioRunner.cpp
+index f6f5fe9..93398a9 100644
+--- a/cpp/multimodal/audioRunner.cpp
++++ b/cpp/multimodal/audioRunner.cpp
+@@ -331,153 +331,176 @@ bool Qwen3OmniAudioRunner::loadMelSpectrogramFromFile(
+     return true;
+ }
+ 
+-bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
+-    std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
++// Shared per-audio encoder forward pass. Used by:
++//   - preprocessAudio (one-shot path, looped over audioBuffers)
++//   - encodeMelChunk  (streaming path, single chunk)
++// No text/MRope side effects; only fills `mAudioEmbedding` and the encoder's
++// scratch tensors. Bit-exact preserved vs the original inline body.
++bool Qwen3OmniAudioRunner::encodeOneAudioImpl(
++    rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream)
+ {
+-    if (audioBuffers.empty())
++    if (!mAudioEngine || !mAudioContext)
+     {
+-        return true;
++        LOG_ERROR("Audio encoder not loaded");
++        return false;
+     }
+ 
+-    if (!mAudioEngine || !mAudioContext)
++    rt::Tensor melSpec;
++
++    // Load pre-computed mel-spectrogram
++    // Audio preprocessing (Mel-spectrogram computation) must be done externally
++    // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
++    if (audio.melSpectrogramPath.empty())
+     {
+-        LOG_ERROR("Audio encoder not loaded");
++        LOG_ERROR(
++            "Pre-computed mel-spectrogram path is required. "
++            "Audio preprocessing must be done externally using Python or other pipelines.");
+         return false;
+     }
+ 
+-    // Process each audio clip
+-    for (auto const& audio : audioBuffers)
++    if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+     {
+-        rt::Tensor melSpec;
++        LOG_ERROR("Failed to load mel-spectrogram from file");
++        return false;
++    }
+ 
+-        // Load pre-computed mel-spectrogram
+-        // Audio preprocessing (Mel-spectrogram computation) must be done externally
+-        // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
+-        if (audio.melSpectrogramPath.empty())
+-        {
+-            LOG_ERROR(
+-                "Pre-computed mel-spectrogram path is required. "
+-                "Audio preprocessing must be done externally using Python or other pipelines.");
+-            return false;
+-        }
++    int64_t const timeSteps = melSpec.getShape()[2];
++    LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
+ 
+-        if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+-        {
+-            LOG_ERROR("Failed to load mel-spectrogram from file");
+-            return false;
+-        }
++    // Preprocess for audio encoder
++    std::vector<int64_t> afterCNNLens;
++    if (!audioUtils::preprocessAudioForEncoder(
++            melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
++    {
++        LOG_ERROR("Failed to preprocess audio for encoder");
++        return false;
++    }
+ 
+-        int64_t const timeSteps = melSpec.getShape()[2];
+-        LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
++    // Convert mask to indices
++    if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
++    {
++        LOG_ERROR("Failed to convert mask to indices");
++        return false;
++    }
+ 
+-        // Preprocess for audio encoder
+-        std::vector<int64_t> afterCNNLens;
+-        if (!audioUtils::preprocessAudioForEncoder(
+-                melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
+-        {
+-            LOG_ERROR("Failed to preprocess audio for encoder");
+-            return false;
+-        }
++    LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
++        mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
+ 
+-        // Convert mask to indices
+-        if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
+-        {
+-            LOG_ERROR("Failed to convert mask to indices");
+-            return false;
+-        }
++    // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
++    if (!audioUtils::createChunkwiseAttentionMask(
++            afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
++    {
++        LOG_ERROR("Failed to create attention mask");
++        return false;
++    }
+ 
+-        LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
+-            mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
++    LOG_DEBUG(
++        "Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
+ 
+-        // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
+-        if (!audioUtils::createChunkwiseAttentionMask(
+-                afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
+-        {
+-            LOG_ERROR("Failed to create attention mask");
+-            return false;
+-        }
++    // Calculate total audio tokens
++    int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
+ 
+-        LOG_DEBUG(
+-            "Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
++    // Reshape output buffer
++    if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
++    {
++        LOG_ERROR("Failed to reshape audio output");
++        return false;
++    }
+ 
+-        // Calculate total audio tokens
+-        int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
++    LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
+ 
+-        // Reshape output buffer
+-        if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
+-        {
+-            LOG_ERROR("Failed to reshape audio output");
+-            return false;
+-        }
++    // Set input shapes
++    if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set padded features input shape");
++        return false;
++    }
+ 
+-        LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
++    if (!mAudioContext->setInputShape(
++            binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set padded mask indices input shape");
++        return false;
++    }
+ 
+-        // Set input shapes
+-        if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set padded features input shape");
+-            return false;
+-        }
++    if (!mAudioContext->setInputShape(
++            binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set attention mask input shape");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setInputShape(
+-                binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set padded mask indices input shape");
+-            return false;
+-        }
++    // Set tensor addresses
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
++    {
++        LOG_ERROR("Failed to set padded features input address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setInputShape(
+-                binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set attention mask input shape");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
++    {
++        LOG_ERROR("Failed to set padded mask indices input address");
++        return false;
++    }
+ 
+-        // Set tensor addresses
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set padded features input address");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
++    {
++        LOG_ERROR("Failed to set attention mask input address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set padded mask indices input address");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
++    {
++        LOG_ERROR("Failed to set audio output address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set attention mask input address");
+-            return false;
+-        }
++    // Execute audio encoder
++    LOG_DEBUG(
++        "Executing audio encoder with shapes: "
++        "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
++        mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
++        mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
++        mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
++
++    {
++        TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
++        if (!mAudioContext->enqueueV3(stream))
+         {
+-            LOG_ERROR("Failed to set audio output address");
++            LOG_ERROR("Audio encoder inference failed");
+             return false;
+         }
++    }
+ 
+-        // Execute audio encoder
+-        LOG_DEBUG(
+-            "Executing audio encoder with shapes: "
+-            "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
+-            mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
+-            mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
+-            mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
++    LOG_DEBUG("Audio encoder inference completed");
+ 
+-        {
+-            TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
++    outTokens = totalAudioTokens;
++    return true;
++}
+ 
+-            if (!mAudioContext->enqueueV3(stream))
+-            {
+-                LOG_ERROR("Audio encoder inference failed");
+-                return false;
+-            }
+-        }
++bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
++    std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
++{
++    if (audioBuffers.empty())
++    {
++        return true;
++    }
+ 
+-        LOG_DEBUG("Audio encoder inference completed");
++    if (!mAudioEngine || !mAudioContext)
++    {
++        LOG_ERROR("Audio encoder not loaded");
++        return false;
++    }
+ 
++    // Process each audio clip via the shared per-audio encoder forward pass.
++    for (auto const& audio : audioBuffers)
++    {
++        int64_t totalAudioTokens = 0;
++        if (!encodeOneAudioImpl(audio, totalAudioTokens, stream))
++        {
++            return false;
++        }
+         audioTokenLengths.push_back(totalAudioTokens);
+         mMultimodalMetrics.recordRun(0, 0, 1, totalAudioTokens);
+     }
+@@ -486,6 +509,39 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
+     return true;
+ }
+ 
++// Streaming entry point: encode a single mel chunk via the shared per-audio
++// forward pass, then copy the result into the caller-allocated `outEmbedding`.
++// Does NOT touch text or MRope state — those are handled by the runtime layer
++// (see beginAsrSession / appendPrefillEmbeds).
++bool Qwen3OmniAudioRunner::encodeMelChunk(
++    rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream)
++{
++    int64_t totalAudioTokens = 0;
++    if (!encodeOneAudioImpl(mel, totalAudioTokens, stream))
++    {
++        return false;
++    }
++
++    if (outEmbedding.getDataType() != nvinfer1::DataType::kHALF)
++    {
++        LOG_ERROR("encodeMelChunk: outEmbedding must be FP16 (kHALF)");
++        return false;
++    }
++
++    if (!outEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
++    {
++        LOG_ERROR("encodeMelChunk: failed to reshape outEmbedding to [%ld, %d] (allocation too small?)",
++            totalAudioTokens, mConfig.audioFeatureDim);
++        return false;
++    }
++
++    size_t const bytes = static_cast<size_t>(totalAudioTokens) * mConfig.audioFeatureDim * sizeof(half);
++    CUDA_CHECK(cudaMemcpyAsync(
++        outEmbedding.rawPointer(), mAudioEmbedding.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    return true;
++}
++
+ bool Qwen3OmniAudioRunner::infer([[maybe_unused]] cudaStream_t stream)
+ {
+     LOG_DEBUG("No-op (inference already done in preprocessAudio)");
+@@ -511,6 +567,51 @@ bool Qwen3OmniAudioRunner::preprocessSystemPrompt(std::string const& systemPromp
+     return initializeSequentialMRopeCache(1, ropeRotaryCosSinDevice, stream);
+ }
+ 
++// Session-scoped MRope init for streaming ASR. `maxAudioTokens` bounds the
++// worst-case session length and is validated against `ropeRotaryCosSinDevice`'s
++// maxPositionEmbeddings so a session that would outgrow the cache fails fast at
++// begin-time instead of silently corrupting MRope mid-session. `activeBatchSize`
++// is the number of concurrent lanes sharing this session (single-context
++// batched ASR); it defaults to 1, preserving the original single-session
++// behavior, and is forwarded verbatim to initializeSequentialMRopeCache, which
++// already builds the [activeBatchSize, 3, maxPositionEmbeddings] position-id
++// layout and launches the kernel with that batch count.
++bool Qwen3OmniAudioRunner::initializeMRopeForSession(
++    int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream, int32_t activeBatchSize)
++{
++    if (mConfig.mropeTheta <= 0.0F)
++    {
++        // Not an MRope model — nothing to do.
++        return true;
++    }
++
++    auto const ropeShape = ropeRotaryCosSinDevice.getShape();
++    if (ropeShape.getNumDims() < 3)
++    {
++        LOG_ERROR("initializeMRopeForSession: ropeRotaryCosSinDevice has unexpected rank %d",
++            ropeShape.getNumDims());
++        return false;
++    }
++    int64_t const maxPositionEmbeddings = ropeShape[1];
++
++    if (maxAudioTokens > maxPositionEmbeddings)
++    {
++        LOG_ERROR(
++            "initializeMRopeForSession: maxAudioTokens=%d exceeds MRope cache capacity "
++            "(maxPositionEmbeddings=%ld); rebuild thinker engine with larger capacity.",
++            maxAudioTokens, maxPositionEmbeddings);
++        return false;
++    }
++
++    // Layout (positions, dimensions) is identical to the one-shot path used by
++    // preprocess(), so a session-init call here is interchangeable with the
++    // per-call init that the one-shot path performs. For batched ASR, N lanes
++    // share one context: pass activeBatchSize through so the cache spans all
++    // lanes (initializeSequentialMRopeCache loops b<activeBatchSize and the
++    // kernel consumes activeBatchSize, audioRunner.cpp:628-656).
++    return initializeSequentialMRopeCache(activeBatchSize, ropeRotaryCosSinDevice, stream);
++}
++
+ bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
+     int64_t activeBatchSize, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream)
+ {
+diff --git a/cpp/multimodal/audioRunner.h b/cpp/multimodal/audioRunner.h
+index 6b0bdb1..44a6fad 100644
+--- a/cpp/multimodal/audioRunner.h
++++ b/cpp/multimodal/audioRunner.h
+@@ -102,6 +102,40 @@ public:
+     bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
+         rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream) override;
+ 
++    //! \brief Encode a single mel-spectrogram chunk to audio embeddings (streaming entry point).
++    //! \details Thin public wrapper over the per-audio encoder forward path. Does NOT touch
++    //!          text tokens or MRope state — callers (streaming worker / runtime) drive those
++    //!          separately. The one-shot `preprocess` path is preserved bit-exact and unchanged.
++    //! \param[in]  mel          AudioData describing the mel chunk (must carry
++    //!                          `melSpectrogramPath`/`melSpectrogramFormat`; PCM is M4 scope).
++    //! \param[out] outEmbedding Caller-allocated GPU half-precision tensor. Reshaped on
++    //!                          success to [audio_tokens_this_chunk, audioFeatureDim] and
++    //!                          populated. Caller must size the underlying allocation big
++    //!                          enough — the function only reshapes within it.
++    //! \param[in]  stream       CUDA stream for execution.
++    //! \return True on success, false otherwise.
++    bool encodeMelChunk(
++        rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream);
++
++    //! \brief Initialize MRope cos/sin cache once per streaming ASR session.
++    //! \details Session-scoped variant of `initializeSequentialMRopeCache`. Sized once at
++    //!          session start so per-chunk `encodeMelChunk` calls do not need to touch the
++    //!          MRope cache. Streaming batch is always 1 (single sequence per ASR session).
++    //!          Position-id layout matches the one-shot path (T=H=W sequential).
++    //! \param[in]      maxAudioTokens          Upper bound on cumulative audio tokens for this
++    //!                                         session (informational/bound; the underlying
++    //!                                         cache spans the full `maxPositionEmbeddings`
++    //!                                         of the rope tensor, same as the one-shot path).
++    //! \param[in,out]  ropeRotaryCosSinDevice  RoPE cache tensor (e.g.
++    //!                                         `LLMEngineRunner::getRopeCosSinCacheTensor()`).
++    //! \param[in]      stream                  CUDA stream.
++    //! \param[in]      activeBatchSize         Number of concurrent lanes sharing the session
++    //!                                         (single-context batched ASR). Default 1 keeps the
++    //!                                         existing single-session callers unchanged.
++    //! \return True on success, false otherwise.
++    bool initializeMRopeForSession(int32_t maxAudioTokens, rt::Tensor& ropeRotaryCosSinDevice, cudaStream_t stream,
++        int32_t activeBatchSize = 1) override;
++
+ private:
+     //! \brief Preprocess audio buffers and run encoder inference
+     //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
+@@ -111,6 +145,18 @@ private:
+     bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
+         std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+ 
++    //! \brief Encode a single mel chunk to `mAudioEmbedding` via the encoder TRT context.
++    //! \details Shared body for both `preprocessAudio` (one-shot, looped per buffer) and
++    //!          `encodeMelChunk` (streaming, single buffer). Does only the forward pass —
++    //!          no text/MRope side effects. On success, `mAudioEmbedding` is reshaped to
++    //!          [totalAudioTokens, audioFeatureDim] and `outTokens` carries that count.
++    //! \param[in]  audio      Single audio data (mel-spectrogram path).
++    //! \param[out] outTokens  Number of audio tokens produced for this chunk.
++    //! \param[in]  stream     CUDA stream.
++    //! \return True on success, false otherwise.
++    bool encodeOneAudioImpl(
++        rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream);
++
+     //! \brief Tokenize text and insert audio tokens
+     //! \param[in] request LLM generation request
+     //! \param[out] batchInputIds Batched input IDs after tokenization and audio token insertion
+diff --git a/cpp/multimodal/multimodalRunner.h b/cpp/multimodal/multimodalRunner.h
+index bc4fb5e..e4b9c36 100644
+--- a/cpp/multimodal/multimodalRunner.h
++++ b/cpp/multimodal/multimodalRunner.h
+@@ -123,6 +123,26 @@ public:
+         [[maybe_unused]] tokenizer::Tokenizer const* tokenizer, [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice,
+         [[maybe_unused]] cudaStream_t stream);
+ 
++    /*!
++     * @brief Initialize MRope cos/sin cache for a streaming ASR session.
++     * @details Default implementation is a no-op (returns true). Audio runners
++     *          that use MRope (e.g. Qwen3OmniAudioRunner) override this to fill
++     *          the cache once at session start so per-chunk encoder calls do
++     *          not need to touch MRope state.
++     * @param maxAudioTokens          Upper bound on cumulative audio tokens for this session.
++     * @param ropeRotaryCosSinDevice  RoPE cache tensor.
++     * @param stream                  CUDA stream.
++     * @param activeBatchSize         Number of concurrent lanes sharing the
++     *                                session (single-context batched ASR). Default 1.
++     * @return True on success, false on failure.
++     */
++    virtual bool initializeMRopeForSession([[maybe_unused]] int32_t maxAudioTokens,
++        [[maybe_unused]] rt::Tensor& ropeRotaryCosSinDevice, [[maybe_unused]] cudaStream_t stream,
++        [[maybe_unused]] int32_t activeBatchSize = 1)
++    {
++        return true;
++    }
++
+     /*!
+      * @brief Run multimodal inference
+      * @param stream CUDA stream
+diff --git a/cpp/runtime/llmInferenceSpecDecodeRuntime.cpp b/cpp/runtime/llmInferenceSpecDecodeRuntime.cpp
+index 3862551..51d29e0 100644
+--- a/cpp/runtime/llmInferenceSpecDecodeRuntime.cpp
++++ b/cpp/runtime/llmInferenceSpecDecodeRuntime.cpp
+@@ -106,9 +106,23 @@ LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::string const&
+     initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream);
+ }
+ 
++LLMInferenceSpecDecodeRuntime::LLMInferenceSpecDecodeRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine,
++    std::string const& engineDir, std::string const& multimodalEngineDir,
++    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
++{
++    // Vanilla-only shared-engine path (ASR slot-pool, D1): draftingConfig stays nullopt.
++    initializeCommon(engineDir, multimodalEngineDir, loraWeightsMap, std::nullopt, stream, std::move(sharedBaseEngine));
++}
++
++std::shared_ptr<nvinfer1::ICudaEngine> LLMInferenceSpecDecodeRuntime::getBaseEngine() const noexcept
++{
++    return mBaseEngineRunner ? mBaseEngineRunner->getEngine() : nullptr;
++}
++
+ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDir,
+     std::string const& multimodalEngineDir, std::unordered_map<std::string, std::string> const& loraWeightsMap,
+-    std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream)
++    std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream,
++    std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine)
+ {
+     mDraftingConfig = draftingConfig;
+ 
+@@ -132,6 +146,13 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
+         }
+     };
+ 
++    // Shared-engine path (ASR slot-pool, D1) is vanilla-only: a shared base engine cannot be combined with Eagle.
++    if (sharedBaseEngine != nullptr && draftingConfig.has_value())
++    {
++        LOG_ERROR("Shared base engine is only supported in vanilla mode (no Eagle drafting)");
++        throw std::runtime_error("Shared base engine is only supported in vanilla mode (no Eagle drafting)");
++    }
++
+     if (draftingConfig.has_value())
+     {
+         // Eagle speculative decoding mode: use named engine files
+@@ -185,8 +206,29 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
+     else
+     {
+         // Vanilla-only mode: use hardcoded engine filename matching old LLMInferenceRuntime
+-        mBaseEngineRunner = loadBaseEngine(std::filesystem::path(engineDir) / "llm.engine",
+-            std::filesystem::path(engineDir) / "config.json", "base engine (vanilla mode)");
++        std::filesystem::path const baseConfigPath = std::filesystem::path(engineDir) / "config.json";
++        if (sharedBaseEngine != nullptr)
++        {
++            // ASR slot-pool (D1): build the base runner from the shared, already-deserialized engine so this
++            // slot reuses the base engine weights while owning its own execution context / KV state.
++            try
++            {
++                mBaseEngineRunner = std::make_unique<LLMEngineRunner>(
++                    std::move(sharedBaseEngine), baseConfigPath, loraWeightsMap, stream);
++                LOG_INFO("LLMEngineRunner successfully initialized base engine (vanilla mode, shared engine).");
++            }
++            catch (std::exception const& e)
++            {
++                LOG_ERROR("Failed to initialize shared-engine LLMEngineRunner (base engine): %s", e.what());
++                throw std::runtime_error(
++                    "Failed to initialize shared-engine LLMEngineRunner: " + std::string(e.what()));
++            }
++        }
++        else
++        {
++            mBaseEngineRunner = loadBaseEngine(
++                std::filesystem::path(engineDir) / "llm.engine", baseConfigPath, "base engine (vanilla mode)");
++        }
+         mBaseEngineConfig = mBaseEngineRunner->getEngineConfig();
+ 
+         // No draft engine in vanilla mode
+@@ -328,6 +370,7 @@ void LLMInferenceSpecDecodeRuntime::initializeCommon(std::string const& engineDi
+         mDeviceBatchMapping = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kGPU, DataType::kINT32,
+             "LLMInferenceSpecDecodeRuntime::mDeviceBatchMapping");
+ 
++        mHostKvLengthSnapshot = rt::Tensor({1}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "hostKvLengthSnapshot");
+         mHostPackedTokenIds = rt::Tensor({mMaxRuntimeBatchSize, mBaseEngineConfig.maxSupportedInputLength},
+             rt::DeviceType::kCPU, DataType::kINT32, "LLMInferenceSpecDecodeRuntime::mHostPackedTokenIds");
+         mHostSelectedTokenIds = rt::Tensor({mMaxRuntimeBatchSize}, rt::DeviceType::kCPU, DataType::kINT32,
+@@ -555,13 +598,20 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
+ 
+     int32_t maxGenerateLength = request.maxGenerateLength;
+ 
+-    // Apply chat template for all requests (common for both multimodal and non-multimodal)
+-    request.formattedRequests.resize(activeBatchSize);
+-    for (int32_t i = 0; i < activeBatchSize; ++i)
++    // Apply chat template for all requests unless the caller provided fully formatted prompts.
++    bool const hasPreformattedRequests
++        = static_cast<int32_t>(request.formattedRequests.size()) == activeBatchSize
++        && std::all_of(request.formattedRequests.begin(), request.formattedRequests.end(),
++            [](auto const& formatted) { return !formatted.formattedCompleteRequest.empty(); });
++    if (!hasPreformattedRequests)
+     {
+-        // Apply chat template to populate both formatted system prompt and full formatted prompt
+-        mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
+-            request.addGenerationPrompt, request.enableThinking);
++        request.formattedRequests.resize(activeBatchSize);
++        for (int32_t i = 0; i < activeBatchSize; ++i)
++        {
++            // Apply chat template to populate both formatted system prompt and full formatted prompt
++            mTokenizer->applyChatTemplate(request.requests[i], request.formattedRequests[i], request.applyChatTemplate,
++                request.addGenerationPrompt, request.enableThinking);
++        }
+     }
+ 
+     SpecDecodeInferenceContext context;
+@@ -637,7 +687,7 @@ bool LLMInferenceSpecDecodeRuntime::handleRequest(LLMGenerationRequest const& re
+ 
+     // Conduct the preparation work to handle a new set of sequences, including inputIds packing, input/output tensor
+     // preparation, reset the KVCache state, and apply reused prefix KVCache if available.
+-    if (!setUpForPrefillExecution(context))
++    if (!setUpForPrefillExecutionOneShot(context))
+     {
+         LOG_ERROR("Prefill execution setup failed. This request cannot be handled.");
+         return false;
+@@ -2125,7 +2175,7 @@ void LLMInferenceSpecDecodeRuntime::zeroRecurrentStates(int32_t batchIdx, cudaSt
+     }
+ }
+ 
+-bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInferenceContext& context)
++bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionOneShot(SpecDecodeInferenceContext& context)
+ {
+     NVTX_SCOPED_RANGE(nvtx_setup, "SETUP_PREFILL_EXECUTION", nvtx_colors::PALE_GREEN);
+ 
+@@ -2158,51 +2208,77 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
+     {
+         auto const& prompt = context.systemPrompts[i];
+         auto const promptKey = keySystemPromptWithLoraWeights(prompt, context.loraWeightsName);
++        bool useCachedKV = false;
+         if (mSystemPromptKVCacheBase.count(promptKey) > 0)
+         {
+             auto& precachedKVCacheBase = mSystemPromptKVCacheBase[promptKey];
+-            baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
+-
+-            if (mDraftEngineRunner != nullptr)
++            auto const reuseLength = math::cast<size_t>(precachedKVCacheBase.kvCacheLayers[0].getShape()[2]);
++
++            // Validate cache shape before any side-effecting restore.
++            bool const shapeOk = (reuseLength > 0 && reuseLength < batchedInputIds[i].size());
++
++            // Token-id alignment must match the cached prefix exactly. If the
++            // cached `tokenizedPrompt` was built with different tokenizer flags
++            // (e.g. add_special_tokens=true at cache build vs false at live
++            // request), the cached KV has MRoPE positions baked at build-time
++            // positions that won't align with live-request positions, producing
++            // silent decoding corruption. Fall back to fresh prefill instead of
++            // proceeding with mismatched cache.
++            bool const matchIds = shapeOk
++                && precachedKVCacheBase.tokenizedPrompt.size() <= batchedInputIds[i].size()
++                && std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
++                    precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
++
++            LOG_DEBUG("Cache lookup: baseCount=%zu, draftCount=%zu, reuseLength=%zu, inputLen=%zu, shapeOk=%d, matchIds=%d",
++                mSystemPromptKVCacheBase.count(promptKey),
++                mDraftEngineRunner ? mSystemPromptKVCacheDraft.count(promptKey) : static_cast<size_t>(0),
++                reuseLength, batchedInputIds[i].size(), shapeOk ? 1 : 0, matchIds ? 1 : 0);
++
++            if (shapeOk && matchIds)
+             {
+-                check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
+-                    "System prompt cache inconsistency between base and draft model");
+-                auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
+-                mDraftEngineRunner->getCacheManager().restoreKVCache(
+-                    precachedKVCacheDraft.kvCacheLayers, i, context.stream);
+-            }
++                baseCacheManager.restoreKVCache(precachedKVCacheBase.kvCacheLayers, i, context.stream);
+ 
+-            // Restore recurrent states if applicable
+-            if (mBaseEngineConfig.numLinearAttnLayers > 0)
+-            {
+-                restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
+-            }
++                if (mDraftEngineRunner != nullptr)
++                {
++                    check::check(mSystemPromptKVCacheDraft.count(promptKey) > 0,
++                        "System prompt cache inconsistency between base and draft model");
++                    auto& precachedKVCacheDraft = mSystemPromptKVCacheDraft[promptKey];
++                    mDraftEngineRunner->getCacheManager().restoreKVCache(
++                        precachedKVCacheDraft.kvCacheLayers, i, context.stream);
++                }
+ 
+-            auto reuseLength = math::cast<size_t>(precachedKVCacheBase.kvCacheLayers[0].getShape()[2]);
+-            // If the system prompt is not well designed, the boundary of the inputIDs could be mis-aligned.
+-            check::check(reuseLength > 0 && reuseLength < batchedInputIds[i].size(),
+-                "The reuse length shall be larger than 0 and not exceed the input length.");
+-            // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
+-            // this keeps the draft prefill boundary aligned with the true next-token position.
+-            auto const effectiveReuseLength = reuseLength - 1;
+-            reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
+-
+-            // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
+-            context.tokenIds[i].assign(batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
+-            context.effectivePrefillLengths[i] = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
+-
+-            bool const matchIds = std::equal(precachedKVCacheBase.tokenizedPrompt.begin(),
+-                precachedKVCacheBase.tokenizedPrompt.end(), batchedInputIds[i].begin());
+-            if (!matchIds)
++                // Restore recurrent states if applicable
++                if (mBaseEngineConfig.numLinearAttnLayers > 0)
++                {
++                    restoreRecurrentStates(i, precachedKVCacheBase, context.stream);
++                }
++
++                // Reuse N-1 tokens from the cached prefix so the Nth token is treated as real input in prefill;
++                // this keeps the draft prefill boundary aligned with the true next-token position.
++                auto const effectiveReuseLength = reuseLength - 1;
++                reuseKVCacheLengthsData[i] = math::cast<int32_t>(effectiveReuseLength);
++
++                // Directly assign to context.tokenIds (skip only the reused portion, keep the next token for normal flow)
++                context.tokenIds[i].assign(
++                    batchedInputIds[i].begin() + effectiveReuseLength, batchedInputIds[i].end());
++                context.effectivePrefillLengths[i]
++                    = math::cast<int32_t>(batchedInputIds[i].size() - effectiveReuseLength);
++                useCachedKV = true;
++            }
++            else
+             {
+                 LOG_WARNING(
+-                    "Though system prompt strings are matched, token_ids are not perfectly aligned."
+-                    "This may generate incorrect result, please check your system prompt design.");
++                    "System-prompt KV cache token_ids mismatch for seq %d "
++                    "(cached_len=%zu, live_input_len=%zu, shapeOk=%d, matchIds=%d) "
++                    "-- falling back to fresh prefill to avoid MRoPE/position misalignment.",
++                    i, precachedKVCacheBase.tokenizedPrompt.size(), batchedInputIds[i].size(),
++                    static_cast<int>(shapeOk), static_cast<int>(matchIds));
+             }
+         }
+-        else
++
++        if (!useCachedKV)
+         {
+-            // Directly assign to context.tokenIds (full input)
++            // Fresh prefill: full input, no reuse.
+             context.tokenIds[i] = batchedInputIds[i];
+             context.effectivePrefillLengths[i] = static_cast<int32_t>(batchedInputIds[i].size());
+             reuseKVCacheLengthsData[i] = 0;
+@@ -2235,6 +2311,506 @@ bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecution(SpecDecodeInference
+     return true;
+ }
+ 
++// Per-chunk prefill setup for streaming/chunked prefill (M1 of streaming ASR).
++//
++// Carries ONLY the BOTH-classified lines from the original setUpForPrefillExecution
++// (per codex spec, design doc §12 milestone 1):
++//   - NVTX scope / prologue
++//   - activeBatchSize fetch
++//   - effective prefill length validation against engine max
++//
++// Explicitly OMITTED (one-shot only):
++//   - switchLoraWeights (LoRA binding is session-scoped, set once at session start
++//     via the OneShot path on the first chunk).
++//   - rawBatchedInputIds construction (caller appends to context.tokenIds itself).
++//   - reuseKVCacheLengths reshape/zero + system-prompt restore (one-shot init only).
++//   - context.tokenIds.clear()+resize (would destroy accumulated session tokens).
++//   - baseCacheManager.resetForNewSequences (would zero KV cache lengths; the
++//     engine derives kvcache_start_index from live cache lengths per §10c-real).
++//   - draft cache resetForNewSequences (same reasoning).
++//
++// Precondition: context.effectivePrefillLengths[i] has been set by the caller
++// to the per-chunk token-slice length for chunk K.
++bool LLMInferenceSpecDecodeRuntime::setUpForPrefillExecutionForChunk(SpecDecodeInferenceContext& context)
++{
++    NVTX_SCOPED_RANGE(nvtx_setup_chunk, "SETUP_PREFILL_EXECUTION_FOR_CHUNK", nvtx_colors::PALE_GREEN);
++
++    int32_t const activeBatchSize = context.activeBatchSize;
++    (void) activeBatchSize; // currently unused beyond validation; reserved for future per-batch logic.
++
++    // Validate max input length (per-chunk slice must fit engine binding).
++    int32_t const maxInputLength
++        = *std::max_element(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end());
++    if (maxInputLength > mBaseEngineConfig.maxSupportedInputLength)
++    {
++        LOG_ERROR("The per-chunk input length (%d) exceeds the max supported input length (%d) of the LLM Engine.",
++            maxInputLength, mBaseEngineConfig.maxSupportedInputLength);
++        return false;
++    }
++
++    return true;
++}
++
++// Streaming-ASR session-init entrypoint (renamed from beginChunkedPrefillSession
++// in M2). Calls into the existing one-shot setup path so LoRA / KV reset /
++// system-prompt restore / reuse lengths are bound identically to the
++// handleRequest path.
++//
++// M3.5: when a CUDA stream is supplied and an audio runner is loaded, also
++// initializes the audio runner's MRope cos/sin cache once for the worst-case
++// session length (bounded by max_kv_cache_capacity, currently 256 on the
++// shipped ASR thinker). Per-chunk encodeMelChunk calls thereafter do not
++// need to touch MRope state — the worker stays oblivious to it.
++bool LLMInferenceSpecDecodeRuntime::beginAsrSession(
++    SpecDecodeInferenceContext& context, cudaStream_t stream, int32_t activeBatchSize)
++{
++    NVTX_SCOPED_RANGE(nvtx_begin_asr, "BEGIN_ASR_SESSION", nvtx_colors::PALE_GREEN);
++    if (!setUpForPrefillExecutionOneShot(context))
++    {
++        return false;
++    }
++
++    if (mAudioRunner && stream != nullptr)
++    {
++        // Bound by KV cap so the MRope cache spans the worst-case session.
++        // Audio tokens are 1:1 with KV positions consumed by audio embeds
++        // (one MRope slot per audio token), so max_kv_cache_capacity is the
++        // tightest upper bound on cumulative audio tokens. activeBatchSize
++        // (default 1) selects how many lanes the MRope cache spans for the
++        // single-context batched path.
++        int32_t const maxAudioTokens = getMaxKvCacheCapacity();
++        if (!mAudioRunner->initializeMRopeForSession(
++                maxAudioTokens, mBaseEngineRunner->getRopeCosSinCacheTensor(), stream, activeBatchSize))
++        {
++            LOG_ERROR("beginAsrSession: audio runner MRope session-init failed");
++            return false;
++        }
++    }
++    return true;
++}
++
++// Streaming-ASR session teardown (M2). Frees the KV slot bound to this context
++// and clears accumulated per-session state so the context can be reused by a
++// later beginAsrSession call. Safe to call without a paired begin (no-op on a
++// fresh context); safe to call repeatedly.
++bool LLMInferenceSpecDecodeRuntime::endAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream)
++{
++    NVTX_SCOPED_RANGE(nvtx_end_asr, "END_ASR_SESSION", nvtx_colors::PALE_GREEN);
++
++    int32_t const activeBatchSize = context.activeBatchSize;
++    if (activeBatchSize <= 0)
++    {
++        // Context never carried an active session — nothing to free.
++        return true;
++    }
++
++    // Free the KV slot by issuing a resetForNewSequences with all-zero reuse
++    // lengths. This is the same mechanism setUpForPrefillExecutionOneShot uses
++    // to bring fresh sessions to zero (cpp/runtime/llmInferenceSpecDecodeRuntime.cpp ~L1995),
++    // reused here for teardown.
++    check::check(mHostReuseKVCacheLengths.reshape({activeBatchSize}), "Tensor reshape failed");
++    int32_t* reuseData = mHostReuseKVCacheLengths.dataPointer<int32_t>();
++    std::fill(reuseData, reuseData + activeBatchSize, 0);
++
++    rt::HybridCacheManager& baseCacheManager = mBaseEngineRunner->getCacheManager();
++    baseCacheManager.resetForNewSequences(mHostReuseKVCacheLengths, stream);
++    if (mDraftEngineRunner != nullptr)
++    {
++        mDraftEngineRunner->getCacheManager().resetForNewSequences(mHostReuseKVCacheLengths, stream);
++    }
++
++    // Clear accumulated per-session bookkeeping.
++    for (auto& seq : context.tokenIds)
++    {
++        seq.clear();
++    }
++    std::fill(context.effectivePrefillLengths.begin(), context.effectivePrefillLengths.end(), 0);
++
++    return true;
++}
++
++// ----------------------------------------------------------------------------
++// Test-only post-prefill decode driver for the M3.6 empirical-LCS spike.
++// Strips handleRequest's post-prefill loop down to: sample-first-token from
++// mLogitsOutput, then loop runVanillaDecoding until EOS / maxNewTokens.
++// No spec-decode, no streaming, no eviction. Single batch only.
++// ----------------------------------------------------------------------------
++bool LLMInferenceSpecDecodeRuntime::decodeAfterChunkedPrefillForTesting(SpecDecodeInferenceContext& context,
++    int32_t maxNewTokens, std::vector<int32_t>& outGeneratedTokens, cudaStream_t stream)
++{
++    NVTX_SCOPED_RANGE(nvtx_decode_test, "DECODE_AFTER_CHUNKED_PREFILL_TEST", nvtx_colors::PURPLE);
++    check::check(context.activeBatchSize == 1, "decodeAfterChunkedPrefillForTesting: batch==1 only");
++    check::check(!hasDraftModel(), "decodeAfterChunkedPrefillForTesting: no spec-decode");
++    constexpr int32_t kBatchIdx = 0;
++
++    outGeneratedTokens.clear();
++
++    // Step 1 — sample first token from the prefill logits already in mLogitsOutput.
++    // mLogitsOutput has shape [1, outputVocabSize] from the last appendPrefillEmbeds call.
++    check::check(mSamplingIndices.reshape({1, 1}), "mSamplingIndices reshape failed");
++    {
++        constexpr int32_t kSAMPLING_TOP_K = 1;
++        selectAllTopK(mLogitsOutput, std::nullopt, mSamplingIndices, kSAMPLING_TOP_K, mSamplingWorkspace, stream);
++    }
++    if (mBaseEngineConfig.reducedVocabSize > 0)
++    {
++        mapReducedVocabToFullVocab(mSamplingIndices, mBaseVocabMappingTable, stream);
++    }
++    check::check(mHostSelectedTokenIds.reshape({1}), "mHostSelectedTokenIds reshape failed");
++    int32_t* hostSel = mHostSelectedTokenIds.dataPointer<int32_t>();
++    CUDA_CHECK(cudaMemcpyAsync(hostSel, mSamplingIndices.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++
++    int32_t firstToken = hostSel[0];
++    context.tokenIds[kBatchIdx].push_back(firstToken);
++    context.currentGenerateLengths[kBatchIdx] += 1;
++    outGeneratedTokens.push_back(firstToken);
++
++    int32_t const eosId = mTokenizer->getEosId();
++    if (firstToken == eosId)
++    {
++        return true;
++    }
++
++    // Step 2 — loop runVanillaDecoding until EOS or maxNewTokens.
++    context.generationRound = 1; // post-prefill round number, mirrors handleRequest convention.
++    while (static_cast<int32_t>(outGeneratedTokens.size()) < maxNewTokens)
++    {
++        bool const ok = runVanillaDecoding(context);
++        if (!ok)
++        {
++            LOG_ERROR("decodeAfterChunkedPrefillForTesting: runVanillaDecoding failed at round %d",
++                context.generationRound);
++            return false;
++        }
++        // runVanillaDecoding appended the next token to context.tokenIds[0].
++        int32_t const lastTok = context.tokenIds[kBatchIdx].back();
++        outGeneratedTokens.push_back(lastTok);
++        context.generationRound += 1;
++        if (lastTok == eosId)
++        {
++            break;
++        }
++    }
++    return true;
++}
++
++// Streaming-ASR append entrypoint. Append one chunk of audio-bearing prefill
++// embeddings to an in-flight session. Subset of runBaseModelPrefill (~L976):
++// no draft model, no deepstack, no sampling — only the base-engine prefill is
++// invoked. Cache state is owned by the engine (auto-derived kvcache_start_index,
++// additive commit), so we must NOT call setUpForPrefillExecutionOneShot here.
++//
++// N=1 wrapper (Phase D-1a). Retained for backward compatibility with all
++// existing single-session callers (spike_m1/m2/m36, worker streaming hop).
++// Forces context.activeBatchSize=1, constructs one-lane vectors, and delegates
++// to appendPrefillEmbedsBatched, so the single-lane and batched code paths
++// share one implementation. The single-context model means this lane lives in
++// row 0 of `context`'s [N=1] structures — identical layout to the original M1
++// path that hardcoded kBatchIdx=0.
++bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbeds(SpecDecodeInferenceContext& context,
++    Tensor const& audioEmbedsDelta, int32_t audioIndexBase, std::vector<int32_t> const& tokenSliceDelta,
++    cudaStream_t stream)
++{
++    context.activeBatchSize = 1;
++
++    std::vector<Tensor const*> audioEmbedsDeltas{&audioEmbedsDelta};
++    std::vector<int32_t> audioIndexBases{audioIndexBase};
++    std::vector<std::vector<int32_t>> tokenSliceDeltas{tokenSliceDelta};
++
++    return appendPrefillEmbedsBatched(context, audioEmbedsDeltas, audioIndexBases, tokenSliceDeltas, stream);
++}
++
++// Batched append-prefill (Phase D-1a, spec §3). SINGLE-CONTEXT MODEL: one
++// SpecDecodeInferenceContext carries activeBatchSize == N lanes; per-lane data
++// lives in context.tokenIds[b] / context.effectivePrefillLengths[b]. This is
++// the same model the official batched normal-prefill path uses
++// (runBaseModelPrefill, :1183-1224): a single context.activeBatchSize drives
++// the [N,...] reshapes of the runtime member tensors, and per-lane lengths/ids
++// are read from the context's [N] vectors. One executePrefillStep call over
++// [N, maxChunkLen, H] embeds; per-lane context lengths drive last-token
++// selection, padding rows are ignored. Audio-only, no draft, no deepstack, no
++// visual (same scope the single-lane M1 path held). additive: the old
++// appendPrefillEmbeds now delegates here.
++bool LLMInferenceSpecDecodeRuntime::appendPrefillEmbedsBatched(SpecDecodeInferenceContext& context,
++    std::vector<Tensor const*> const& audioEmbedsDeltas, std::vector<int32_t> const& audioIndexBases,
++    std::vector<std::vector<int32_t>> const& tokenSliceDeltas, cudaStream_t stream)
++{
++    NVTX_SCOPED_RANGE(nvtx_append_prefill_batched, "APPEND_PREFILL_EMBEDS_BATCHED", nvtx_colors::PURPLE);
++
++    // N is the single context's activeBatchSize (mirrors runBaseModelPrefill:1183).
++    int32_t const N = context.activeBatchSize;
++    check::check(N >= 1, "appendPrefillEmbedsBatched: context.activeBatchSize must be >= 1");
++    check::check(static_cast<int32_t>(audioEmbedsDeltas.size()) == N
++            && static_cast<int32_t>(audioIndexBases.size()) == N && static_cast<int32_t>(tokenSliceDeltas.size()) == N,
++        "appendPrefillEmbedsBatched: all input vectors must have length N == context.activeBatchSize");
++    // The context's per-lane [N] bookkeeping vectors must already be sized to N
++    // (allocated by beginAsrSession / setUpForPrefillExecutionOneShot). We write
++    // tokenIds[b] and effectivePrefillLengths[b] below, exactly as :1212-1216.
++    check::check(static_cast<int32_t>(context.tokenIds.size()) == N
++            && static_cast<int32_t>(context.effectivePrefillLengths.size()) == N,
++        "appendPrefillEmbedsBatched: context.tokenIds / effectivePrefillLengths must be sized to N");
++
++    // ----- Scope guards (audio-only streaming, same as the M1 single-lane path). -----
++    check::check(!hasDraftModel(), "appendPrefillEmbedsBatched: speculative-decode draft model not supported");
++    check::check(mBaseEngineConfig.numDeepstackFeatures == 0,
++        "appendPrefillEmbedsBatched: deepstack-feature models not supported");
++    check::check(!context.visualEmbeddings.has_value(),
++        "appendPrefillEmbedsBatched: audio-only streaming (no visual embeddings)");
++
++    // Per-lane guards + chunkLen collection. Per-lane data lives in the single
++    // context's [N] structures, NOT in N separate contexts.
++    std::vector<int32_t> chunkLens(N);
++    int32_t maxChunkLen = 0;
++    for (int32_t b = 0; b < N; ++b)
++    {
++        check::check(!tokenSliceDeltas[b].empty(), "appendPrefillEmbedsBatched: tokenSliceDelta must be non-empty");
++        chunkLens[b] = static_cast<int32_t>(tokenSliceDeltas[b].size());
++        maxChunkLen = std::max(maxChunkLen, chunkLens[b]);
++    }
++
++    // ----- Capacity guards (per lane, BEFORE any state mutation). -----
++    //
++    // (a) Per-chunk cap: each lane's chunkLen must fit the engine's
++    //     max_input_len binding (the padded [N, maxChunkLen] still has to fit,
++    //     and maxChunkLen is the worst lane). Surface a dedicated status BEFORE
++    //     mutating any context so the caller can refuse cleanly.
++    int32_t const engineMaxIn = mBaseEngineConfig.maxSupportedInputLength;
++    for (int32_t b = 0; b < N; ++b)
++    {
++        if (chunkLens[b] > engineMaxIn)
++        {
++            LOG_ERROR("appendPrefillEmbedsBatched: lane %d chunk too long (chunkLen=%d > max_input_len=%d)", b,
++                chunkLens[b], engineMaxIn);
++            mLastAppendStatus = AppendPrefillStatus::kChunkTooLong;
++            return false;
++        }
++    }
++
++    // (b) KV capacity cap: per-lane live cache length + chunkLen must fit
++    //     max_kv_cache_capacity. The device KV lengths tensor is [N]; issue a
++    //     single synchronous D2H of all N int32 lengths and compare per lane.
++    //     HybridCacheManager tracks per-batch lengths (hybridCacheManager.cpp:247-285).
++    rt::HybridCacheManager& baseCacheManager = mBaseEngineRunner->getCacheManager();
++    rt::Tensor const& deviceKvLengths = baseCacheManager.getKVCacheLengths();
++    check::check(deviceKvLengths.getShape()[0] >= N,
++        "appendPrefillEmbedsBatched: KV lengths tensor has fewer slots than N");
++    check::check(mHostKvLengthSnapshot.reshape({N}), "mHostKvLengthSnapshot reshape failed");
++    int32_t* hostKvLenPtr = mHostKvLengthSnapshot.dataPointer<int32_t>();
++    CUDA_CHECK(cudaMemcpyAsync(hostKvLenPtr, deviceKvLengths.rawPointer(), static_cast<size_t>(N) * sizeof(int32_t),
++        cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    int32_t const maxKvCap = mBaseEngineConfig.maxKVCacheCapacity;
++    for (int32_t b = 0; b < N; ++b)
++    {
++        int32_t const currentKvLen = hostKvLenPtr[b];
++        if (currentKvLen + chunkLens[b] > maxKvCap)
++        {
++            LOG_ERROR("appendPrefillEmbedsBatched: lane %d KV capacity exceeded (current=%d, chunk=%d, cap=%d)", b,
++                currentKvLen, chunkLens[b], maxKvCap);
++            mLastObservedKvLength = currentKvLen;
++            mLastAppendStatus = AppendPrefillStatus::kKvCapacityExceeded;
++            return false;
++        }
++    }
++    // Surface lane-0 KV length for the single-lane convenience accessor.
++    mLastObservedKvLength = hostKvLenPtr[0];
++    // ------------------------------------------------------------------------
++
++    // 1. Extend each lane's accumulated token-ID list and set its per-chunk
++    //    effective prefill length, IN THE SINGLE SHARED CONTEXT's [N] vectors.
++    //    Mirrors runBaseModelPrefill:1212-1216 (which reads context.tokenIds[i]
++    //    / context.effectivePrefillLengths[i] for i in [0,activeBatchSize)). Do
++    //    NOT clear tokenIds (the session accumulates across chunks), and
++    //    effectivePrefillLengths[b] is the chunk slice length (the engine adds
++    //    the live KV start index itself, llmEngineRunner.cpp:1247-1264).
++    for (int32_t b = 0; b < N; ++b)
++    {
++        context.tokenIds[b].insert(
++            context.tokenIds[b].end(), tokenSliceDeltas[b].begin(), tokenSliceDeltas[b].end());
++        context.effectivePrefillLengths[b] = chunkLens[b];
++    }
++
++    // 2. Per-chunk validation (max input-length check over the lanes' lengths).
++    //    Equivalent to the inputIdsLength = max_element(effectivePrefillLengths)
++    //    the normal path computes at :1187-1188; setUpForPrefillExecutionForChunk
++    //    only reads effectivePrefillLengths via max_element, so we check the max
++    //    directly to keep this independent of that helper's single-context
++    //    assumptions.
++    if (maxChunkLen > mBaseEngineConfig.maxSupportedInputLength)
++    {
++        LOG_ERROR("appendPrefillEmbedsBatched: per-chunk setup validation failed (maxChunkLen=%d, engineMax=%d)",
++            maxChunkLen, mBaseEngineConfig.maxSupportedInputLength);
++        mLastAppendStatus = AppendPrefillStatus::kPreconditionFailed;
++        return false;
++    }
++
++    // 3. Reshape engine I/O for the batch. Mirror runBaseModelPrefill:1190-1198,1223:
++    //    ids [N, maxChunkLen], contextLengths [N], embeds [N, maxChunkLen, H],
++    //    logits [N, vocab].
++    check::check(mIdsInput.reshape({N, maxChunkLen}), "mIdsInput reshape failed");
++    check::check(mContextLengthsInput.reshape({N}), "mContextLengthsInput reshape failed");
++    check::check(
++        mInputsEmbeds.reshape({N, maxChunkLen, mBaseEngineConfig.hiddenSize}), "mInputsEmbeds reshape failed");
++    check::check(mLogitsOutput.reshape({N, mBaseEngineConfig.outputVocabSize}), "mLogitsOutput reshape failed");
++
++    // 4. Pack token ids into pinned host memory [N, maxChunkLen]. Mirror
++    //    runBaseModelPrefill:1205-1217: zero-fill the whole buffer first so pad
++    //    slots are deterministic (the multimodal-index walk scans all
++    //    maxChunkLen positions per row), then copy each lane's slice and set its
++    //    context length to the real (unpadded) chunk length.
++    check::check(mHostPackedTokenIds.reshape({N, maxChunkLen}), "mHostPackedTokenIds reshape failed");
++    int32_t* hostTokenIdsData = mHostPackedTokenIds.dataPointer<int32_t>();
++    std::fill(hostTokenIdsData, hostTokenIdsData + static_cast<size_t>(N) * maxChunkLen, 0);
++    int32_t* ctxLenData = mContextLengthsInput.dataPointer<int32_t>();
++    for (int32_t b = 0; b < N; ++b)
++    {
++        ctxLenData[b] = chunkLens[b];
++        std::copy(tokenSliceDeltas[b].begin(), tokenSliceDeltas[b].end(),
++            hostTokenIdsData + static_cast<size_t>(b) * maxChunkLen);
++    }
++    CUDA_CHECK(cudaMemcpyAsync(mIdsInput.rawPointer(), hostTokenIdsData,
++        static_cast<size_t>(N) * maxChunkLen * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++
++    // 5. Build the batched multimodal indices [N, maxChunkLen]. The embedding
++    //    kernel indexes ONE flat audioEmbeds buffer globally
++    //    (embeddingKernels.cu:414: audioEmbeds[multimodalIdx * hiddenSize]), so
++    //    the N per-lane audioEmbedsDeltas are concatenated row-wise into a single
++    //    device buffer below, and lane b's multimodal indices are biased by
++    //    (concatRowBase[b] + audioIndexBases[b]). We generate indices PER LANE
++    //    (single-row CPU tensor with that lane's effective base) — generateMultimodalIndices
++    //    takes a scalar audioIndexBase, and each lane needs a different one.
++    std::optional<int32_t> audioTokenIdOpt
++        = (mBaseEngineConfig.audioTokenId != 0) ? std::optional<int32_t>{mBaseEngineConfig.audioTokenId} : std::nullopt;
++    std::optional<int32_t> imageTokenIdOpt
++        = (mBaseEngineConfig.imageTokenId != 0) ? std::optional<int32_t>{mBaseEngineConfig.imageTokenId} : std::nullopt;
++
++    // Compute per-lane concat row bases (cumulative audio rows of prior lanes)
++    // and the total audio-row count for the concatenated buffer.
++    std::vector<int32_t> concatRowBase(N, 0);
++    int64_t totalAudioRows = 0;
++    int32_t const hiddenSize = mBaseEngineConfig.hiddenSize;
++    for (int32_t b = 0; b < N; ++b)
++    {
++        concatRowBase[b] = static_cast<int32_t>(totalAudioRows);
++        auto const shape = audioEmbedsDeltas[b]->getShape();
++        check::check(shape.getNumDims() == 2 && shape[1] == hiddenSize,
++            "appendPrefillEmbedsBatched: each audioEmbedsDelta must be [audioRows, hiddenSize]");
++        totalAudioRows += shape[0];
++    }
++
++    // Assemble the [N, maxChunkLen] indices on CPU, one lane-row at a time.
++    Tensor multimodalIndicesCPU({N, maxChunkLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32);
++    int32_t* indicesData = multimodalIndicesCPU.dataPointer<int32_t>();
++    std::fill(indicesData, indicesData + static_cast<size_t>(N) * maxChunkLen, -1);
++    for (int32_t b = 0; b < N; ++b)
++    {
++        // Single-row inputIds for this lane, zero-padded to maxChunkLen so the
++        // generated row aligns with the packed ids buffer.
++        Tensor laneIdsCPU({1, maxChunkLen}, DeviceType::kCPU, nvinfer1::DataType::kINT32);
++        int32_t* laneIds = laneIdsCPU.dataPointer<int32_t>();
++        std::fill(laneIds, laneIds + maxChunkLen, 0);
++        std::copy(tokenSliceDeltas[b].begin(), tokenSliceDeltas[b].end(), laneIds);
++
++        int32_t const effectiveBase = concatRowBase[b] + audioIndexBases[b];
++        Tensor laneIndices = generateMultimodalIndices(
++            laneIdsCPU, audioTokenIdOpt, imageTokenIdOpt, mBaseEngineConfig.vocabSize, effectiveBase);
++        // laneIndices is [1, maxChunkLen]; copy into row b of the batched buffer.
++        std::copy(laneIndices.dataPointer<int32_t>(), laneIndices.dataPointer<int32_t>() + maxChunkLen,
++            indicesData + static_cast<size_t>(b) * maxChunkLen);
++    }
++    auto const indicesShape = multimodalIndicesCPU.getShape();
++    check::check(mMultimodalIndices.reshape(indicesShape), "mMultimodalIndices reshape failed");
++    size_t const indicesBytes = static_cast<size_t>(indicesShape.volume()) * sizeof(int32_t);
++    CUDA_CHECK(cudaMemcpy(
++        mMultimodalIndices.rawPointer(), multimodalIndicesCPU.rawPointer(), indicesBytes, cudaMemcpyHostToDevice));
++
++    // 6. Concatenate the N per-lane audioEmbedsDeltas (device FP16) row-wise into
++    //    one flat buffer the kernel can index globally. Allocate a transient
++    //    device tensor [totalAudioRows, H] and D2D-copy each lane in turn. When
++    //    N==1 this is a single copy of the lane's tensor (kept simple over a
++    //    special-case alias so the batched path stays uniform).
++    Tensor concatAudioEmbeds(
++        {totalAudioRows, hiddenSize}, DeviceType::kGPU, audioEmbedsDeltas[0]->getDataType());
++    {
++        // Derive the per-row byte stride from the destination buffer rather than
++        // hardcoding sizeof(half): bytes-per-element = capacity / element-count.
++        // (A hardcoded sizeof(half) ABI assumption has bitten this fork before;
++        // MOSS KV buffers, see MEMORY.) When totalAudioRows is 0 there is nothing
++        // to copy and we skip.
++        if (totalAudioRows > 0)
++        {
++            size_t const bytesPerElem
++                = static_cast<size_t>(concatAudioEmbeds.getMemoryCapacity()) / (static_cast<size_t>(totalAudioRows) * hiddenSize);
++            size_t const rowBytes = static_cast<size_t>(hiddenSize) * bytesPerElem;
++            for (int32_t b = 0; b < N; ++b)
++            {
++                auto const shape = audioEmbedsDeltas[b]->getShape();
++                size_t const laneBytes = static_cast<size_t>(shape[0]) * rowBytes;
++                if (laneBytes == 0)
++                {
++                    continue;
++                }
++                auto* dst = static_cast<uint8_t*>(concatAudioEmbeds.rawPointer())
++                    + static_cast<size_t>(concatRowBase[b]) * rowBytes;
++                CUDA_CHECK(cudaMemcpyAsync(
++                    dst, audioEmbedsDeltas[b]->rawPointer(), laneBytes, cudaMemcpyDeviceToDevice, stream));
++            }
++        }
++    }
++
++    // 7. Batched embedding lookup (multimodal, audio-only). The concatenated
++    //    audio buffer + biased per-lane indices reproduce the single-lane kernel
++    //    contract for every lane in one launch.
++    OptionalInputTensor visualEmbedsOpt{std::nullopt};
++    OptionalInputTensor audioEmbedsOpt{std::cref(concatAudioEmbeds)};
++    kernel::embeddingLookupMultimodal(mIdsInput, mEmbedding.table, mEmbedding.scalesAsOptional(),
++        std::optional{std::ref(mMultimodalIndices)}, imageTokenIdOpt, visualEmbedsOpt, audioTokenIdOpt, audioEmbedsOpt,
++        mInputsEmbeds, stream);
++
++    // 8. Fire the engine once for the whole batch. executePrefillStep is already
++    //    the official batched runner (llmEngineRunner.cpp:1262-1396); it derives
++    //    activeBatchSize from mInputsEmbeds and packs [activeBatchSize,...]. No
++    //    deepstack, no hidden-states output (draft path disabled).
++    OptionalInputTensors emptyDeepstack{};
++    OptionalOutputTensor noHidden = std::nullopt;
++    bool const prefillOk = mBaseEngineRunner->executePrefillStep(
++        mInputsEmbeds, mContextLengthsInput, emptyDeepstack, mLogitsOutput, noHidden, stream);
++    if (!prefillOk)
++    {
++        LOG_ERROR("appendPrefillEmbedsBatched: executePrefillStep failed at N=%d, maxChunkLen=%d", N, maxChunkLen);
++        mLastAppendStatus = AppendPrefillStatus::kPrefillFailed;
++        return false;
++    }
++
++    mLastAppendStatus = AppendPrefillStatus::kOk;
++    return true;
++}
++
++// M2: trivial accessor for the engine-config max KV capacity. Defined out-of-line
++// to keep the header free of engine-config dependencies.
++int32_t LLMInferenceSpecDecodeRuntime::getMaxKvCacheCapacity() const noexcept
++{
++    return mBaseEngineConfig.maxKVCacheCapacity;
++}
++
++// M2: synchronous D2H read of the live KV cache length for the given batch
++// slot. Issues a 1-int memcpy + stream-sync on the supplied stream. Reuses
++// mHostKvLengthSnapshot as the pinned host buffer (single-slot read).
++int32_t LLMInferenceSpecDecodeRuntime::peekKvCacheLength(int32_t batchIdx, cudaStream_t stream)
++{
++    rt::HybridCacheManager& cm = mBaseEngineRunner->getCacheManager();
++    rt::Tensor const& devLen = cm.getKVCacheLengths();
++    check::check(batchIdx >= 0 && batchIdx < devLen.getShape()[0],
++        "peekKvCacheLength: batchIdx out of range for active KV cache lengths tensor");
++    check::check(mHostKvLengthSnapshot.reshape({1}), "mHostKvLengthSnapshot reshape failed");
++    int32_t* host = mHostKvLengthSnapshot.dataPointer<int32_t>();
++    auto const* devBase = static_cast<int32_t const*>(devLen.rawPointer());
++    CUDA_CHECK(cudaMemcpyAsync(host, devBase + batchIdx, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    return host[0];
++}
++
+ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+     SpecDecodeInferenceContext& context, int32_t genAndSaveBatchIdx)
+ {
+@@ -2256,7 +2832,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+         return true;
+     }
+ 
+-    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
++    auto tokenizedPrompt = mTokenizer->encode(prompt, false);
+     if (tokenizedPrompt.empty())
+     {
+         LOG_ERROR("Failed to encode system prompt for KVCache generation.");
+@@ -2288,7 +2864,7 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+     tempContext.tokenIds[0] = tokenizedPrompt;
+ 
+     // Setup for prefill execution: handles KV cache reset and applies any reused system prompt cache
+-    if (!setUpForPrefillExecution(tempContext))
++    if (!setUpForPrefillExecutionOneShot(tempContext))
+     {
+         LOG_ERROR("Prefill execution setup failed for system prompt KVCache generation.");
+         return false;
+@@ -2365,15 +2941,18 @@ bool LLMInferenceSpecDecodeRuntime::genAndSaveSystemPromptKVCache(
+         return true;
+     }
+     auto const promptKey = keySystemPromptWithLoraWeights(prompt, loraWeightsName);
+-    if (mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end())
++    bool baseExists = mSystemPromptKVCacheBase.find(promptKey) != mSystemPromptKVCacheBase.end();
++    bool draftExists = !mDraftEngineRunner
++        || mSystemPromptKVCacheDraft.find(promptKey) != mSystemPromptKVCacheDraft.end();
++    if (baseExists && draftExists)
+     {
+-        LOG_DEBUG("The system prompt KVCache already exists for the prompt: {%s}", prompt.c_str());
++        LOG_DEBUG("The system prompt KVCache already exists (base+draft) for prompt: {%s}", prompt.c_str());
+         return true;
+     }
+     SpecDecodeInferenceContext tempContext;
+     tempContext.initialize(1, 1, std::nullopt, rt::OptionalInputTensors{}, loraWeightsName, stream);
+     tempContext.systemPrompts[0] = prompt;
+-    auto tokenizedPrompt = mTokenizer->encode(prompt, true);
++    auto tokenizedPrompt = mTokenizer->encode(prompt, false);
+     if (tokenizedPrompt.empty())
+     {
+         LOG_ERROR("Failed to encode system prompt for KVCache generation.");
+diff --git a/cpp/runtime/llmInferenceSpecDecodeRuntime.h b/cpp/runtime/llmInferenceSpecDecodeRuntime.h
+index 25d64f3..91b586b 100644
+--- a/cpp/runtime/llmInferenceSpecDecodeRuntime.h
++++ b/cpp/runtime/llmInferenceSpecDecodeRuntime.h
+@@ -169,6 +169,34 @@ public:
+     LLMInferenceSpecDecodeRuntime(std::string const& engineDir, std::string const& multimodalEngineDir,
+         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+ 
++    /*!
++     * @brief Construct vanilla-only runtime that SHARES a base ICudaEngine with another runtime (ASR slot-pool, D1).
++     *
++     * Used to build N decoder/thinker slots that share one deserialized base engine (saving weight memory)
++     * while each slot owns an independent IExecutionContext, KV/cache manager state, runtime tensors, and
++     * shared-execution-context memory. The supplied @p sharedBaseEngine must come from another live
++     * LLMEngineRunner (via getEngine()), whose deserializing owner must outlive this runtime.
++     *
++     * This path is vanilla-only (no Eagle draft). It still loads its own embedding table, tokenizer, and
++     * (if present) multimodal runners from @p engineDir / @p multimodalEngineDir, exactly like the vanilla
++     * path-based constructor — only the base LLM engine weights are shared.
++     *
++     * @param sharedBaseEngine Shared, already-deserialized base TensorRT engine (must be non-null)
++     * @param engineDir Directory containing engine files (embedding.safetensors, config.json, etc.)
++     * @param multimodalEngineDir Directory containing multimodal engine files
++     * @param loraWeightsMap Map of LoRA weight names to file paths
++     * @param stream CUDA stream for operations
++     * @throws std::runtime_error if directories do not contain expected data, or runner initialization fails
++     */
++    LLMInferenceSpecDecodeRuntime(std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine,
++        std::string const& engineDir, std::string const& multimodalEngineDir,
++        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
++
++    //! @brief Get the shared base TensorRT engine backing this runtime (ASR slot-pool, D1).
++    //! @return Shared pointer to the base ICudaEngine, for constructing additional slot runtimes that share it.
++    //! @note Valid only while this runtime (and its deserializing owner) is alive.
++    std::shared_ptr<nvinfer1::ICudaEngine> getBaseEngine() const noexcept;
++
+     //! @brief Destructor
+     ~LLMInferenceSpecDecodeRuntime() noexcept = default;
+ 
+@@ -212,6 +240,226 @@ public:
+      */
+     void setActionNoiseSeed(int32_t seed) noexcept;
+ 
++    /*!
++     * @brief One-time per-session setup that must run before any
++     *        appendPrefillEmbeds calls. Reuses the OneShot setup path so LoRA
++     *        binding, KV-cache reset, system-prompt restore, and reuse-length
++     *        bookkeeping happen exactly as they do in handleRequest.
++     *
++     * After this returns true the caller may invoke appendPrefillEmbeds any
++     * number of times (subject to engine max_input_len per chunk and max KV
++     * capacity total), then drive decode separately.
++     *
++     * Caller must populate context.activeBatchSize, context.systemPrompts[i],
++     * context.rawBatchedInputIds[i] (initial prompt token IDs — typically the
++     * text prefix that precedes any audio), and context.loraWeightsName / stream
++     * before calling.
++     *
++     * @return True on success, false on validation failure.
++     */
++    /*!
++     * @brief Status code reported by the most recent appendPrefillEmbeds call.
++     *        M2 introduces the kKvCapacityExceeded / kChunkTooLong refusal
++     *        modes so callers can distinguish capacity refusal from engine
++     *        prefill failure and emit a structured error event.
++     */
++    enum class AppendPrefillStatus : int32_t
++    {
++        kOk = 0,                  //!< Append succeeded.
++        kKvCapacityExceeded = 1,  //!< current_kv_length + chunkLen > max_kv_cache_capacity.
++        kChunkTooLong = 2,        //!< tokenSliceDelta.size() > engine max_input_len.
++        kPreconditionFailed = 3,  //!< Per-chunk validation in setUpForPrefillExecutionForChunk failed.
++        kPrefillFailed = 4,       //!< Underlying executePrefillStep returned false.
++    };
++
++    //! @brief Status of the most recent appendPrefillEmbeds call (kOk if never called).
++    AppendPrefillStatus getLastAppendStatus() const noexcept
++    {
++        return mLastAppendStatus;
++    }
++
++    //! @brief Snapshot of the live KV cache length (batch slot 0) read at entry
++    //!        to the most recent appendPrefillEmbeds call. Useful for the
++    //!        worker to surface in a structured capacity-error event.
++    int32_t getLastObservedKvLength() const noexcept
++    {
++        return mLastObservedKvLength;
++    }
++
++    //! @brief Static read of the engine's max KV cache capacity (256 in the
++    //!        shipped ASR thinker engine). Convenience for callers that want
++    //!        to advertise the cap in a structured error.
++    int32_t getMaxKvCacheCapacity() const noexcept;
++
++    //! @brief Synchronous D2H read of the live KV cache length for batch slot
++    //!        @p batchIdx. M2 helper for both the lifecycle acceptance test and
++    //!        the M3 worker, which wants to advertise live cache occupancy in
++    //!        structured error events.
++    int32_t peekKvCacheLength(int32_t batchIdx, cudaStream_t stream);
++
++    //! @brief Begin a streaming-ASR session.
++    //!
++    //! Wraps the one-shot setup path so LoRA / KV reset / system-prompt
++    //! restore / reuse lengths are bound identically to the handleRequest
++    //! path. When a `stream` is supplied and an audio runner is loaded, also
++    //! initializes the audio runner's MRope cos/sin cache for the worst-case
++    //! session length (bounded by max_kv_cache_capacity) so per-chunk
++    //! encodeMelChunk calls do not touch MRope state.
++    //!
++    //! @param context  Inference context to bind.
++    //! @param stream   CUDA stream for MRope init. If 0 (default), MRope init
++    //!                 is skipped — preserves the M2 spike_m2 API.
++    //! @param activeBatchSize  Number of concurrent ASR lanes sharing this
++    //!                 single context (single-context batched ASR). Default 1
++    //!                 keeps existing single-session callers unchanged; the
++    //!                 value is forwarded to the audio runner's MRope session
++    //!                 init so the cos/sin cache spans all N lanes.
++    bool beginAsrSession(
++        SpecDecodeInferenceContext& context, cudaStream_t stream = 0, int32_t activeBatchSize = 1);
++
++    /*!
++     * @brief End an in-flight streaming-ASR session and release its state.
++     *        Mirror of beginAsrSession.
++     *
++     * Frees the KV-cache slot bound to this context (via
++     * HybridCacheManager::resetForNewSequences with zero reuse lengths),
++     * clears the accumulated session token-ID list and per-batch effective
++     * prefill lengths so a subsequent beginAsrSession on the same context
++     * starts from a clean slate.
++     *
++     * Safe to call without a paired begin (returns true and is a no-op on
++     * unused contexts). Safe to call repeatedly. After endAsrSession returns,
++     * the context can be reused via beginAsrSession.
++     *
++     * @param context  Inference context previously passed to beginAsrSession.
++     * @param stream   CUDA stream used to issue the cache-length reset H2D.
++     * @return True on success.
++     */
++    bool endAsrSession(SpecDecodeInferenceContext& context, cudaStream_t stream);
++
++    /*!
++     * @brief Append one chunk of prefill embeddings to an in-flight streaming
++     *        prefill session. Milestone 1 of the streaming-ASR plan
++     *        (design doc §12).
++     *
++     * Preconditions:
++     *  - Caller has already run one OneShot prefill (e.g. via handleRequest /
++     *    a session-init path) on context, so LoRA, KV-cache state, system-prompt
++     *    restore, and recurrent state init are done.
++     *  - The engine's KV cache lengths reflect prior chunks; this function does
++     *    NOT reset them. Cache start index is derived inside the engine from
++     *    live cache lengths (see design doc §10c-real,
++     *    cpp/runtime/llmEngineRunner.cpp:1247-1264).
++     *  - Single batch only (activeBatchSize == 1) in M1.
++     *  - audioEmbedsDelta layout matches the one-shot path: shape
++     *    `[totalAudioTokensSoFar, hiddenSize]` cumulative, OR
++     *    `[chunkAudioTokens, hiddenSize]` per-chunk — either is supported via
++     *    audioIndexBase. Per-chunk + base=cumulative-so-far is the recommended
++     *    call pattern: it avoids the caller having to grow a single tensor.
++     *
++     * @param context           Inference context that has been used for prior
++     *                          chunks. tokenIds[0] is extended in place.
++     * @param audioEmbedsDelta  Audio embedding rows visible to the kernel for
++     *                          this call. With audioIndexBase==N, the kernel
++     *                          reads row indices in [N, N + tokenSliceDelta's
++     *                          audio-token count). Must be device FP16.
++     * @param audioIndexBase    Number of audio tokens consumed by prior chunks
++     *                          in this session (cumulative).
++     * @param tokenSliceDelta   New token IDs for this chunk (the audio-pad /
++     *                          audio-eos / text suffix slice). Appended to
++     *                          context.tokenIds[0].
++     * @param stream            CUDA stream (must match context.stream).
++     * @return True on success, false on prefill failure.
++     */
++    bool appendPrefillEmbeds(SpecDecodeInferenceContext& context, Tensor const& audioEmbedsDelta,
++        int32_t audioIndexBase, std::vector<int32_t> const& tokenSliceDelta, cudaStream_t stream);
++
++    /*!
++     * @brief Per-lane streaming-ASR bookkeeping for the batched append-prefill
++     *        path. Modeled after PerBatchTalkerState
++     *        (qwen3OmniTTSRuntime.h:398-409): one instance per concurrent ASR
++     *        session occupying a batch slot/lane. Owned by the product-level
++     *        micro-batch scheduler (qwen3-edgellm-jetson worker), NOT by this
++     *        runtime; appendPrefillEmbedsBatched only writes appendStatus /
++     *        currentKvLen back into it as a convenience. The remaining fields
++     *        (emitted cursors, stream channel) are carried for the scheduler's
++     *        per-session decode/emit loop and are not consumed by the prefill
++     *        call itself.
++     *
++     * NOTE: In the single-context + activeBatchSize=N model, every lane shares
++     * ONE SpecDecodeInferenceContext (per-lane data lives in that context's
++     * [N] structures: tokenIds[b], effectivePrefillLengths[b]). The `laneIndex`
++     * field identifies which row b of the shared context this session occupies;
++     * `context` points at the (shared) context the lane belongs to.
++     */
++    struct PerBatchAsrState
++    {
++        int32_t sessionId{-1};                  //!< Caller-assigned stream/session identifier.
++        SpecDecodeInferenceContext* context{};  //!< Shared context this lane belongs to (activeBatchSize=N).
++        int32_t laneIndex{0};                   //!< Row b of the shared [N] context structures.
++        int32_t audioIndexBase{0};              //!< Cumulative audio tokens consumed by prior chunks.
++        int32_t chunkLen{0};                    //!< Token slice length staged for the most recent chunk.
++        int32_t currentKvLen{0};                //!< KV length snapshot read at entry of the most recent append.
++        bool finished{false};                   //!< True once this session's decode reached EOS / final.
++        AppendPrefillStatus appendStatus{AppendPrefillStatus::kOk}; //!< Per-lane status of the last append.
++        int32_t emittedTokenCursor{0};          //!< Count of decoded tokens already emitted to the caller.
++        int32_t emittedTextCursor{0};           //!< Byte/char offset of partial text already emitted.
++        std::shared_ptr<StreamChannel> streamChannel; //!< Per-slot streaming sink (StreamChannel is per-slot).
++    };
++
++    /*!
++     * @brief Batched variant of appendPrefillEmbeds: append one chunk of
++     *        audio-bearing prefill embeddings for N concurrent ASR lanes in a
++     *        single executePrefillStep call (Phase D-1a, spec §3).
++     *
++     * SINGLE-CONTEXT MODEL. One SpecDecodeInferenceContext carries
++     * activeBatchSize == N lanes; per-lane data lives in that context's [N]
++     * structures (context.tokenIds[b], context.effectivePrefillLengths[b]).
++     * This is the SAME model the official batched normal-prefill path uses
++     * (runBaseModelPrefill, llmInferenceSpecDecodeRuntime.cpp:1183-1224):
++     * a single `context.activeBatchSize` drives [N,...] reshapes of the runtime
++     * member tensors, and per-lane lengths/ids are read from the context's [N]
++     * vectors. We do NOT take N independent contexts — that would mean N copies
++     * of activation state and cannot be executed by a single executePrefillStep.
++     *
++     * Packing contract (mirrors runBaseModelPrefill:1187-1223):
++     *  - N = context.activeBatchSize; maxChunkLen = max over lanes of chunk
++     *    length (== max_element(context.effectivePrefillLengths), the same
++     *    `inputIdsLength` the normal path computes at :1187-1188).
++     *  - Token ids staged as [N, maxChunkLen] in pinned host memory, padded
++     *    with 0; padding is excluded from the engine's last-token selection by
++     *    per-lane context lengths (:1211-1216).
++     *  - Embeddings staged as [N, maxChunkLen, H]; logits bound as [N, vocab].
++     *  - contextLengths[b] = chunkLen[b] (the per-chunk effective prefill
++     *    length, matching the single-lane contract — engine adds the live KV
++     *    start index internally, llmEngineRunner.cpp:1247-1264).
++     *  - The N per-lane audioEmbedsDeltas are concatenated row-wise into one
++     *    flat audio-embeds buffer because the multimodal kernel indexes a
++     *    single audioEmbeds tensor globally (embeddingKernels.cu:414). Lane b's
++     *    multimodal indices are biased by (concatRowBase[b] + audioIndexBases[b]).
++     *
++     * The old single-lane appendPrefillEmbeds is retained as an N=1 wrapper
++     * (sets context.activeBatchSize=1, builds 1-element vectors, delegates here).
++     *
++     * @param context           Single shared context with activeBatchSize == N.
++     *                           Lane b's accumulated token list is context.tokenIds[b];
++     *                           the same context object must be reused across a
++     *                           session's chunks (tokenIds[b] extended in place).
++     * @param audioEmbedsDeltas N device-FP16 audio-embedding tensors, one per
++     *                          lane, [audioRows_b, H]. Concatenated internally.
++     *                          size() must equal context.activeBatchSize.
++     * @param audioIndexBases   N cumulative audio-token counts (one per lane).
++     * @param tokenSliceDeltas  N token-id slices for this chunk (one per lane).
++     *                          Appended to context.tokenIds[b].
++     * @param stream            CUDA stream (must match the context's stream).
++     * @return True if every lane's append succeeded; false on any per-lane
++     *         capacity refusal or engine prefill failure (mLastAppendStatus and
++     *         mLastObservedKvLength reflect the FIRST failing lane).
++     */
++    bool appendPrefillEmbedsBatched(SpecDecodeInferenceContext& context,
++        std::vector<Tensor const*> const& audioEmbedsDeltas, std::vector<int32_t> const& audioIndexBases,
++        std::vector<std::vector<int32_t>> const& tokenSliceDeltas, cudaStream_t stream);
++
+     //! Get LLM prefill stage metrics
+     metrics::LLMPrefillMetrics const& getPrefillMetrics() const noexcept
+     {
+@@ -282,6 +530,56 @@ public:
+         return mLastInputTokenIds;
+     }
+ 
++    //! @brief Test-only accessor: read-only view of the most recent prefill
++    //! logits binding. Used by the M1 acceptance test to bit-exact compare
++    //! single-chunk vs split-chunk paths. Not part of the production API —
++    //! production callers receive tokens via handleRequest, not raw logits.
++    rt::Tensor const& getLogitsForTesting() const noexcept
++    {
++        return mLogitsOutput;
++    }
++
++    //! @brief Test-only accessor: tokenizer pointer used by the runtime. The
++    //! M3.6 empirical-LCS spike needs to encode the request prompt prefix /
++    //! suffix outside handleRequest to drive chunked prefill manually.
++    //! Production callers should hand text to handleRequest instead.
++    tokenizer::Tokenizer* getTokenizerForTesting() const noexcept
++    {
++        return mTokenizer.get();
++    }
++
++    //! @brief Test-only accessor: audio runner pointer used by the runtime.
++    //! Returns nullptr if no audio runner is loaded. The M3.6 spike calls
++    //! encodeMelChunk through this handle (after dynamic_cast to the concrete
++    //! Qwen3OmniAudioRunner) so the runtime's MRope-init issued in
++    //! beginAsrSession is the one driving per-chunk encoding.
++    //! Production callers should not bypass handleRequest.
++    MultimodalRunner* getAudioRunnerForTesting() const noexcept
++    {
++        return mAudioRunner.get();
++    }
++
++    //! @brief Test-only post-prefill decode driver for the M3.6 empirical-LCS
++    //! spike. Preconditions:
++    //!   - The caller has just finished its last appendPrefillEmbeds call for
++    //!     this session. mLogitsOutput holds the logits over the LAST prefill
++    //!     token (i.e., the next token to sample).
++    //!   - context.activeBatchSize == 1, no draft model, no streaming/cancel
++    //!     wiring is attached.
++    //!
++    //! Behavior: greedy-samples the first generated token from mLogitsOutput,
++    //! appends it to context.tokenIds[0], then loops runVanillaDecoding until
++    //! EOS or until @p maxNewTokens additional generated tokens have been
++    //! produced (inclusive of the first sampled token). Returns the list of
++    //! GENERATED token IDs (not the prefill tokens) in @p outGeneratedTokens.
++    //!
++    //! This duplicates the post-prefill loop of handleRequest in a stripped
++    //! form (no spec-decode, no streaming, no eviction). It exists so the
++    //! M3.6 spike can compare chunked-prefill text quality without touching
++    //! the production handleRequest path.
++    bool decodeAfterChunkedPrefillForTesting(SpecDecodeInferenceContext& context, int32_t maxNewTokens,
++        std::vector<int32_t>& outGeneratedTokens, cudaStream_t stream);
++
+     //! @brief Check if draft model is loaded and spec-decode is available
+     bool hasDraftModel() const noexcept
+     {
+@@ -289,10 +587,14 @@ public:
+     }
+ 
+ private:
+-    //! @brief Common initialization logic shared between both constructors
++    //! @brief Common initialization logic shared between all constructors
++    //! @param sharedBaseEngine Optional pre-deserialized base engine (ASR slot-pool, D1). When non-null, the
++    //! base LLMEngineRunner is built via the shared-engine overload instead of deserializing a new engine.
++    //! Only supported in vanilla mode (draftingConfig must be nullopt when sharedBaseEngine is provided).
+     void initializeCommon(std::string const& engineDir, std::string const& multimodalEngineDir,
+         std::unordered_map<std::string, std::string> const& loraWeightsMap,
+-        std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream);
++        std::optional<EagleDraftingConfig> const& draftingConfig, cudaStream_t stream,
++        std::shared_ptr<nvinfer1::ICudaEngine> sharedBaseEngine = nullptr);
+ 
+     rt::Tensor mSharedExecContextMemory{};              //!< Shared device memory for all execution contexts
+     int32_t mMaxRuntimeBatchSize{1};                    //!< Maximum runtime batch size
+@@ -364,6 +666,19 @@ private:
+     rt::Tensor mHostAcceptedTokenIds;    //!< Host pinned memory for accepted token IDs
+     rt::Tensor mHostReuseKVCacheLengths; //!< Host pinned memory for reuse KV cache lengths
+ 
++    //! @brief Pinned host scratch for D2H copy of the live KV cache lengths
++    //!        tensor — populated at the entry of appendPrefillEmbeds so the
++    //!        capacity check can run synchronously with respect to in-flight
++    //!        prefill commits.
++    rt::Tensor mHostKvLengthSnapshot{};
++
++    //! @brief Status of the most recent appendPrefillEmbeds call.
++    AppendPrefillStatus mLastAppendStatus{AppendPrefillStatus::kOk};
++
++    //! @brief Snapshot of live KV cache length observed by the most recent
++    //!        appendPrefillEmbeds call (batch slot 0). 0 if never called.
++    int32_t mLastObservedKvLength{0};
++
+     // [7] Multimodal support tensors for audio/image token indexing
+     rt::Tensor mMultimodalIndices; //!< Multimodal indices tensor [batchSize, seqLen] for audio/image embeddings
+ 
+@@ -426,8 +741,23 @@ private:
+ 
+     // Consume batched input ids and the hash table of system prompt KVCache, produce the padded input ids and input
+     // lengths. Instantiate the KVCache from the hash table if the system prompt has been cached.
++    //
++    // OneShot variant: full setup for a fresh request (LoRA switch, reuseKVCacheLengths
++    // init, system-prompt cache restore, tokenIds (re)seed, cache-manager reset).
++    // Use this on session start / single-request handleRequest path.
+     //! @throws std::runtime_error if system prompt is malformed
+-    bool setUpForPrefillExecution(SpecDecodeInferenceContext& context);
++    bool setUpForPrefillExecutionOneShot(SpecDecodeInferenceContext& context);
++
++    // Per-chunk variant for streaming/chunked prefill (M1, streaming ASR).
++    // Only performs the BOTH-classified work: NVTX scope, activeBatchSize fetch,
++    // engine-max validation against context.effectivePrefillLengths (per-chunk slice
++    // length). All one-shot mutations (LoRA, KV-restore, tokenIds.clear,
++    // resetForNewSequences) are skipped. Caller must have already set
++    // context.effectivePrefillLengths[i] to this chunk's token-slice length, and must
++    // not have reset cache lengths between chunks (engine derives kvcache_start_index
++    // from live cache state — see design doc §10c-real).
++    //! @throws std::runtime_error if a CUDA error occurs
++    bool setUpForPrefillExecutionForChunk(SpecDecodeInferenceContext& context);
+ 
+     // Batch eviction support
+     //! @brief Perform batch eviction
