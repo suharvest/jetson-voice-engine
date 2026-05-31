@@ -21,4 +21,16 @@ artifacts/
 !docs/audio-evidence/
 !docs/audio-evidence/*.wav
 models/
+# Engine-build tooling lives under models/ (per-model build scripts). Track the
+# source tree; large artifacts inside are still ignored by the *.engine/*.onnx/etc rules above.
+!models/
+!models/**/
+!models/**/*.py
+!models/**/*.sh
+!models/**/*.cu
+!models/**/*.txt
+!models/**/*.json
+!models/**/*.patch
+!models/**/*.html
+!models/**/*.md
 engines/
