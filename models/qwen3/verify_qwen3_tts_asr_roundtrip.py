@@ -136,14 +136,14 @@ import sys
 import time
 from pathlib import Path
 
-app_dir = Path('/opt/speech/app')
+app_dir = Path('/opt/speech/server')
 sys.path.insert(0, str(app_dir))
 os.chdir(app_dir)
 os.environ.setdefault('MODEL_DIR', '/opt/models')
 os.environ.setdefault('LANGUAGE_MODE', 'zh_en')
 os.environ.setdefault('ASR_BACKEND', 'paraformer_trt')
 
-from app.core.asr_backend import create_asr_backend
+from server.core.asr_backend import create_asr_backend
 
 backend = create_asr_backend('paraformer_trt')
 t0 = time.time()

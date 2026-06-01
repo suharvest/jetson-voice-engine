@@ -49,7 +49,7 @@ from typing import Optional
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from app.core import engine_resolver  # noqa: E402
+from server.core import engine_resolver  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("build_engine_bundle")

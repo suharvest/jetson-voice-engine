@@ -13,7 +13,7 @@ import sys, os, time, wave, numpy as np
 MODEL_DIR = os.environ.get("PARAFORMER_MODEL_DIR", "/opt/models/paraformer-streaming")
 ENGINE_DIR = os.path.join(MODEL_DIR, "engines")
 sys.path.insert(0, "/opt/speech")
-sys.path.insert(0, "/opt/speech/app")
+sys.path.insert(0, "/opt/speech/server")
 
 os.environ.setdefault("PARAFORMER_MODEL_DIR", MODEL_DIR)
 os.environ.setdefault("PARAFORMER_ENC_ENGINE", os.path.join(ENGINE_DIR, "paraformer_encoder_dp4_400.plan"))

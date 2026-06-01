@@ -208,7 +208,7 @@ EDGE_LLM_BASE=~/project/tensorrt-edge-llm \
 EDGE_LLM_BUILD_DIR=build \
 EDGE_LLM_TTS_WORKER_BIN=~/project/tensorrt-edge-llm/build/examples/omni/qwen3_tts_worker \
 EDGELLM_PLUGIN_PATH=~/project/tensorrt-edge-llm/build/libNvInfer_edgellm_plugin.so \
-uvicorn app.main:app --host 0.0.0.0 --port 8621
+uvicorn server.main:app --host 0.0.0.0 --port 8621
 ```
 
 For Docker/compose deployment, pass the same profile and artifact env vars into
