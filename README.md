@@ -207,6 +207,10 @@ bash scripts/verify_reproduction.sh \
 
 ## Qwen3 voice clone
 
+> **Note:** voice cloning is the **base Qwen3-TTS** path only. **Qwen3-CustomVoice**
+> (`customvoice-v071`) does **not** support voice cloning — it serves a fixed set
+> of built-in speakers. Use the base Qwen3-TTS engines for `/tts/clone/stream`.
+
 Pre-extract the speaker embedding on a workstation (librosa + onnxruntime)
 once per voice and pass the base64 to the worker. Don't run the speaker encoder
 per request.
