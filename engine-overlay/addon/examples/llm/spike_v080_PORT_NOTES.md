@@ -34,5 +34,30 @@ All CONFIRMED except one correction:
 - One-shot byte-identity: **code-inspection proof only** (see #3) — no v0.8.0 qwen3-asr TRT engine exists on the box (only Python modeling templates in `tensorrt_edgellm/models/qwen3_asr/`). The runtime R2 single-vs-split argmax/logit-parity test is **Phase 3b**, needing a built v0.8.0 ASR engine + the deferred spike drivers (`spike_v080_m1_append_prefill.cpp` / `spike_v080_m2_session_lifecycle.cpp`).
 - Next dependency: **Phase 4** (R1 per-lane `HybridCacheManager` reset + `SessionLaneManager`) for concurrent-session/TTS-slot co-residency, and **Phase 3b** (engine-backed runtime validation).
 
-## Spike files (deferred)
-`spike_v080_m1_append_prefill.cpp` (R2 one-chunk-vs-split parity) and `spike_v080_m2_session_lifecycle.cpp` (begin/append/end + KV-overflow refusal) will be written alongside Phase 3 when hooks #3/#4/#6 land — porting them now yields only TODO-stubs against non-existent APIs. The old spikes to port FROM: `spike_m1_append_prefill_embeds.cpp`, `spike_m2_session_lifecycle.cpp` (this dir).
+## Spike files — LANDED + RUN (Phase 3b, 2026-06-09)
+`spike_v080_m1_append_prefill.cpp` (R2/R3) and `spike_v080_m2_session_lifecycle.cpp`
+(lifecycle + KV-overflow) are written, registered in `examples/llm/CMakeLists.txt`, and
+tracked as patch `engine-overlay/patches/v080-0003-asr-streaming-spikes.patch`. They drive
+the new `rt::AsrStreamingSessionRuntime` over a real `LLMInferenceRuntime` using text token
+IDs (no mel) to isolate the prefill-chunk seam. Needed `loadEdgellmPluginLib()` in `main()`
+to register `AttentionPlugin` before deserialize.
+
+## Phase 3b empirical result (full evidence: `docs/plans/v080-phase3b-acceptance-results.md`)
+Built a fresh v0.8.0 Qwen3-ASR-0.6B engine (the May-1 ONNX config lacked the now-required
+`kv_cache_dtype` → had to re-export; `hf-xet` uninstalled to dodge a cas-bridge stall).
+Engine loads in official `llm_inference` (INFER_EXIT=0, EOS) → genuine v0.8.0 compat.
+Engine md5: llm `b133dff24c8aa96ac1679b95e2f97153`, audio `5c877cfe58b8fcb7914679c6fe274f90`.
+- **R2: byte-identical (max-abs logit diff = 0.0, argmax MATCH) for every split whose final
+  chunk is ≥ 2 tokens** (N=40/64/100, splits 1..N-2). KV continuity (R3) holds.
+- **m2 PASS**: session-pair teardown byte-identical, KV-overflow refused without silent
+  advance, append-after-end refused.
+- **R4** structurally verified in the compiled binary (`restoreKVCache` now gated inside
+  `if(matchIds)`; mismatch → fresh prefill).
+- ⚠️ **One regression for Phase 4**: a **1-token FINAL prefill chunk** diverges (logit diff
+  ~20, argmax can flip; KV length still correct). Root cause points at the last-token gather
+  / `selectTokenIndices` using the per-chunk length (=1) instead of the accumulated position;
+  the one-shot path never hits `inputIdsLength==1` so it was invisible to code inspection.
+  Fix: gather at the accumulated sequence position when chunkLen==1, or never emit a 1-token
+  final chunk. Re-run `spike_v080_m1_append_prefill $ENG N N-1` to confirm.
+
+The old spikes ported FROM: `spike_m1_append_prefill_embeds.cpp`, `spike_m2_session_lifecycle.cpp` (this dir).
