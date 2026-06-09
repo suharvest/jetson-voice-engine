@@ -111,3 +111,5 @@ recipe, (3) split-projection, (4) langId/9-row plumbing + kernel layout.
 The `--wrap` toolchain fix is necessary and correct (enables audio gen at all) but does
 NOT make output intelligible. Remaining for TTS accuracy: localize the Talker prefill
 numeric corruption (options A/B/C above) — a model/export-level workstream.
+
+> **⚠️ SUPERSEDED 2026-06-10** — this doc's "zh broken / en garbled" verdict was a FALSE NEGATIVE (broken Qwen3-ASR harness [known-good sanity failed 亲戚≠天气] + apply_chat_template=false). Authoritative result: **en+zh CORRECT, roundtrip byte-exact** — see v080-0009 CORRECTED doc + main-thread independent transcribe (q_zh24/m5zh → 今天天气真不错; bad-artifact control → empty). qwen3-tts CustomVoice is accuracy-GREEN.
