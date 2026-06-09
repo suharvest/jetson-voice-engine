@@ -117,3 +117,39 @@ Full evidence: `docs/plans/v080-phase5a-acceptance-results.md`. Summary:
   chunks through the batcher; worker/server-loop wiring; live ASR+TTS lane co-residency. **TTS track
   is separate** (Talker-batched + sequential CodePredictor/Code2Wav, replacing patch-0004's runtime
   replication with one `maxBatchSize=N` Talker runtime).
+
+## TTS Phase A — patch 0005 (CustomVoice 9-row language conditioning) LANDED onto v0.8.0 (patch `v080-0007`, 2026-06-10)
+Full evidence: `docs/plans/v080-tts-phaseA-acceptance-results.md`. Summary:
+- **Patch 0005 LANDED on v0.8.0** as `v080-0007-customvoice-language-conditioning.patch`
+  (md5 `74b31e98e8f90c758bc5a222f55c187e`, 7 files). v0.8.0's `talkerMLPKernels.{cu,h}` is the
+  pristine 8-row baseline → patch-0005's kernel/header/example hunks **applied clean (3-way)**; the
+  runtime wiring (`qwen3OmniTTSRuntime.{cpp,h}`) + the export hunk were hand-ported (v0.8.0 moved TTS
+  export from the deleted `experimental/llm_loader/export_all_cli.py` to
+  `tensorrt_edgellm/scripts/export.py`, which already copied `codec_think_id` but not the
+  `codec_language_id` map). Round-trip `git apply --check` OK + byte-identical to the on-box edits.
+- **Two pre-existing v0.8.0 link hazards fixed for the TTS example** (both in v080-0007 /
+  build-procedure): (1) the omni example's `CMakeLists.txt` was missing the
+  `trt_edgellm_cutedsl_cudart_shim` whole-archive link the LLM examples have (→ link-time
+  `undefined reference to cudaKernelSetAttributeForDevice`); (2) CUDA separable-compilation stale
+  device-link — after the `talkerMLPKernels.cu` change the fatbin hash flips and
+  `libexampleUtils.a`'s pre-device-linked blob still demands the old hash → rebuild `exampleUtils` +
+  `edgellmKernels` to regenerate their `cmake_device_link.o`.
+- **Coherent v0.8.0 engines re-exported** (the on-box TTS engines were 0.7.0/0.7.1, no
+  `kv_cache_dtype`): `tensorrt-edgellm-export Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` on the aarch64
+  `.venv-x86export`. Talker `471d36d8…` + CodePredictor `baff21ea…` built; talker config now carries
+  `edgellm_version 0.8.0` + `kv_cache_dtype fp16` + the **`codec_language_id` map**
+  (chinese→2055, english→2050, … 12 langs) — proving the export.py port. Code2Wav ONNX needed
+  `device="cpu"` (default forces `.to(cuda)`, rejected by torch+cu130 on the box's older driver).
+- **9-row language path PROVEN at the Talker level** (engines load coherently, `qwen3_tts_inference`
+  runs): zh→`codec_id=2055`/`prefixRows=9`/`speakerId=3065`; en→`codec_id=2050`/`prefixRows=9`/
+  `speakerId=3061`. The ported langId resolution + 9-row kernel dispatch fire correctly per language.
+- **Full audio (energy + ASR-roundtrip) BLOCKED on two device-toolchain issues, NOT the source**:
+  (A) `invokeTalkerMLP` CuTe DSL GEMM throws `invalid device function` at launch — the box's
+  CUDA-12.6 libcudart lacks `cudaKernelSetAttributeForDevice` (the artifact was built against
+  12.6.68; the link shim stubs the symbol but the device-side kernel registration no-ops → invalid
+  launch). LLM/ASR path doesn't use the Talker CuTe GEMM, so the ASR track never hit this. Fix:
+  rebuild the CuTe DSL artifact for the box's exact CUDA 12.6.x (`kernelSrcs/build_cutedsl.py`) OR
+  bump CUDA to ≥12.6.68. (B) Code2Wav TensorRT engine build starves on GPU memory (tactics want
+  11–17 GB, only ~8 GB free) — needs a quiet GPU. The two LLM engines + all ONNX are preserved.
+- **Spec note**: per §6 v2, Phase A = N=1 single-session correctness via the native single-request
+  path (patch-0004 slot-pool NOT needed; Talker native batch = Phase 5b).
