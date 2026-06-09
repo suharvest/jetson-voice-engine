@@ -3,12 +3,15 @@
 Status: RUN 2026-06-09 on orin-nx against a freshly-built v0.8.0 Qwen3-ASR-0.6B engine.
 Gates the Phase 2-3 hooks (patches v080-0001 / v080-0002) that until now were only
 compile-proven + code-inspection-proven byte-identical. This is the de-risk gate before Phase 4.
+**UPDATE 2026-06-10: the lone 1-token-final-chunk regression is FIXED (patch `v080-0004`)
+and re-verified empirically — R2 parity is now FULLY green for all final-chunk sizes. See §6.**
 
-Verdict: **R2 chunk-prefill parity HOLDS (byte-identical) for every split whose final chunk
-is ≥ 2 tokens.** A single regression is isolated: a **1-token FINAL prefill chunk** produces
-wrong sampled logits (and can flip argmax). Lifecycle / KV-overflow / R3 / R4 all PASS.
-Phase 4 MUST fix the 1-token-final-chunk path or constrain the chunker to never emit a
-final chunk of length 1.
+Verdict: **R2 chunk-prefill parity HOLDS (byte-identical, diff 0.0) for EVERY split — both
+final chunk ≥ 2 tokens AND, after patch `v080-0004`, final chunk == 1 token.** The single
+isolated regression (a 1-token final/intermediate prefill chunk mis-sampling, argmax flip,
+max-abs-diff ~2e+01) was root-caused to the AttentionPlugin's shape-only prefill-vs-decode
+deduction and fixed by a runtime single-token append-prefill guard (§6). Lifecycle /
+KV-overflow / R3 / R4 all PASS. **Phase 4 is UNBLOCKED.**
 
 ---
 
@@ -95,7 +98,7 @@ N=40 split=38  (final 2 tok)  argmax MATCH  diff=0.000000e+00  PASS
 ```
 => **R2 byte-identical (diff exactly 0.0) and R3 KV continuous for every final-chunk ≥ 2 tokens.**
 
-### ⚠️ Regression — 1-token FINAL prefill chunk diverges
+### ⚠️ Regression — 1-token FINAL prefill chunk diverges  →  ✅ FIXED in §6 (patch `v080-0004`, 2026-06-10)
 
 ```
 N=64 split=63 (final 1 tok)  argmax A=11  B=11   MATCH      diff=2.002344e+01  FAIL
@@ -145,14 +148,11 @@ pick up stale KV.
 | KV-overflow refusal (no silent advance) | ✅ |
 | Lifecycle session-pair byte-identity + clean teardown | ✅ |
 | R4 sys-prompt fallback (validation before restore) | ✅ code-verified-in-binary |
-| **R2 with 1-token FINAL chunk** | ❌ **diverges (argmax can flip) — Phase 4 must fix** |
+| **R2 with 1-token FINAL chunk** | ✅ **FIXED (patch `v080-0004`) — argmax MATCH + diff 0.0; see §6** |
 
 **The Phase 2-3 chunk-prefill refactor is empirically non-regressing for multi-token chunks
-(byte-identical to one-shot). The lone failure is a length-1 final prefill chunk.** Phase 4
-fix: make `runBaseModelPrefillChunk`'s last-token logit gather use the accumulated sequence
-position (not the chunk length) when `inputIdsLength==1`, OR have the streaming chunker
-guarantee the final chunk is never a single token (merge a trailing 1-token chunk into its
-predecessor). Re-run m1 at `split=N-1` to confirm the fix.
+(byte-identical to one-shot). The lone failure was a length-1 final prefill chunk — now FIXED
+(patch `v080-0004`, §6).**
 
 ## 5. Reproduce
 
@@ -162,6 +162,72 @@ cd ~/project/edgellm-v080
 cmake --build build --target spike_v080_m1_append_prefill spike_v080_m2_session_lifecycle
 ENG=$HOME/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines-v080/llm
 ./build/examples/llm/spike_v080_m1_append_prefill  $ENG 40 17   # PASS (diff 0.0)
-./build/examples/llm/spike_v080_m1_append_prefill  $ENG 40 39   # FAIL (1-tok final chunk)
+./build/examples/llm/spike_v080_m1_append_prefill  $ENG 40 39   # PASS post-v080-0004 (was FAIL: 1-tok final)
 ./build/examples/llm/spike_v080_m2_session_lifecycle $ENG       # PASS x3
 ```
+
+## 6. Fix — single-token append-prefill guard (patch `v080-0004`, 2026-06-10)
+
+### Root cause (file:line)
+Not in `runBaseModelPrefillChunk`. `deduceModeVanilla` in
+`cpp/plugins/attentionPlugin/attentionPlugin.cpp:93-110` distinguishes a chunked-prefill step
+from a vanilla-decode step **SOLELY** by `qInputTensor.getShape()[1]` (runtime Q seq-len):
+
+```
+non-empty kvcache_start_index && qSeqLen >  1  -> kCHUNKED_PREFILL
+non-empty kvcache_start_index && qSeqLen == 1  -> kVANILLA_DECODING
+```
+
+A FINAL (or intermediate) prefill chunk of exactly **1 token** landing on a **non-empty KV
+cache** therefore has `qSeqLen==1` + non-empty `kvcache_start_index` → misrouted to the DECODE
+path. In decode, RoPE position is derived from `contextLength`:
+`launchApplyRopeWriteKV(..., contextLengthTensor, ...)` → in
+`cpp/kernels/posEncoding/applyRopeWriteKV.cu:150` `posStartId = kvCacheEndLens[b] - qSeqLen`.
+The chunk path sets `contextLength = chunkLen = 1`, so `posStartId = 1 - 1 = 0`
+(**chunk-relative**) instead of the absolute `priorKV + 0`; and the XQA decoder attends over
+`sequence_lengths = contextLength = 1` instead of the full committed KV. That is the ~2e+01
+logit error (argmax flip). The chunked-prefill branch instead computes absolute
+`kvCacheEndIdxs = kvCacheStartIdx + contextLength` and FMHA attends the full KV via
+`cuKVSeqLens` — which is why multi-token chunks were byte-identical. The gather index
+(`selectTokenIndices = hostContextLengths-1 = 0`) is correct for chunkLen==1 and is NOT the
+bug; the RoPE/attention **position binding** is. The plugin boundary has no shape-distinct
+signal: a genuine decode and a 1-token prefill-append are both `qSeqLen==1` with non-empty KV.
+
+### The fix (why correct; one-shot byte-identical)
+Enforce the invariant in the runtime, not the plugin/engine ABI:
+`AsrStreamingSessionRuntime::appendChunkImpl` carries the trailing token of a non-final
+**text** chunk forward into the next chunk, so every step after the first (and the final step)
+packs ≥ 2 tokens and stays on the chunked-prefill path. The first chunk runs on an empty KV
+cache (`kNORMAL_PREFILL`, valid at length 1) and is never deferred. Carry-over is text-only
+(an audio chunk binds its own per-chunk audio embeddings and is never length 1 in practice);
+an audio 1-token step on non-empty KV is hard-refused. Carry state commits only after the
+prefill succeeds (refused appends leave it intact). This covers BOTH a 1-token final chunk
+(wrong sampled token) and a 1-token intermediate chunk (wrong RoPE position baked into KV).
+**The one-shot path (`runBaseModelPrefill → runBaseModelPrefillChunk(fullSpans)`) is NOT
+touched** — `appendChunkImpl` is the only caller affected; Path A (one-shot-equivalent) logits
+are unchanged (argmax 487/13/11/13 identical to §3). The m1 R3 assertion is relaxed to accept
+the coalesced intermediate boundary (`kvB1 ∈ {splitAt-1, splitAt}`; final `kvB2 == totalTokens`
+and strict monotonicity unchanged).
+
+### Empirical gate (raw, orin-nx, engines-v080)
+
+1-token FINAL splits (was FAIL diff ~1.9–2.3e+01, argmax could flip):
+```
+N=30 split=29  R3 B_kv1=28 B_kv2=30 PASS  R2 argmax A=487 B=487 MATCH  diff=0.000000e+00  PASS
+N=40 split=39  R3 B_kv1=38 B_kv2=40 PASS  R2 argmax A=13  B=13  MATCH  diff=0.000000e+00  PASS
+N=64 split=63  R3 B_kv1=62 B_kv2=64 PASS  R2 argmax A=11  B=11  MATCH  diff=0.000000e+00  PASS
+N=100 split=99 R3 B_kv1=98 B_kv2=100 PASS R2 argmax A=13  B=13  MATCH  diff=0.000000e+00  PASS
+```
+
+Multi-token splits (no regression):
+```
+N=64 split=32  diff=0.000000e+00 PASS   N=40 split=17  diff=0.000000e+00 PASS
+N=100 split=50 diff=0.000000e+00 PASS   N=64 split=62  diff=0.000000e+00 PASS
+N=40 split=38  diff=0.000000e+00 PASS
+```
+
+m2 lifecycle: Scenario 1 (session-pair, max-abs diff 0.0) PASS; Scenario 2 (KV-overflow
+refusal, kv 99→199, call2 refused no-advance, recover) PASS; Scenario 3 (append-after-end
+refused) PASS → **M2 ACCEPTANCE: PASS**.
+
+**Verdict: R2 chunk-prefill parity is FULLY green for ALL final-chunk sizes. Phase 4 unblocked.**
