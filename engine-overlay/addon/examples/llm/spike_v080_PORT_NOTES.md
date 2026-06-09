@@ -82,3 +82,38 @@ Full evidence: `docs/plans/v080-phase4-acceptance-results.md`. Summary:
   is diff 0.0. The ⚠️ Phase 3b "1-token FINAL" caveat above is therefore CLOSED by v080-0004.
 - **Phase 5 (batch-lane concurrency over a maxBatchSize=2 engine) is UNBLOCKED** — the R1 isolation
   mechanism it depends on is proven.
+
+## Phase 5a — batch-lane N=2 concurrency + isolation gate (LANDED 2026-06-10, patch `v080-0006`)
+Full evidence: `docs/plans/v080-phase5a-acceptance-results.md`. Summary:
+- **maxBatchSize=2 engine** built from the SAME on-box `onnx-v080/llm` (no re-export — `--maxBatchSize`
+  is a `llm_build` flag) → `engines-v080-b2/llm/llm.engine` md5 `4122dfcc666fe82b8b0cae4b93c97b70`,
+  config `"max_batch_size": 2`. The maxBatch=1 engine (`b133dff…`) is untouched.
+- **New net-new layer `AsrContinuousBatcher`** (`cpp/runtime/asrContinuousBatcher.{h,cpp}`, GLOB'd
+  into `edgellmCore`): owns ONE shared `DecodingInferenceContext` (row i == KV lane i == MRope row
+  i) over `SessionLaneManager`; `admit`/`enqueueChunk`/`tick`/`evict`. `tick()` packs ONLY the lanes
+  with a pending chunk into ONE batched `appendPrefillChunk` (reuses `runBaseModelPrefillChunk`
+  across the active batch), samples per-lane on final, evicts via per-lane `resetSessionLane`. Idle
+  lanes are never packed (empty span → `selectTokenIndices=-1` corrupts the lane). Batch-wide
+  single-token guard (refuse iff `max(stepLen)==1 && anyPriorKv` — the AttentionPlugin keys
+  prefill-vs-decode on the batch-wide `qInputTensor.shape[1]`, so mixed `[1,5]` ticks are safe).
+- **Codex design verdict (file:line)**: row<->KV-row<->MRope-row alignment confirmed — no indirection
+  in `runBaseModelPrefillChunk` (`llmInferenceRuntime.cpp:1098-1141`); `StepPreparer::prepare`
+  rowwise (`stepPreparer.cpp:37-59`); `kvcache_start_index` bound `[batch]`
+  (`pipelineIO.cpp:185-190`, `registryBuilder.cpp:59-67`, `llmEngineConfig.cpp:458-481`); RoPE kernel
+  indexes `cosSinCacheBatchIdx=batchIdx` when batch != 1 (`applyRopeWriteKV.cu:161-168`); mode
+  decision batch-wide from `qInputTensor.shape[1]` (`attentionPlugin.cpp:93-109`), per-lane absolute
+  KV-end = `kvCacheStartIdx + runtimeSeqLen` (`utilKernels.cu:54-58`). Idle lanes corrupt
+  (`stepPreparer.cpp:46-53`). `resetLanes` per-lane memset (`hybridCacheManager.cpp:276-298`);
+  non-prefix/lone-survivor lane needs `performBatchEvict`-style compaction
+  (`llmInferenceRuntime.cpp:1610-1685`).
+- **THE N=2 ISOLATION GATE — GREEN.** New `spike_v080_m4_concurrent_lanes.cpp`: two DISTINCT token
+  streams (seeds 1234/9876), solo baseline per session, then concurrent lockstep activeBatchSize=2.
+  Per-lane concurrent-vs-solo **max-abs logit diff = 0.000000e+00** (argmax MATCH) for BOTH lanes,
+  **0 CUDA errors**, across splits 64/32, 64/63 (1-tok-final carry-over), 64/17, 100/50. Zero
+  cross-talk proven byte-identical.
+- **No regression** on the maxBatch=2 engine (single-lane subset): m1 64/63 + 64/32 → argmax MATCH,
+  diff 0.0; m2 → all 3 scenarios PASS. Raising the builder batch dim is accuracy-neutral.
+- **Remaining ASR track**: async (non-lockstep) eviction needs lone-survivor lane compaction; mel
+  chunks through the batcher; worker/server-loop wiring; live ASR+TTS lane co-residency. **TTS track
+  is separate** (Talker-batched + sequential CodePredictor/Code2Wav, replacing patch-0004's runtime
+  replication with one `maxBatchSize=N` Talker runtime).
