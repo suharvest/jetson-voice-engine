@@ -68,3 +68,27 @@ Order: (1) build/ABI fail-fast → (2) ASR R2/R3/R4/KV-overflow → (3) TTS Cust
 | 3 Runtime hooks | R2 single-vs-split argmax/logit; lifecycle reset; KV-overflow refusal; R4 fallback |
 | 4 Cache/scheduler | N=2 lane isolation; ASR/TTS shared-lane reset; 30-burst CUDA gate |
 | 5 Full validation | ALL: ASR corpus, TTS MD5+energy+roundtrip, N=2 TTFA ≤1.5×, gate.py --strict, engine MD5, docker grep |
+
+---
+
+## Baseline Resolution (2026-06-09) — final anchor decision
+
+After ~9 device-capture attempts, the v0.7.1 EDGELLM baseline is anchored as follows:
+
+| Dimension | Anchor | Status |
+|---|---|---|
+| **qwen3-asr streaming** | service e2e (20/20 transcripts + eos2final) + engine MD5 | ✅ captured (server-loop-v7, commit b54dfc8) |
+| **qwen3-tts / CustomVoice** | **engine MD5 + C++ spike numerics** (NOT service e2e) | engine MD5 ✅; spike golden = Phase 1a |
+| **MOSS** | **engine MD5** (+ spike if available) | MD5 ✅; service deferred |
+| **N=2 slot-pool** | deferred to first coherent build | engine-level only |
+| matcha TTS (non-edgellm) | service e2e | ✅ neighbor check |
+
+**Why qwen3-tts is engine/spike-anchored, not service-e2e:** the v0.7.1 qwen3-tts SERVICE never coherently existed on available artifacts — a genuine fork divergence:
+- 0.7.1 trees (Mac `v071/customvoice-product` `kRUNTIME_VERSION=0.7.1`, + box snapshots): CustomVoice + slot-pool, but `handleAudioGeneration` is **3-arg** (no FrameCallback param).
+- 0.7.0 trees (repro-qwen3 w8a16): **4-arg** streaming `handleAudioGeneration(...,frameCallback)`, version 0.7.0, weaker CustomVoice.
+- The deployed `/opt/jv-workers/qwen3_tts_worker` is the OLD `native/edgellm_voice_worker/qwen3_tts_worker.cpp` (calls 4-arg → 0.7.0-only) bundled with 0.7.1 engines → `Model version 0.7.1 != runtime 0.7.0`. The 0.7.1-matching worker is `qwen3_tts_streaming_worker.cpp` (overlay addon, slot-pool, `OVS_TTS_WORKER_CONCURRENCY`).
+- A runnable v0.7.1 qwen3-tts requires building `qwen3_tts_streaming_worker` from the 0.7.1 fork — i.e. it's first cleanly assembled BY the migration. So qwen3-tts service e2e golden is captured against the first coherent build, comparing engine numerics.
+
+**Regression coverage remains solid:** engine MD5 (build determinism) + spike numerics (engine correctness, the targeted migration surface) + ASR service e2e. Only qwen3-tts SERVICE e2e is deferred — and it's unanchorable at v0.7.1 by construction.
+
+**Discipline:** no qwen3-tts migration code merges without its engine-MD5 + spike gates green.
