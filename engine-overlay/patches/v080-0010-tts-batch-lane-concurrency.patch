@@ -1,0 +1,822 @@
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 6020d3d..1fcd535 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -135,11 +135,21 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
+             "Failed to set context memory for CodePredictor engine");
+     }
+ 
+-    // Determine max batch size from engine configs (use the minimum of Talker and CodePredictor)
+-    mMaxBatchSize = std::min(mTalkerLLMConfig.maxSupportedBatchSize, mCodePredictorConfig.maxSupportedBatchSize);
++    // Determine the runtime's BATCH-LANE capacity from the Talker engine alone (spec Â§6 v2, TTS:
++    // Talker batches -> the lane; CodePredictor + Code2Wav are batch=1 / single-sample, run
++    // SEQUENTIALLY per lane). All batched workspaces and the decode CUDA-graph capture are sized
++    // to mMaxBatchSize (== the Talker's maxSupportedBatchSize); the CodePredictor's workspaces are
++    // hardcoded at batch=1 and it is invoked in a per-lane for-loop (see runTalkerGenerationLoop).
++    // Therefore the CodePredictor's batch=1 must NOT clamp the lane count -- the prior
++    // std::min(Talker, CodePredictor) wrongly capped concurrency to 1 and was the reason patch-0004
++    // resorted to per-slot runtime REPLICATION. With a maxBatchSize=N Talker engine, one runtime
++    // serves N concurrent lanes natively. (CodePredictor is required to be >= 1, which it always is.)
++    check::check(mCodePredictorConfig.maxSupportedBatchSize >= 1,
++        "CodePredictor engine must support batch >= 1 (it is invoked batch=1 per lane)");
++    mMaxBatchSize = mTalkerLLMConfig.maxSupportedBatchSize;
+     check::check(mMaxBatchSize >= 1, "maxBatchSize must be >= 1");
+-    LOG_INFO("Max batch size: %d (Talker=%d, CodePredictor=%d)", mMaxBatchSize, mTalkerLLMConfig.maxSupportedBatchSize,
+-        mCodePredictorConfig.maxSupportedBatchSize);
++    LOG_INFO("Max batch size: %d (Talker=%d [lane capacity], CodePredictor=%d [batch=1 per-lane])", mMaxBatchSize,
++        mTalkerLLMConfig.maxSupportedBatchSize, mCodePredictorConfig.maxSupportedBatchSize);
+ 
+     bool const codePredictorWeightsLoaded = loadCodePredictorWeights(codePredictorEngineDir);
+     ELLM_CHECK(codePredictorWeightsLoaded, "Failed to load CodePredictor weights");
+@@ -1145,14 +1155,25 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+     SamplingParams talkerSamplingParams(
+         activeBatchSize, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
+     SamplingParams predictorSamplingParams(1, mTalkerConfig.codebookSize, talkerTemperature, talkerTopK, talkerTopP);
+-    SamplingParams singleSamplingParams(1, mTalkerConfig.talkerVocabSize, talkerTemperature, talkerTopK, talkerTopP);
+-
+-    // Per-batch sequential: tokenize → prepareTalkerInput → prefill → sample first codec token
++    // BATCHED Talker prefill (spec Â§6 v2, TTS): a SINGLE batched prefill across all lanes sets the
++    // engine's active batch size to activeBatchSize, which the batched decode step requires. The prior
++    // implementation prefilled each lane SEPARATELY at batchSize=1 -- each call reset the Talker KV
++    // cache to batch=1 and wrote to row 0, so lane 1 clobbered lane 0 and the engine's active batch
++    // stayed 1 -> the batched decode failed validation ("batchSize shall equal the active batch size
++    // set by the previous prefill stage"). This mirrors the proven Omni path
++    // (handleAudioGenerationFromThinker): stash each lane's prefill embeds to a per-batch slot, assemble
++    // a contiguous padded [BS, maxOutSeqLen, H] buffer, then ONE executeTalkerPrefillStep with per-batch
++    // context lengths. CodePredictor + Code2Wav stay batch=1 / sequential per lane (unchanged).
+     std::vector<PerBatchTalkerState> states(activeBatchSize);
+     std::vector<int64_t> perBatchSeqLens(activeBatchSize);
++    std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr); // TTS path: no trailing-text hiddens.
++    int64_t const maxInputSeqLen = mTalkerLLMConfig.maxSupportedInputLength;
++    int64_t maxOutSeqLen = 0;
+ 
+-    for (int32_t b = 0; b < activeBatchSize; ++b)
+-    {
++    // Phase 1: build each lane's prefill embeds. prepareTalkerInput writes to mTalkerInputEmbeds row 0
++    // (scratch); relocate lanes 1..N-1 to slot (b * maxInputSeqLen) so the next build doesn't clobber
++    // them. Lane 0 is built last and stays in scratch (row 0). (Process 1..N-1 first, then 0.)
++    auto buildOneLane = [&](int32_t b) -> bool {
+         LLMGenerationRequest::Request llmReq;
+         llmReq.messages = requests[b].messages;
+         LLMGenerationRequest::FormattedRequest formatted;
+@@ -1171,27 +1192,81 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+             return false;
+         }
+         perBatchSeqLens[b] = seqLen;
++        maxOutSeqLen = std::max(maxOutSeqLen, seqLen);
++        states[b].rvqCodes.reserve(requests[b].maxAudioLength);
++        return true;
++    };
++
++    int64_t const hiddenSizeLocal = mTalkerConfig.talkerHiddenSize;
++    for (int32_t b = activeBatchSize - 1; b >= 1; --b)
++    {
++        if (!buildOneLane(b))
++            return false;
++        // prepareTalkerInput left this lane's embeds at row 0; stash to slot (b * maxInputSeqLen).
++        __half* const slotPtr
++            = static_cast<__half*>(mTalkerInputEmbeds.rawPointer()) + b * maxInputSeqLen * hiddenSizeLocal;
++        CUDA_CHECK(cudaMemcpyAsync(slotPtr, mTalkerInputEmbeds.rawPointer(),
++            perBatchSeqLens[b] * hiddenSizeLocal * sizeof(__half), cudaMemcpyDeviceToDevice, stream));
++    }
++    if (!buildOneLane(0))
++        return false;
+ 
++    // Phase 2: assemble contiguous padded [BS, maxOutSeqLen, H]. Slot layout: lane 0 at row 0, lane
++    // b>=1 at row (b * maxInputSeqLen). Target: lane b at row (b * maxOutSeqLen). Reverse order avoids
++    // overlap when maxOutSeqLen < maxInputSeqLen.
++    __half* const embedBase = static_cast<__half*>(mTalkerInputEmbeds.rawPointer());
++    for (int32_t b = activeBatchSize - 1; b >= 0; --b)
++    {
++        __half* const srcPtr = embedBase + (b == 0 ? 0 : b * maxInputSeqLen * hiddenSizeLocal);
++        __half* const dstPtr = embedBase + b * maxOutSeqLen * hiddenSizeLocal;
++        if (srcPtr != dstPtr)
+         {
+-            TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
+-            if (!executeTalkerPrefillStep(mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream))
+-            {
+-                LOG_ERROR("Talker prefill failed for batch %d", b);
+-                return false;
+-            }
++            CUDA_CHECK(cudaMemcpyAsync(dstPtr, srcPtr, perBatchSeqLens[b] * hiddenSizeLocal * sizeof(__half),
++                cudaMemcpyDeviceToDevice, stream));
++        }
++        if (perBatchSeqLens[b] < maxOutSeqLen)
++        {
++            CUDA_CHECK(cudaMemsetAsync(dstPtr + perBatchSeqLens[b] * hiddenSizeLocal, 0,
++                (maxOutSeqLen - perBatchSeqLens[b]) * hiddenSizeLocal * sizeof(__half), stream));
+         }
++    }
+ 
+-        kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, mTalkerLogits, mTalkerConfig.talkerVocabSize - 1024,
+-            mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
+-        trt_edgellm::topKtopPSamplingFromLogits(
+-            mTalkerLogits, mTalkerSelectedIndices, singleSamplingParams, mSamplingWorkspace, stream);
+-        CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
+-            sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+-        CUDA_CHECK(cudaStreamSynchronize(stream));
++    // Single batched Talker prefill with per-batch context lengths -> active batch size = activeBatchSize.
++    check::check(mTalkerInputEmbeds.reshape({activeBatchSize, maxOutSeqLen, hiddenSizeLocal}), "Tensor reshape failed");
++    check::check(mTalkerHiddenStatesBuffer.reshape({activeBatchSize, maxOutSeqLen, mTalkerConfig.talkerHiddenSize}),
++        "Tensor reshape failed");
++    {
++        TIME_STAGE(metrics::StageNames::kTALKER_PREFILL, stream);
++        if (!executeTalkerPrefillStep(
++                mTalkerInputEmbeds, mTalkerLogits, mTalkerHiddenStatesBuffer, stream, perBatchSeqLens))
++        {
++            LOG_ERROR("Batched Talker prefill failed");
++            return false;
++        }
++    }
+ 
+-        states[b].codecToken = mHostSelectedTokenIds.dataPointer<int32_t>()[0];
+-        states[b].rvqCodes.reserve(requests[b].maxAudioLength);
+-        LOG_INFO("Batch %d: first codec token: %d", b, states[b].codecToken);
++    // Batched first-token sampling from [BS, vocabSize]. Per-lane logit adjust (seenTokens=0 at frame 0).
++    check::check(mTalkerLogits.reshape({activeBatchSize, mTalkerConfig.talkerVocabSize}), "Tensor reshape failed");
++    check::check(mTalkerSelectedIndices.reshape({activeBatchSize, 1}), "Tensor reshape failed");
++    for (int32_t b = 0; b < activeBatchSize; ++b)
++    {
++        rt::Tensor logitsSlice(static_cast<float*>(mTalkerLogits.rawPointer()) + b * mTalkerConfig.talkerVocabSize,
++            rt::Coords{1, mTalkerConfig.talkerVocabSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT);
++        kernel::invokeTalkerLogitAdjust(mSeenCodecTokensBuf, logitsSlice, mTalkerConfig.talkerVocabSize - 1024,
++            mTalkerConfig.talkerVocabSize, mTalkerConfig.codecEosId, 0, repetitionPenalty, stream);
++    }
++    trt_edgellm::topKtopPSamplingFromLogits(
++        mTalkerLogits, mTalkerSelectedIndices, talkerSamplingParams, mSamplingWorkspace, stream);
++    CUDA_CHECK(cudaMemcpyAsync(mHostSelectedTokenIds.rawPointer(), mTalkerSelectedIndices.rawPointer(),
++        activeBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    {
++        int32_t* hostTokens = mHostSelectedTokenIds.dataPointer<int32_t>();
++        for (int32_t b = 0; b < activeBatchSize; ++b)
++        {
++            states[b].codecToken = hostTokens[b];
++            LOG_INFO("Batch %d: first codec token: %d (seqLen=%ld)", b, states[b].codecToken, perBatchSeqLens[b]);
++        }
+     }
+ 
+     int32_t const talkerKVCapacity = mTalkerLLMConfig.maxKVCacheCapacity;
+@@ -1202,9 +1277,10 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+         effectiveMaxFrames = std::max(effectiveMaxFrames, std::min(requests[b].maxAudioLength, safe));
+     }
+ 
+-    std::vector<rt::Tensor const*> trailingPtrs(activeBatchSize, nullptr);
++    // trailingPtrs already declared above (all-nullptr for the TTS path). Pass perBatchSeqLens so the
++    // decode loop extracts each lane's last hidden at its true (unpadded) length after the batched prefill.
+     if (!runTalkerGenerationLoop(states, activeBatchSize, effectiveMaxFrames, talkerSamplingParams,
+-            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream))
++            predictorSamplingParams, repetitionPenalty, trailingPtrs, stream, perBatchSeqLens))
+     {
+         return false;
+     }
+diff --git a/cpp/runtime/hybridCacheManager.cpp b/cpp/runtime/hybridCacheManager.cpp
+index 715af62..145f00a 100644
+--- a/cpp/runtime/hybridCacheManager.cpp
++++ b/cpp/runtime/hybridCacheManager.cpp
+@@ -269,8 +269,15 @@ void HybridCacheManager::resetForNewSequences(rt::Tensor const& reuseKVCacheLeng
+         }
+     }
+     mKVCacheAllEmpty = allEmpty;
++    // Copy exactly batchSize logical elements, NOT reuseKVCacheLengths.getMemoryCapacity() (the host
++    // buffer's FIXED allocation). When the host buffer is allocated at maxBatchSize but reshaped to a
++    // smaller batchSize (e.g. a batch=1 reset on a maxBatchSize=2 TTS runtime), getMemoryCapacity()
++    // still returns the full allocation while mDeviceKVCacheLengths was just reshaped to {batchSize} ->
++    // the oversized H2D copy faults with "invalid argument". batchSize*typeSize matches the reshaped
++    // device buffer for every maxBatchSize (identical to the old value whenever allocation==batchSize).
++    int64_t const copyBytes = static_cast<int64_t>(batchSize) * rt::utils::getTypeSize(mDeviceKVCacheLengths.getDataType());
+     CUDA_CHECK(cudaMemcpyAsync(mDeviceKVCacheLengths.rawPointer(), reuseKVCacheLengths.rawPointer(),
+-        reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
++        copyBytes, cudaMemcpyHostToDevice, stream));
+ }
+ 
+ void HybridCacheManager::resetLanes(std::vector<int32_t> const& batchIdxs, cudaStream_t stream)
+diff --git a/cpp/runtime/ttsBatchLaneManager.h b/cpp/runtime/ttsBatchLaneManager.h
+new file mode 100644
+index 0000000..a4adecf
+--- /dev/null
++++ b/cpp/runtime/ttsBatchLaneManager.h
+@@ -0,0 +1,117 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager / LaneOwnerKind
++#include "runtime/qwen3OmniTTSRuntime.h"
++
++#include <cstdint>
++#include <mutex>
++#include <vector>
++
++namespace trt_edgellm
++{
++namespace rt
++{
++
++/*!
++ * @brief N-lane batch scheduler for concurrent CustomVoice / Qwen3-TTS sessions (spec §6 v2, TTS).
++ *
++ * This REPLACES patch-0004's TTS slot-pool RUNTIME REPLICATION (one cloned PipelineIO / scratch /
++ * decode-context per concurrent slot) with the engine's NATIVE batch dimension. A single
++ * `Qwen3OmniTTSRuntime` whose Talker engine is built `--maxBatchSize N` already exposes the
++ * batched entry point `handleAudioGeneration(std::vector<TalkerGenerationRequest>, ...)`, which:
++ *   - runs ONE batched autoregressive Talker decode loop over `activeBatchSize` lanes
++ *     (`runTalkerGenerationLoop(states, activeBatchSize, ...)`, qwen3OmniTTSRuntime.h:388) — this is
++ *     the BATCH lane: row i of the Talker engine's KV cache == TTS lane i, no cross-talk;
++ *   - then, PER BATCH SAMPLE, runs the CodePredictor (batch=1) and (at the example layer) Code2Wav
++ *     (single-sample) SEQUENTIALLY. CodePredictor + Code2Wav are NOT batched — they are looped
++ *     per-lane. That is exactly the spec design (Talker batches; CP/Code2Wav sequential per-lane).
++ *
++ * `TtsBatchLaneManager` is the thin scheduling layer on top: it reserves a persistent TTS lane in
++ * the shared `SessionLaneManager` TTS partition `[asrMax, asrMax + ttsMax)` for each admitted
++ * session (the same static partition the ASR continuous batcher reserves from — so an ASR lane and
++ * a TTS lane can never alias the same HybridCacheManager row), maps that lane to a Talker engine
++ * batch row, admits sessions into free lanes, and on `runBatch()` packs all currently-admitted
++ * lanes into ONE batched `handleAudioGeneration` call. Per-lane RVQ codes come back in
++ * `batchRvqCodes[laneIndex]`; the caller drives Code2Wav per lane (sequential), mirroring the omni
++ * example. No replicated runtime state: the moat (zero cross-talk) is the engine's batch dimension,
++ * proven by the N=2 roundtrip isolation gate, NOT by per-slot cloning.
++ *
++ * Mapping note: the Talker engine has its OWN KV cache rows `[0, N)`. The SessionLaneManager TTS
++ * partition lane id is `ttsBase() + slotIndex`; the Talker engine batch row for that lane is
++ * `slotIndex` (== laneId - ttsBase). `runBatch` packs admitted lanes in ascending slot-index order,
++ * so `batchRvqCodes[k]` belongs to the k-th admitted lane (ascending). Admission order is recorded
++ * so callers can recover which session each batch row served.
++ *
++ * Threading: a single internal mutex serializes admit/runBatch/evict (the runtime's batched call
++ * mutates shared workspace tensors allocated at maxBatchSize).
++ */
++class TtsBatchLaneManager
++{
++public:
++    //! @brief One reserved TTS lane's bookkeeping.
++    struct LaneRecord
++    {
++        int32_t lane{-1};      //!< Physical SessionLaneManager lane id (== HybridCacheManager row in the partition).
++        int32_t batchRow{-1};  //!< Talker engine batch row for this lane (== lane - ttsBase).
++        int64_t sessionId{-1}; //!< Caller session id.
++        bool active{false};    //!< True between admit() and evict().
++        Qwen3OmniTTSRuntime::TalkerGenerationRequest request; //!< The full TTS request for this lane.
++    };
++
++    //! @param runtime  TTS runtime (must outlive this; its Talker engine must be maxBatchSize >= N).
++    //! @param laneManager  Lane allocator (must outlive this); TTS lanes are acquired/released here.
++    TtsBatchLaneManager(Qwen3OmniTTSRuntime& runtime, SessionLaneManager& laneManager) noexcept;
++
++    TtsBatchLaneManager(TtsBatchLaneManager const&) = delete;
++    TtsBatchLaneManager& operator=(TtsBatchLaneManager const&) = delete;
++
++    //! @brief Admit a TTS session into a free TTS lane and record its request.
++    //! @return Physical lane id, or -1 if the TTS partition is full.
++    int32_t admit(int64_t sessionId, Qwen3OmniTTSRuntime::TalkerGenerationRequest const& request);
++
++    //! @brief Run ONE batched Talker decode across all currently-admitted lanes.
++    //! @details Packs admitted lanes (ascending batch-row order) into a single
++    //!          `handleAudioGeneration(std::vector<...>)` on the maxBatchSize=N Talker. On success,
++    //!          `response.batchRvqCodes[k]` / `response.numFramesPerSample[k]` hold the k-th
++    //!          admitted lane's RVQ codes. CodePredictor runs (batch=1) per sample inside the call;
++    //!          the caller runs Code2Wav per lane (sequential). The admitted lane ids in ascending
++    //!          order are written to `outLaneOrder` so the caller can map batch row k -> lane/session.
++    //! @return True if generation succeeded.
++    bool runBatch(Qwen3OmniTTSRuntime::TalkerGenerationResponse& response, std::vector<int32_t>& outLaneOrder,
++        cudaStream_t stream);
++
++    //! @brief Release a lane back to the TTS partition.
++    void evict(int32_t lane);
++
++    //! @brief Number of currently-admitted (active) lanes.
++    int32_t activeLaneCount() const noexcept;
++
++    //! @brief Session id owning a lane (or -1).
++    int64_t sessionOf(int32_t lane) const;
++
++private:
++    Qwen3OmniTTSRuntime& mRuntime;
++    SessionLaneManager& mLaneManager;
++    mutable std::mutex mMutex;
++    std::vector<LaneRecord> mLanes; //!< One record per admitted lane (insertion order).
++};
++
++} // namespace rt
++} // namespace trt_edgellm
+diff --git a/cpp/runtime/ttsBatchLaneManager.cpp b/cpp/runtime/ttsBatchLaneManager.cpp
+new file mode 100644
+index 0000000..169efbc
+--- /dev/null
++++ b/cpp/runtime/ttsBatchLaneManager.cpp
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "runtime/ttsBatchLaneManager.h"
++
++#include "common/logger.h"
++
++#include <algorithm>
++
++namespace trt_edgellm
++{
++namespace rt
++{
++
++TtsBatchLaneManager::TtsBatchLaneManager(Qwen3OmniTTSRuntime& runtime, SessionLaneManager& laneManager) noexcept
++    : mRuntime(runtime)
++    , mLaneManager(laneManager)
++{
++}
++
++int32_t TtsBatchLaneManager::admit(int64_t sessionId, Qwen3OmniTTSRuntime::TalkerGenerationRequest const& request)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++
++    int32_t const lane = mLaneManager.acquire(LaneOwnerKind::kTts, sessionId);
++    if (lane < 0)
++    {
++        LOG_WARNING("TtsBatchLaneManager: TTS partition full, cannot admit session %ld", static_cast<long>(sessionId));
++        return -1;
++    }
++
++    LaneRecord rec;
++    rec.lane = lane;
++    rec.batchRow = lane - mLaneManager.ttsBase();
++    rec.sessionId = sessionId;
++    rec.active = true;
++    rec.request = request;
++    mLanes.push_back(std::move(rec));
++
++    LOG_INFO("TtsBatchLaneManager: admitted session %ld -> lane %d (Talker batch row %d)",
++        static_cast<long>(sessionId), lane, lane - mLaneManager.ttsBase());
++    return lane;
++}
++
++bool TtsBatchLaneManager::runBatch(Qwen3OmniTTSRuntime::TalkerGenerationResponse& response,
++    std::vector<int32_t>& outLaneOrder, cudaStream_t stream)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++
++    // Collect active lanes in ASCENDING Talker-batch-row order. Row k of the engine's KV cache is
++    // TTS lane k; packing in row order keeps response.batchRvqCodes[k] aligned to lane order.
++    std::vector<LaneRecord*> ordered;
++    for (auto& rec : mLanes)
++    {
++        if (rec.active)
++        {
++            ordered.push_back(&rec);
++        }
++    }
++    std::sort(ordered.begin(), ordered.end(),
++        [](LaneRecord const* a, LaneRecord const* b) { return a->batchRow < b->batchRow; });
++
++    if (ordered.empty())
++    {
++        LOG_WARNING("TtsBatchLaneManager::runBatch: no active lanes");
++        return false;
++    }
++
++    // Pack one TalkerGenerationRequest per active lane -> ONE batched handleAudioGeneration call.
++    // This is the BATCH lane: the maxBatchSize=N Talker runs all lanes' autoregressive decode in a
++    // single batched engine loop; CodePredictor (batch=1) is run per-sample SEQUENTIALLY inside.
++    std::vector<Qwen3OmniTTSRuntime::TalkerGenerationRequest> batch;
++    batch.reserve(ordered.size());
++    outLaneOrder.clear();
++    outLaneOrder.reserve(ordered.size());
++    for (auto* rec : ordered)
++    {
++        batch.push_back(rec->request);
++        outLaneOrder.push_back(rec->lane);
++    }
++
++    LOG_INFO("TtsBatchLaneManager::runBatch: batched Talker over %zu lane(s) (activeBatchSize=%zu)", batch.size(),
++        batch.size());
++
++    bool const ok = mRuntime.handleAudioGeneration(batch, response, stream);
++    if (!ok)
++    {
++        LOG_ERROR("TtsBatchLaneManager::runBatch: handleAudioGeneration failed");
++    }
++    return ok;
++}
++
++void TtsBatchLaneManager::evict(int32_t lane)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    auto it = std::find_if(mLanes.begin(), mLanes.end(), [lane](LaneRecord const& r) { return r.lane == lane; });
++    if (it == mLanes.end() || !it->active)
++    {
++        return;
++    }
++    it->active = false;
++    mLaneManager.release(lane);
++    LOG_INFO("TtsBatchLaneManager: evicted lane %d (session %ld)", lane, static_cast<long>(it->sessionId));
++    mLanes.erase(it);
++}
++
++int32_t TtsBatchLaneManager::activeLaneCount() const noexcept
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    return static_cast<int32_t>(std::count_if(mLanes.begin(), mLanes.end(), [](LaneRecord const& r) { return r.active; }));
++}
++
++int64_t TtsBatchLaneManager::sessionOf(int32_t lane) const
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    auto it = std::find_if(mLanes.begin(), mLanes.end(), [lane](LaneRecord const& r) { return r.lane == lane; });
++    return it == mLanes.end() ? -1 : it->sessionId;
++}
++
++} // namespace rt
++} // namespace trt_edgellm
+diff --git a/examples/omni/spike_v080_m5_tts_concurrent.cpp b/examples/omni/spike_v080_m5_tts_concurrent.cpp
+new file mode 100644
+index 0000000..ca487c3
+--- /dev/null
++++ b/examples/omni/spike_v080_m5_tts_concurrent.cpp
+@@ -0,0 +1,322 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// spike_v080_m5_tts_concurrent — Phase 5b TTS N=2 batch-lane isolation gate.
++//
++// Drives TWO concurrent CustomVoice sessions with DISTINCT text through TtsBatchLaneManager on a
++// maxBatchSize=2 Talker engine: ONE batched handleAudioGeneration(vector) across both lanes, then
++// per-lane SEQUENTIAL Code2Wav. Compares each lane's CONCURRENT audio to its SOLO run (single-lane
++// admit). PASS == per-lane concurrent RVQ + audio byte-identical to solo, 0 CUDA errors.
++//
++// Usage:
++//   spike_v080_m5_tts_concurrent --talkerEngineDir <b2/talker> --code2wavEngineDir <code2wav>
++//                                --outputAudioDir <dir>
++// Text + speaker + language for the two lanes are fixed below (zh + en, speaker vivian).
++
++#include "audioWriter.h"
++#include "common/checkMacros.h"
++#include "common/logger.h"
++#include "common/trtUtils.h"
++#include "multimodal/code2WavRunner.h"
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager
++#include "runtime/qwen3OmniTTSRuntime.h"
++#include "runtime/ttsBatchLaneManager.h"
++
++#include <cstdio>
++#include <filesystem>
++#include <getopt.h>
++#include <string>
++#include <vector>
++
++using namespace trt_edgellm;
++using namespace trt_edgellm::rt;
++
++namespace
++{
++
++// One TTS session's fixed input.
++struct SessionSpec
++{
++    std::string tag;      // "zh" / "en"
++    std::string text;     // text to synthesize
++    std::string speaker;  // speaker name
++    std::string language; // CustomVoice language hint
++};
++
++Qwen3OmniTTSRuntime::TalkerGenerationRequest makeRequest(SessionSpec const& spec)
++{
++    Qwen3OmniTTSRuntime::TalkerGenerationRequest req;
++    // Canonical config (Phase A caller requirement): chat template + generation prompt.
++    req.applyChatTemplate = true;
++    req.addGenerationPrompt = true;
++    req.enableThinking = false;
++    // Greedy decode for determinism (byte-identical solo vs concurrent).
++    req.talkerTemperature = 0.0f;
++    req.talkerTopK = 1;
++    req.talkerTopP = 1.0f;
++    req.repetitionPenalty = 1.05f;
++    req.speakerName = spec.speaker;
++    req.language = spec.language;
++    req.maxAudioLength = 4096;
++
++    Message msg;
++    msg.role = "assistant"; // TTS talker prefill expects the assistant role prefix.
++    Message::MessageContent mc;
++    mc.type = "text";
++    mc.content = spec.text;
++    msg.contents.push_back(std::move(mc));
++    req.messages.push_back(std::move(msg));
++    return req;
++}
++
++// Transpose [frames][layers] -> [layers][frames] for Code2Wav.
++std::vector<std::vector<int32_t>> transposeCodes(std::vector<std::vector<int32_t>> const& framesCodes)
++{
++    if (framesCodes.empty())
++    {
++        return {};
++    }
++    size_t const numFrames = framesCodes.size();
++    size_t const numLayers = framesCodes[0].size();
++    std::vector<std::vector<int32_t>> transposed(numLayers, std::vector<int32_t>(numFrames));
++    for (size_t f = 0; f < numFrames; ++f)
++    {
++        for (size_t l = 0; l < numLayers; ++l)
++        {
++            transposed[l][f] = framesCodes[f][l];
++        }
++    }
++    return transposed;
++}
++
++// FNV-1a over the flattened RVQ codes (cheap deterministic fingerprint).
++uint64_t hashCodes(std::vector<std::vector<int32_t>> const& codes)
++{
++    uint64_t h = 1469598103934665603ull;
++    for (auto const& frame : codes)
++    {
++        for (int32_t c : frame)
++        {
++            for (int b = 0; b < 4; ++b)
++            {
++                h ^= static_cast<uint64_t>((c >> (b * 8)) & 0xff);
++                h *= 1099511628211ull;
++            }
++        }
++    }
++    return h;
++}
++
++bool runCode2Wav(Code2WavRunner& runner, std::vector<std::vector<int32_t>> const& framesCodes,
++    audioUtils::AudioData& out, cudaStream_t stream)
++{
++    if (framesCodes.empty())
++    {
++        return false;
++    }
++    auto transposed = transposeCodes(framesCodes);
++    return runner.generateWaveform(transposed, out, stream);
++}
++
++void saveWav(std::string const& dir, std::string const& name, audioUtils::AudioData const& audio)
++{
++    if (dir.empty())
++    {
++        return;
++    }
++    std::filesystem::create_directories(dir);
++    std::filesystem::path p = std::filesystem::path(dir) / (name + ".wav");
++    if (!saveAudioToWav(p.string(), audio))
++    {
++        LOG_WARNING("Failed to save %s", p.string().c_str());
++    }
++    else
++    {
++        LOG_INFO("Saved %s", p.string().c_str());
++    }
++}
++
++} // namespace
++
++int main(int argc, char** argv)
++{
++    std::string talkerEngineDir;
++    std::string code2wavEngineDir;
++    std::string codePredictorEngineDir;
++    std::string tokenizerDir;
++    std::string outputAudioDir;
++    bool debug = false;
++
++    static struct option opts[] = {{"talkerEngineDir", required_argument, 0, 't'},
++        {"code2wavEngineDir", required_argument, 0, 'c'},
++        {"codePredictorEngineDir", required_argument, 0, 'p'},
++        {"tokenizerDir", required_argument, 0, 'k'}, {"outputAudioDir", required_argument, 0, 'o'},
++        {"debug", no_argument, 0, 'd'}, {0, 0, 0, 0}};
++    int o;
++    while ((o = getopt_long(argc, argv, "", opts, nullptr)) != -1)
++    {
++        switch (o)
++        {
++        case 't': talkerEngineDir = optarg; break;
++        case 'c': code2wavEngineDir = optarg; break;
++        case 'p': codePredictorEngineDir = optarg; break;
++        case 'k': tokenizerDir = optarg; break;
++        case 'o': outputAudioDir = optarg; break;
++        case 'd': debug = true; break;
++        default: break;
++        }
++    }
++    if (talkerEngineDir.empty())
++    {
++        fprintf(stderr, "--talkerEngineDir required\n");
++        return EXIT_FAILURE;
++    }
++
++    gLogger.setLevel(debug ? nvinfer1::ILogger::Severity::kVERBOSE : nvinfer1::ILogger::Severity::kINFO);
++    LOG_INFO("=== spike_v080_m5_tts_concurrent (N=2 TTS isolation gate) ===");
++
++    auto pluginHandles = loadEdgellmPluginLib();
++
++    cudaStream_t stream;
++    CUDA_CHECK(cudaStreamCreate(&stream));
++
++    // CodePredictor stays batch=1 (sequential per-lane) — reuse the existing batch=1 CP engine if a
++    // sibling code_predictor/ was not built next to the maxBatchSize=2 Talker.
++    std::string const cpDir = !codePredictorEngineDir.empty()
++        ? codePredictorEngineDir
++        : (std::filesystem::path(talkerEngineDir).parent_path() / "code_predictor").string();
++    // Tokenizer files live in the talker engine dir; default to it (the runtime looks for
++    // tokenizer.json directly in tokenizerDir).
++    std::string const tokDir = !tokenizerDir.empty() ? tokenizerDir : talkerEngineDir;
++    auto ttsRuntime = std::make_unique<Qwen3OmniTTSRuntime>(talkerEngineDir, cpDir, tokDir, stream);
++    LOG_INFO("TTS runtime initialized (Talker %s)", talkerEngineDir.c_str());
++
++    std::filesystem::path const c2wDir = code2wavEngineDir.empty()
++        ? std::filesystem::path(talkerEngineDir).parent_path() / "code2wav"
++        : std::filesystem::path(code2wavEngineDir);
++    auto code2wav = std::make_unique<Code2WavRunner>(c2wDir.string(), stream);
++    LOG_INFO("Code2Wav initialized (%s)", c2wDir.string().c_str());
++
++    // The two distinct concurrent sessions.
++    std::vector<SessionSpec> specs = {
++        {"zh", "今天天气真不错", "vivian", "chinese"},
++        {"en", "the weather is really nice today", "vivian", "english"},
++    };
++
++    // ---------- SOLO baselines (single-lane admit, one at a time) ----------
++    LOG_INFO("--- SOLO baselines (activeBatchSize=1) ---");
++    std::vector<uint64_t> soloHash(specs.size(), 0);
++    std::vector<int32_t> soloFrames(specs.size(), 0);
++    {
++        SessionLaneManager laneMgr(/*maxBatchSize=*/2, /*asrMax=*/0, /*ttsMax=*/2);
++        for (size_t i = 0; i < specs.size(); ++i)
++        {
++            TtsBatchLaneManager batch(*ttsRuntime, laneMgr);
++            int32_t lane = batch.admit(static_cast<int64_t>(100 + i), makeRequest(specs[i]));
++            check::check(lane >= 0, "solo admit failed");
++
++            Qwen3OmniTTSRuntime::TalkerGenerationResponse resp;
++            std::vector<int32_t> order;
++            bool ok = batch.runBatch(resp, order, stream);
++            check::check(ok && !resp.batchRvqCodes.empty(), "solo runBatch failed");
++
++            auto const& codes = resp.batchRvqCodes[0];
++            soloHash[i] = hashCodes(codes);
++            soloFrames[i] = static_cast<int32_t>(codes.size());
++
++            audioUtils::AudioData audio;
++            bool a = runCode2Wav(*code2wav, codes, audio, stream);
++            check::check(a, "solo code2wav failed");
++            saveWav(outputAudioDir, std::string("solo_") + specs[i].tag, audio);
++            int64_t samples = (audio.waveform && !audio.waveform->isEmpty()) ? audio.waveform->getShape()[1] : 0;
++            LOG_INFO("solo %s: frames=%d rvqHash=0x%016llx audioSamples=%ld (%.2fs)", specs[i].tag.c_str(),
++                soloFrames[i], static_cast<unsigned long long>(soloHash[i]), static_cast<long>(samples),
++                static_cast<double>(samples) / (audio.sampleRate ? audio.sampleRate : 24000));
++            batch.evict(lane);
++        }
++    }
++
++    // ---------- CONCURRENT N=2 (both lanes admitted, ONE batched Talker) ----------
++    LOG_INFO("--- CONCURRENT N=2 (activeBatchSize=2, batched Talker) ---");
++    std::vector<uint64_t> ccHash(specs.size(), 0);
++    std::vector<int32_t> ccFrames(specs.size(), 0);
++    {
++        SessionLaneManager laneMgr(/*maxBatchSize=*/2, /*asrMax=*/0, /*ttsMax=*/2);
++        TtsBatchLaneManager batch(*ttsRuntime, laneMgr);
++        std::vector<int32_t> lanes;
++        for (size_t i = 0; i < specs.size(); ++i)
++        {
++            int32_t lane = batch.admit(static_cast<int64_t>(200 + i), makeRequest(specs[i]));
++            check::check(lane >= 0, "concurrent admit failed");
++            lanes.push_back(lane);
++        }
++        LOG_INFO("admitted %d lanes (activeLaneCount=%d)", static_cast<int>(lanes.size()), batch.activeLaneCount());
++
++        Qwen3OmniTTSRuntime::TalkerGenerationResponse resp;
++        std::vector<int32_t> order;
++        bool ok = batch.runBatch(resp, order, stream);
++        check::check(ok, "concurrent runBatch failed");
++        check::check(resp.batchRvqCodes.size() == specs.size(), "concurrent batch size mismatch");
++
++        // order[k] == lane for batch row k; lanes were admitted in spec order, batchRow ascending.
++        for (size_t k = 0; k < specs.size(); ++k)
++        {
++            // batch row k corresponds to spec index k (admit order == ascending batchRow).
++            auto const& codes = resp.batchRvqCodes[k];
++            ccHash[k] = hashCodes(codes);
++            ccFrames[k] = static_cast<int32_t>(codes.size());
++
++            audioUtils::AudioData audio;
++            bool a = runCode2Wav(*code2wav, codes, audio, stream);
++            check::check(a, "concurrent code2wav failed");
++            saveWav(outputAudioDir, std::string("concurrent_") + specs[k].tag, audio);
++            int64_t samples = (audio.waveform && !audio.waveform->isEmpty()) ? audio.waveform->getShape()[1] : 0;
++            LOG_INFO("concurrent %s (lane %d / batch row %zu): frames=%d rvqHash=0x%016llx audioSamples=%ld (%.2fs)",
++                specs[k].tag.c_str(), order[k], k, ccFrames[k], static_cast<unsigned long long>(ccHash[k]),
++                static_cast<long>(samples),
++                static_cast<double>(samples) / (audio.sampleRate ? audio.sampleRate : 24000));
++        }
++        for (int32_t lane : lanes)
++        {
++            batch.evict(lane);
++        }
++    }
++
++    // ---------- VERDICT ----------
++    cudaError_t cudaErr = cudaGetLastError();
++    LOG_INFO("CUDA last-error after concurrent run: %s", cudaGetErrorString(cudaErr));
++
++    LOG_INFO("=== N=2 TTS ISOLATION GATE ===");
++    bool allPass = true;
++    for (size_t i = 0; i < specs.size(); ++i)
++    {
++        bool framesMatch = (ccFrames[i] == soloFrames[i]);
++        bool hashMatch = (ccHash[i] == soloHash[i]);
++        bool pass = framesMatch && hashMatch;
++        allPass = allPass && pass;
++        LOG_INFO("lane %s: concurrent frames=%d/solo=%d  rvqHash cc=0x%016llx solo=0x%016llx  => %s",
++            specs[i].tag.c_str(), ccFrames[i], soloFrames[i], static_cast<unsigned long long>(ccHash[i]),
++            static_cast<unsigned long long>(soloHash[i]), pass ? "PASS" : "FAIL");
++    }
++    bool cudaClean = (cudaErr == cudaSuccess);
++    LOG_INFO("0 CUDA errors across concurrent run: %s", cudaClean ? "YES" : "NO");
++    allPass = allPass && cudaClean;
++    LOG_INFO("=== M5 (N=2 TTS ISOLATION) ACCEPTANCE: %s ===", allPass ? "PASS" : "FAIL");
++
++    cudaStreamDestroy(stream);
++    return allPass ? EXIT_SUCCESS : EXIT_FAILURE;
++}
+diff --git a/examples/omni/CMakeLists.txt b/examples/omni/CMakeLists.txt
+index c52a2cb..6c7fbd4 100644
+--- a/examples/omni/CMakeLists.txt
++++ b/examples/omni/CMakeLists.txt
+@@ -27,3 +27,32 @@ set_target_properties(
+   qwen3_tts_inference PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                  ${CMAKE_BINARY_DIR}/examples/omni)
+ 
++# ---------------------------------------------------------------------------
++# Phase 5b: TTS N=2 batch-lane concurrency isolation gate (spec section 6 v2 TTS).
++# Drives two concurrent CustomVoice sessions through TtsBatchLaneManager on a
++# maxBatchSize=2 Talker engine (native batch), with sequential per-lane Code2Wav.
++# Same CuTe DSL shim + --wrap link requirements as qwen3_tts_inference.
++# ---------------------------------------------------------------------------
++add_executable(spike_v080_m5_tts_concurrent spike_v080_m5_tts_concurrent.cpp)
++
++target_include_directories(
++  spike_v080_m5_tts_concurrent PRIVATE ${COMMON_INCLUDE_DIRS}
++                                       ${CMAKE_SOURCE_DIR}/examples/utils)
++
++target_link_libraries(spike_v080_m5_tts_concurrent PRIVATE edgellmCore exampleUtils
++                                                           commonLibraryExt)
++
++add_cross_build_link_options(spike_v080_m5_tts_concurrent)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m5_tts_concurrent PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++  if(NOT DEFINED CUDA_CTK_VERSION OR CUDA_CTK_VERSION STREQUAL ""
++     OR CUDA_CTK_VERSION VERSION_LESS 12.8)
++    target_link_options(spike_v080_m5_tts_concurrent PRIVATE
++      "-Wl,--wrap=_cudaLaunchKernelEx")
++  endif()
++endif()
++
++set_target_properties(
++  spike_v080_m5_tts_concurrent PROPERTIES RUNTIME_OUTPUT_DIRECTORY
++                                          ${CMAKE_BINARY_DIR}/examples/omni)
