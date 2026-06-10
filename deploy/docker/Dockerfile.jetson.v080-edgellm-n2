@@ -1,0 +1,154 @@
+# syntax=docker/dockerfile:1.6
+#
+# Dockerfile.jetson.v080-edgellm — v0.8.0 edgellm serving overlay.
+#
+# THIN overlay (no full rebuild — full rebuild crash-loops per the prod runbook).
+# FROM the current production base `:prod-unified-v8`, which already carries the
+# Python service (server/), the voxedge backends (ASR lang-prefix strip +
+# apply_chat_template, TTS, MOSS worker protocol), and the CUDA/TRT runtime libs.
+# Its baked server/core/deploy_paths.py + moss_artifacts.py + edge_llm_backend.py
+# are byte-identical to seeed-local-voice HEAD and honour every env-override key
+# in the v0.8.0 server-wiring contract (#2) — so NO service-code overlay is
+# needed; only the binaries + engine env + first-boot HF-pull entrypoint.
+#
+# What this overlay adds:
+#   1. the 3 v0.8.0 serving worker binaries (qwen3_asr / qwen3_tts /
+#      moss_tts_nano) + the v0.8.0 edgellm plugin .so, baked to fixed paths
+#      (small + version-locked to the engines; CuTe DSL is statically linked,
+#      no cutedsl tarball needed).
+#   2. deploy_paths env pointing the service at the fixed v0.8.0 engine dirs
+#      (pulled at runtime) + the baked binaries + plugin.
+#   3. a first-boot entrypoint that HF-pulls the multi-GB v0.8.0 ASR/TTS engines
+#      (slim pattern — engines are NOT baked).
+#
+# Build (on orin-nx, context = ~/v080-image-build/ctx):
+#   docker build -f Dockerfile.jetson.v080-edgellm \
+#     -t sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v0.8.0-edgellm-20260610 .
+#
+ARG BASE_IMAGE=sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:prod-unified-v8
+FROM ${BASE_IMAGE}
+
+# ── v0.8.0 serving worker binaries + plugin (baked; engines pulled at runtime) ──
+# md5 (== HF MANIFEST sm87-trt10.3-jp6.2/v0.8.0/):
+#   qwen3_asr_worker            f9bb821dec9f32e53697c7930254b4f3  (v080-0022: #9 N>1 + #10 streaming PARTIALs)
+#   qwen3_tts_worker            22216e8dc724bd8619d4fca26b0c2d5b
+#   moss_tts_nano_worker        6a03bdf5c7a26b09f60597b95008ebfe
+#   libNvInfer_edgellm_plugin.so 8f004bb4c9ddcce30ae4eecf2f410624
+COPY --chmod=0755 bin/qwen3_asr_worker        /opt/jv-workers/qwen3_asr_worker
+COPY --chmod=0755 bin/qwen3_tts_worker        /opt/jv-workers/qwen3_tts_worker
+COPY --chmod=0755 bin/moss_tts_nano_worker    /opt/jv-workers/moss_tts_nano_worker
+COPY            bin/libNvInfer_edgellm_plugin.so /opt/edgellm-v080/plugins/libNvInfer_edgellm_plugin.so
+
+# ── first-boot HF-pull scripts ────────────────────────────────────────────────
+COPY --chmod=0755 pull_v080_artifacts.sh       /opt/speech/pull_v080_artifacts.sh
+COPY --chmod=0755 entrypoint.jetson.v080.sh    /opt/speech/entrypoint.jetson.v080.sh
+
+# ── voxedge worker_io robustness patch (Blocker #3) ───────────────────────────
+# The base wheel's WorkerIO._reader_loop drops a worker error event that carries
+# no routable id ("stale/unsolicited → drop silently"), so the caller hangs the
+# full 60s q.get timeout instead of surfacing the error. This patched copy routes
+# an unkeyed/unmatched ERROR event to the sole inflight queue when exactly one
+# request is in flight (N=1), so worker errors return fast. Only `event=="error"`
+# is rerouted (never partial/done) to avoid corrupting a legitimately stale
+# stream. Functionally identical otherwise (byte-equal except the reroute guard).
+COPY worker_io.voxedge-patch.py \
+     /usr/local/lib/python3.10/dist-packages/voxedge/backends/jetson/worker_io.py
+
+# ── v0.8.0 edgellm profile (generic-runner TTS worker, no explicit-KV flags) ───
+# Not present in the base image's configs/ — add it so the canonical entrypoint
+# can resolve OVS_PROFILE=jetson-edgellm-v080.
+COPY jetson-edgellm-v080.json /opt/speech/configs/profiles/jetson-edgellm-v080.json
+# v080-0022 N>1 + streaming variant profile (stream_mode=worker, asr_max_slots=2).
+COPY jetson-edgellm-v080-n2.json /opt/speech/configs/profiles/jetson-edgellm-v080-n2.json
+
+# ── profile selection ──────────────────────────────────────────────────────────
+# The service resolves the ASR/TTS *backend class* from the loaded profile
+# (server/core/asr_backend.py:create_asr_backend reads current_profile()
+# ["asr_backend"]; it RAISES if no profile is loaded). `jetson-edgellm-v080`
+# declares asr_backend=jetson.trt_edge_llm + tts_backend=jetson.trt_edge_llm — the
+# v0.8.0 qwen3-asr + qwen3-tts edgellm worker path. Its CRITICAL_KEYS
+# (LANGUAGE_MODE/ASR_BACKEND/TTS_BACKEND) are taken from the profile cleanly
+# because the canonical entrypoint unsets them when OVS_PROFILE is set.
+#
+# This v0.8.0-specific profile (NOT jetson-multilang-highperf-nx) deliberately
+# OMITS the explicit-KV TTS keys (EDGE_LLM_TTS_TALKER_BACKEND/TALKER_ENGINE/
+# CODE_PREDICTOR_BACKEND/TEXT_PROJECTION/PROMPT_KV_CACHE) and sets
+# OVS_TTS_WORKER_CONCURRENCY=1: the v0.8.0 qwen3_tts_worker is the GENERIC
+# LLMEngineRunner and accepts ONLY --talkerEngineDir/--codePredictorEngineDir/
+# --tokenizerDir/--code2wavEngineDir. Passing --qwen3TtsTalkerBackend /
+# --qwen3TtsTalkerEngine / --max_slots (which the highperf-nx profile would
+# trigger) makes the worker reject the unknown flag and abort startup.
+# v080-0022: select the N>1 + streaming variant. asr_backend/tts_backend unchanged
+# (jetson.trt_edge_llm); this profile sets stream_mode=worker + asr_max_slots=2 so
+# the service routes /asr/stream to the streaming worker path and emits --max_slots 2.
+ENV OVS_PROFILE=jetson-edgellm-v080-n2
+
+# ── deploy_paths env → v0.8.0 binaries + plugin + (runtime-pulled) engine dirs ──
+# These keys carry the `EDGE_LLM_`/`QWEN3_` operator prefixes, so profile_loader's
+# _snapshot_operator_keys() (server/core/profile_loader.py:46) marks them
+# operator-owned at import → apply_profile() will NOT overwrite them with the
+# profile's OLD `${QWEN3_ARTIFACT_ROOT}=/opt/models/qwen3-edgellm/...` layout
+# (which is ABSENT on disk). The image-baked v0.8.0 paths WIN. Engine dirs are
+# populated on first boot by /opt/speech/pull_v080_artifacts.sh.
+#
+# The v0.8.0 generic-runner TTS worker loads engines from the *Dir keys
+# (--talkerEngineDir/--codePredictorEngineDir/--tokenizerDir/--code2wavEngineDir),
+# so the engine-DIR keys are baked here. The engine-FILE / explicit-KV keys
+# (EDGE_LLM_TTS_TALKER_ENGINE etc.) are intentionally NOT baked — the v0.8.0
+# worker rejects --qwen3TtsTalkerEngine and aborts. The jetson-edgellm-v080
+# profile also omits them, so they stay empty (generic-runner path).
+ENV EDGELLM_V080_ROOT=/opt/edgellm-v080 \
+    QWEN3_ARTIFACT_ROOT=/opt/edgellm-v080 \
+    EDGE_LLM_ASR_WORKER_BIN=/opt/jv-workers/qwen3_asr_worker \
+    EDGE_LLM_TTS_WORKER_BIN=/opt/jv-workers/qwen3_tts_worker \
+    MOSS_WORKER_BIN=/opt/jv-workers/moss_tts_nano_worker \
+    EDGELLM_PLUGIN_PATH=/opt/edgellm-v080/plugins/libNvInfer_edgellm_plugin.so \
+    EDGE_LLM_ASR_PLUGIN_PATH=/opt/edgellm-v080/plugins/libNvInfer_edgellm_plugin.so \
+    EDGE_LLM_ASR_ENGINE_DIR=/opt/edgellm-v080/engines/asr-b2/llm \
+    EDGE_LLM_ASR_AUDIO_ENC_DIR=/opt/edgellm-v080/engines/asr/audio \
+    EDGE_LLM_TTS_TALKER_DIR=/opt/edgellm-v080/engines/qwen3-tts/talker \
+    EDGE_LLM_TTS_TOKENIZER_DIR=/opt/edgellm-v080/engines/qwen3-tts/talker \
+    EDGE_LLM_TTS_CP_DIR=/opt/edgellm-v080/engines/qwen3-tts/code_predictor \
+    EDGE_LLM_TTS_CODE2WAV_DIR=/opt/edgellm-v080/engines/qwen3-tts/code2wav
+
+# The v0.8.0 engines are pre-staged by the entrypoint, so the stale qwen3
+# manifest auto-downloader (which targets old artifact sets) must NOT run for
+# ASR/TTS — pre-staged files already satisfy the preload existence checks.
+# MOSS keeps its own provisioner (ensure_moss_artifacts, models/moss-tts-nano/),
+# which is v0.7.1<->v0.8.0 engine-compatible; the v0.8.0 MOSS worker is baked
+# above and pointed to via MOSS_WORKER_BIN.
+# ── v080-0022 N>1 + streaming-worker operator overrides ───────────────────────
+# These EDGE_LLM_ASR_* keys are operator-owned (profile_loader snapshots the
+# EDGE_LLM_ prefix at import) so they WIN over any profile value and are stable
+# regardless of profile resolution order:
+#   * STREAM_MODE=worker → create_stream() routes to _TRTEdgeLLMStreamingASRStream
+#     (begin/chunk/end → {event:partial} → service {type:partial,is_final:false}).
+#     The NEW worker (f9bb821d, #10) implements begin/chunk/end; the old worker
+#     returned 501 here (hence accumulate in the non-n2 profile).
+#   * MAX_CONCURRENT=2 → backend emits `--max_slots 2` (only when N>1, b1cb1a5)
+#     + WorkerIO Semaphore(2); 3rd concurrent begin → PoolSaturatedError → 4429.
+#     Requires the maxBatch=2 llm engine at EDGE_LLM_ASR_ENGINE_DIR (asr-b2/llm).
+# The streaming-worker asset gate needs the PCM mel settings/filters; the base
+# image ships them at /opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/.
+ENV EDGE_LLM_ASR_STREAM_MODE=worker \
+    EDGE_LLM_ASR_MAX_CONCURRENT=2 \
+    EDGE_LLM_ASR_MEL_SETTINGS=/opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/whisper_feature_extractor.json \
+    EDGE_LLM_ASR_MEL_FILTERS=/opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/mel_filters.bin
+
+ENV OVS_AUTO_DOWNLOAD_ARTIFACTS=0
+
+LABEL org.opencontainers.image.title="seeed-local-voice (v0.8.0 edgellm)" \
+      org.opencontainers.image.description="v0.8.0 migrated stack: qwen3-asr + qwen3-tts + MOSS + GDN LLM, slim (engines pulled from HF at runtime)" \
+      org.opencontainers.image.version="v0.8.0-edgellm"
+
+# Swap in the v0.8.0 first-boot entrypoint (pulls engines, then chains to the
+# canonical profile-resolving entrypoint + the uvicorn CMD).
+#
+# Docker resets the inherited CMD to null whenever ENTRYPOINT is (re)declared in
+# a child build. The base `:prod-unified-v8` CMD ran uvicorn; without re-declaring
+# it here, the chain `entrypoint.jetson.v080.sh → exec entrypoint.jetson.sh "$@"`
+# would receive an EMPTY "$@", and the canonical entrypoint's terminal `exec "$@"`
+# would exec nothing and EXIT 0 (the "pulls then exits, never serves" bug). Re-
+# declare the uvicorn CMD so it is passed through the chain and actually served.
+ENTRYPOINT ["/opt/speech/entrypoint.jetson.v080.sh"]
+CMD ["python3", "-m", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
