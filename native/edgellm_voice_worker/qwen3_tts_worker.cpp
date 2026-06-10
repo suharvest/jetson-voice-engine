@@ -227,14 +227,18 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     req.talkerTopK = item.value("talker_top_k", 50);
     req.talkerTopP = item.value("talker_top_p", 1.0f);
     req.repetitionPenalty = item.value("repetition_penalty", 1.05f);
-    req.codecEosLogitOffset = item.value("codec_eos_logit_offset", 0.0f);
-    req.predictorTemperature = item.value("predictor_temperature", 0.0f);
-    req.predictorTopK = item.value("predictor_top_k", 0);
-    req.predictorTopP = item.value("predictor_top_p", 0.0f);
+    // v0.8.0 migration: codecEosLogitOffset / predictor* / minAudioLength were
+    // removed from TalkerGenerationRequest (CodePredictor sampling is now fixed
+    // to PyTorch defaults internally). These request keys are accepted but no
+    // longer forwarded; sampling is controlled via talker* fields only.
     req.maxAudioLength = item.value("max_audio_length", 4096);
-    req.minAudioLength = item.value("min_audio_length", 2);
     req.language = item.value("language", "");
     req.speakerName = item.value("speaker", "");
+    // v0.8.0: chat-template + generation-prompt are explicit request fields.
+    // The voxedge caller hard-sets apply_chat_template=true / add_generation_prompt=true.
+    req.applyChatTemplate = item.value("apply_chat_template", true);
+    req.addGenerationPrompt = item.value("add_generation_prompt", true);
+    req.enableThinking = item.value("enable_thinking", false);
 
     Message msg;
     msg.role = "user";
@@ -243,43 +247,21 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
     content.content = item.value("text", "");
     msg.contents.push_back(std::move(content));
     req.messages.push_back(std::move(msg));
+    // v0.8.0 Qwen3-TTS talker prefill expects the assistant-role prefix at
+    // input_ids[:3]; the text to synthesize is the assistant's content. A single
+    // user-role message is the common TTS input shape — coerce it (matches the
+    // proven qwen3_tts_inference golden path, v080-0009 CORRECTED).
+    if (req.messages.size() == 1 && req.messages[0].role == "user")
+    {
+        req.messages[0].role = "assistant";
+    }
     return req;
 }
 
-class TtsStreamAdapter
-{
-public:
-    using SubmitChunkFn = std::function<void(bool isFinal)>;
-
-    TtsStreamAdapter(bool enabled, std::vector<std::vector<int32_t>>& frames, int32_t const& nextChunkAt,
-        SubmitChunkFn submitChunk)
-        : mEnabled(enabled)
-        , mFrames(frames)
-        , mNextChunkAt(nextChunkAt)
-        , mSubmitChunk(std::move(submitChunk))
-    {
-    }
-
-    Qwen3OmniTTSRuntime::CodecFrameCallback callback()
-    {
-        return [this](std::vector<int32_t> const& frameCodes, int32_t totalFrames) { onCodecFrame(frameCodes, totalFrames); };
-    }
-
-private:
-    void onCodecFrame(std::vector<int32_t> const& frameCodes, int32_t totalFrames)
-    {
-        mFrames.push_back(frameCodes);
-        if (mEnabled && totalFrames >= mNextChunkAt)
-        {
-            mSubmitChunk(false);
-        }
-    }
-
-    bool mEnabled{false};
-    std::vector<std::vector<int32_t>>& mFrames;
-    int32_t const& mNextChunkAt;
-    SubmitChunkFn mSubmitChunk;
-};
+// v0.8.0 migration: TtsStreamAdapter (which wrapped the removed per-frame
+// Qwen3OmniTTSRuntime::CodecFrameCallback) is gone. handleAudioGeneration is now
+// fully batched, so streaming is driven post-generation by flushing the completed
+// frame buffer through submitChunk() in the request loop.
 } // namespace
 
 int main(int argc, char** argv)
@@ -565,17 +547,30 @@ int main(int argc, char** argv)
                 processChunk(job);
             };
 
-            TtsStreamAdapter streamAdapter(streamOutput, streamedFrames, nextChunkAt, submitChunk);
-            auto frameCallback = streamOutput ? streamAdapter.callback() : Qwen3OmniTTSRuntime::CodecFrameCallback{};
-            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream, frameCallback);
+            // v0.8.0 migration: handleAudioGeneration is now fully batched with NO
+            // per-frame CodecFrameCallback (that hook was removed in the v0.8.0
+            // runtime re-architecture). All RVQ frames are produced in one call and
+            // returned in response.batchRvqCodes[batch][frame][codeLayer]. Streaming
+            // is therefore "generate-then-chunk": after generation completes we drive
+            // submitChunk() over the completed frame buffer, preserving the wire
+            // protocol (chunk events + final). (void)nextChunkAt — the adaptive
+            // next-chunk threshold is only meaningful for the old incremental path.
+            (void) nextChunkAt;
+            bool ok = ttsRuntime->handleAudioGeneration(request, talkerResponse, stream);
             auto const genEnd = std::chrono::steady_clock::now();
-            if (!ok || talkerResponse.rvqCodes.empty())
+            if (!ok || talkerResponse.batchRvqCodes.empty() || talkerResponse.batchRvqCodes[0].empty())
             {
                 throw std::runtime_error("TTS generation failed");
             }
+            // batch index 0 (worker drives one request at a time): frames[frame][codeLayer]
+            std::vector<std::vector<int32_t>> const& generatedFrames = talkerResponse.batchRvqCodes[0];
+            int32_t const generatedNumFrames = static_cast<int32_t>(generatedFrames.size());
             if (streamOutput)
             {
-                streamedFrames = talkerResponse.rvqCodes;
+                streamedFrames = generatedFrames;
+                // All frames are already available; flush the completed buffer as the
+                // (single, final) chunk. submitChunk emits [lastEmittedFrames, size).
+                // The wire protocol accepts any chunk count; downstream concatenates.
                 submitChunk(true);
             }
             if (asyncCode2Wav)
@@ -610,14 +605,14 @@ int main(int argc, char** argv)
                     {"event", "done"},
                     {"ok", true},
                     {"stream_only", true},
-                    {"frames", talkerResponse.numFrames},
+                    {"frames", generatedNumFrames},
                     {"samples", streamedSamples},
                     {"sample_rate", streamSampleRate},
                     {"audio_s", audioSeconds},
                     {"chunk_count", chunkIndex},
                     {"audio_complete", true},
                     {"final_chunk_index", chunkIndex > 0 ? chunkIndex - 1 : -1},
-                    {"last_chunk_was_final", chunkIndex > 0 && lastEmittedFrames == talkerResponse.numFrames},
+                    {"last_chunk_was_final", chunkIndex > 0 && lastEmittedFrames == generatedNumFrames},
                     {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
                     {"code2wav_ms", streamedCode2WavMs},
                     {"first_chunk_ms",
@@ -631,7 +626,7 @@ int main(int argc, char** argv)
             }
 
             rt::audioUtils::AudioData audioOutput;
-            auto transposed = transposeCodes(talkerResponse.rvqCodes);
+            auto transposed = transposeCodes(generatedFrames);
             auto const wavStart = std::chrono::steady_clock::now();
             if (!code2wavRunner)
             {
@@ -661,7 +656,7 @@ int main(int argc, char** argv)
                 {"event", "done"},
                 {"ok", true},
                 {"output_file", outputFile},
-                {"frames", talkerResponse.numFrames},
+                {"frames", generatedNumFrames},
                 {"samples", samples},
                 {"sample_rate", audioOutput.sampleRate},
                 {"audio_s", audioSeconds},
