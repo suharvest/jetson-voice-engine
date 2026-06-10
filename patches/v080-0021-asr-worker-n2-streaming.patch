@@ -1,0 +1,461 @@
+diff --git a/native/edgellm_voice_worker/qwen3_asr_worker.cpp b/native/edgellm_voice_worker/qwen3_asr_worker.cpp
+index 90b1c5f..d85ef25 100644
+--- a/native/edgellm_voice_worker/qwen3_asr_worker.cpp
++++ b/native/edgellm_voice_worker/qwen3_asr_worker.cpp
+@@ -17,6 +17,7 @@
+ // v0.8.0 vanilla rt::LLMInferenceRuntime on the ONE-SHOT path only (production
+ // runs stream_mode=accumulate → the one-shot `requests` path is the live one;
+ // the streaming begin/chunk/end protocol is dormant and returns a 501 stub).
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager (lane reservation only)
+ #include "runtime/llmInferenceRuntime.h"
+ #include "runtime/llmRuntimeUtils.h"
+ #include "tokenizer/tokenizer.h"
+@@ -24,6 +25,7 @@
+ #include <chrono>
+ #include <filesystem>
+ #include <fstream>
++#include <functional>
+ #include <getopt.h>
+ #include <iostream>
+ #include <memory>
+@@ -132,6 +134,11 @@ bool parseArgs(Args& args, int argc, char** argv)
+     return !args.engineDir.empty() && !args.multimodalEngineDir.empty();
+ }
+ 
++// Forward decl: the proven one-shot core (defined below) is reused by the
++// streaming finalize path (handleEnd) which is defined earlier in the file.
++Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap);
++
+ std::filesystem::path writeTempInput(Json const& input, std::string const& id)
+ {
+     std::string safeId = id.empty() ? "request" : id;
+@@ -156,28 +163,315 @@ std::filesystem::path writeTempInput(Json const& input, std::string const& id)
+     return path;
+ }
+ 
+-//! v0.8.0 migration: streaming begin/chunk/end is dormant in production
+-//! (stream_mode=accumulate uses the one-shot `requests` path). The v0.7.1 slot
+-//! pool + spec-decode append-prefill machinery that backed the streaming path
+-//! was removed from the v0.8.0 engine baseline, so streaming returns a 501 stub.
+-//! Re-enabling it requires porting onto AsrStreamingSessionRuntime (Option A).
+-void emitStreamingNotSupported(Json const& input)
++// ===========================================================================
++// Task #9: N>1 concurrent-session support (begin/chunk/end accumulation path).
++// Task #10: true streaming PARTIALs (per-hop cumulative re-decode -> `partial`).
++//
++// Design (settled): each session reserves a LANE via SessionLaneManager (pure
++// bookkeeping — lane reservation only, NOT AsrStreamingSessionRuntime KV-append).
++// chunks accumulate the CUMULATIVE mel/pcm payload for the session AND run a
++// cumulative re-decode on the audio-so-far, emitting an incremental `partial`
++// per hop (task #10, first-cut: reuses the proven one-shot core -> guaranteed
++// to converge to the one-shot transcript). At `end` (or a `last:true` chunk),
++// the PROVEN one-shot core runs on the full cumulative audio under
++// gEngineExecMutex, guaranteeing CER-0.0000 + byte-identity with the legacy
++// one-shot path. The faster true incremental-KV per-hop append is a deferred
++// optimization (see handleChunk note + plan §3).
++//
++// Concurrency model: the worker is single-threaded (one stdin loop). Sessions
++// co-reside in gSessions and their lanes are held across interleaved
++// begin/chunk/end events from multiple sids; the engine step itself is wrapped
++// by gEngineExecMutex (kept for forward-compat with a future worker thread —
++// single-threaded today so it never contends). A mandatory idle sweep releases
++// lanes whose session went silent past kIdleTimeoutMs (half-open lane-leak guard,
++// cf. the v2v slot-leak lesson).
++// ===========================================================================
++
++//! Per-session accumulation + lane bookkeeping.
++struct SessionState
++{
++    int32_t laneId{-1};                       //!< Reserved lane (SessionLaneManager).
++    std::string melPath;                      //!< Cumulative mel safetensors path (last chunk wins).
++    std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
++    Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
++    std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
++};
++
++std::mutex gEngineExecMutex;                                   //!< Serializes the whole prefill+decode engine step.
++std::unordered_map<std::string, SessionState> gSessions;       //!< sid -> session state.
++std::unique_ptr<rt::SessionLaneManager> gLaneMgr;              //!< Lane allocator over the shared cache batch rows.
++int32_t gMaxSlots{1};                                          //!< Advertised slot-pool size (== asrMax).
++constexpr int64_t kIdleTimeoutMs = 30000;                      //!< Idle-session lane reclaim threshold.
++
++//! Deterministic 63-bit ownerId from a session id (SessionLaneManager wants int64).
++int64_t sidToOwnerId(std::string const& sid)
++{
++    return static_cast<int64_t>(std::hash<std::string>{}(sid) & 0x7fffffffffffffffLL);
++}
++
++//! Task #10: strip the leading "language <Lang>" tag the ASR head prepends, so
++//! partials and finals expose the same bare transcript. Applied consistently to
++//! both partial and final transcripts (idempotent — no tag => unchanged).
++std::string stripLangTag(std::string const& s)
++{
++    // Match a leading ASCII "language" token (case-insensitive) + single space +
++    // a language word + a space, e.g. "language Chinese这并不是...". We only strip
++    // the "language <Word> " prefix; the CJK transcript that follows is preserved.
++    static char const* kTag = "language ";
++    constexpr size_t kTagLen = 9; // strlen("language ")
++    if (s.size() < kTagLen) return s;
++    for (size_t i = 0; i < kTagLen; ++i)
++    {
++        char a = s[i];
++        char b = kTag[i];
++        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
++        if (a != b) return s; // no "language " prefix -> leave untouched
++    }
++    // Skip the language word (run of ASCII letters) and exactly one following space.
++    size_t j = kTagLen;
++    while (j < s.size() && ((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z'))) ++j;
++    if (j < s.size() && s[j] == ' ') ++j;
++    return s.substr(j);
++}
++
++//! Extract the bare (lang-tag-stripped) transcript from a runOneShotCore result.
++//! Empty string if the core produced no output_text.
++std::string transcriptFromCore(Json const& core)
++{
++    if (core.contains("responses") && core["responses"].is_array() && !core["responses"].empty())
++    {
++        Json const& r0 = core["responses"][0];
++        if (r0.contains("output_text") && r0["output_text"].is_string())
++        {
++            return stripLangTag(r0["output_text"].get<std::string>());
++        }
++    }
++    return std::string();
++}
++
++//! begin: reserve a lane (pool_saturated -> 4429), register session, ack.
++void handleBegin(Json const& input)
++{
++    std::string const sid = input.value("id", "");
++    if (sid.empty())
++    {
++        std::cout << Json{{"event", "error"}, {"ok", false}, {"error", "begin_missing_id"}}.dump() << std::endl;
++        return;
++    }
++    if (gSessions.count(sid))
++    {
++        // Idempotent re-begin: ack the existing lane (no double-acquire).
++        gSessions[sid].lastActivity = std::chrono::steady_clock::now();
++        std::cout << Json{{"event", "begin_ack"}, {"id", sid}, {"lane", gSessions[sid].laneId}}.dump() << std::endl;
++        return;
++    }
++    int32_t const lane = gLaneMgr->acquire(rt::LaneOwnerKind::kAsr, sidToOwnerId(sid));
++    if (lane < 0)
++    {
++        // Pool saturated. NO worker restart — caller backs off / retries (HTTP 429
++        // semantics, cf. the OVS session-limiter 4429 contract).
++        std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pool_saturated"},
++            {"status", 4429}, {"max_slots", gMaxSlots}}.dump() << std::endl;
++        return;
++    }
++    SessionState st;
++    st.laneId = lane;
++    st.lastActivity = std::chrono::steady_clock::now();
++    // Capture sampling/meta knobs so finalize replays the SAME request envelope as
++    // a one-shot call would (keeps byte-identity with the golden one-shot path).
++    for (char const* k : {"batch_size", "temperature", "top_p", "top_k", "max_generate_length"})
++    {
++        if (input.contains(k)) st.beginMeta[k] = input[k];
++    }
++    gSessions.emplace(sid, std::move(st));
++    std::cout << Json{{"event", "begin_ack"}, {"id", sid}, {"lane", lane}}.dump() << std::endl;
++}
++
++// Forward decls (handleChunk now finalizes on last:true via the handleEnd path).
++void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap);
++Json buildFinalizeRequest(std::string const& sid, SessionState const& st);
++
++//! Task #10: chunk = record the CUMULATIVE mel/pcm payload for this sid AND run a
++//! cumulative re-decode (first-cut, guaranteed-converge: reuses the proven
++//! one-shot core on the audio-so-far) to emit an incremental `partial`. On a
++//! `last:true` chunk we route straight to the finalize path (emits `final`).
++//!
++//! DEFERRED OPTIMIZATION: the true incremental-KV per-hop append (decode only the
++//! newly-arrived frames via AsrStreamingSessionRuntime::appendChunk /
++//! decodeToTranscript on the session's lane, instead of re-decoding the whole
++//! cumulative prefix every hop) is faster but not yet wired — see plan §3. This
++//! cumulative re-decode is O(audio_so_far) per hop but is correct and converges
++//! exactly to the one-shot transcript, so it ships first.
++void handleChunk(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap)
++{
++    std::string const sid = input.value("id", "");
++    auto it = gSessions.find(sid);
++    if (it == gSessions.end())
++    {
++        std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "unknown_session"}}.dump()
++                  << std::endl;
++        return;
++    }
++    SessionState& st = it->second;
++    st.lastActivity = std::chrono::steady_clock::now();
++    // Cumulative semantics: each chunk carries the full-so-far audio descriptor
++    // (the OVS accumulate driver re-points mel_path to the growing mel). Last wins.
++    if (input.contains("mel_path") && input["mel_path"].is_string())
++    {
++        st.melPath = input["mel_path"].get<std::string>();
++    }
++    else if (input.contains("audio") && input["audio"].is_string())
++    {
++        st.melPath = input["audio"].get<std::string>();
++    }
++    if (input.contains("pcm_b64") && input["pcm_b64"].is_string())
++    {
++        st.pcmB64 = input["pcm_b64"].get<std::string>();
++    }
++
++    // `last:true` => this hop is the end-of-utterance: finalize via the proven path.
++    bool const isLast = input.value("last", false);
++    if (isLast)
++    {
++        handleEnd(input, runtime, stream, loraWeightsMap);
++        return;
++    }
++
++    // No audio recorded yet => nothing to decode; just ack so the lane stays warm.
++    if (st.melPath.empty() && st.pcmB64.empty())
++    {
++        std::cout << Json{{"event", "chunk_ack"}, {"id", sid}}.dump() << std::endl;
++        return;
++    }
++
++    // Cumulative re-decode on the session's reserved lane (serialized by the engine
++    // exec mutex, identical step to the one-shot/finalize path).
++    Json const req = buildFinalizeRequest(sid, st);
++    Json core;
++    {
++        std::lock_guard<std::mutex> lk(gEngineExecMutex);
++        core = runOneShotCore(req, runtime, stream, loraWeightsMap);
++    }
++    if (core.value("ok", false))
++    {
++        std::cout << Json{{"event", "partial"}, {"id", sid}, {"text", transcriptFromCore(core)}}.dump() << std::endl;
++    }
++    else
++    {
++        // Decode failure on an intermediate hop is non-fatal to the session: surface
++        // it but keep the lane so a later (longer) cumulative hop can still finalize.
++        Json ev = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "partial_decode_failed"}};
++        if (core.contains("error")) ev["detail"] = core["error"];
++        std::cout << ev.dump() << std::endl;
++    }
++}
++
++//! Build the one-shot request envelope for a finalized session (cumulative audio).
++Json buildFinalizeRequest(std::string const& sid, SessionState const& st)
++{
++    Json req = st.beginMeta.is_object() ? st.beginMeta : Json::object();
++    if (!req.contains("batch_size")) req["batch_size"] = 1;
++    if (!req.contains("temperature")) req["temperature"] = 1.0;
++    if (!req.contains("top_p")) req["top_p"] = 1.0;
++    if (!req.contains("top_k")) req["top_k"] = 1;
++    if (!req.contains("max_generate_length")) req["max_generate_length"] = 256;
++    req["id"] = sid;
++    Json content = Json::array();
++    if (!st.melPath.empty())
++    {
++        content.push_back(Json{{"type", "audio"}, {"audio", st.melPath}});
++    }
++    // (pcm path: the runtime's mel-extractor consumes pcm_b64 via the request
++    //  parser when mel assets are wired; mel_path is the primary fixture path.)
++    if (!st.pcmB64.empty())
++    {
++        content.push_back(Json{{"type", "audio"}, {"pcm_b64", st.pcmB64}});
++    }
++    req["requests"] = Json::array({Json{{"messages", Json::array({Json{{"role", "user"}, {"content", content}}})},
++        {"reference", "ref"}}});
++    return req;
++}
++
++//! end / last:true: finalize via the PROVEN one-shot core, release lane, emit final.
++void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap)
+ {
+-    Json ev = {{"event", "error"}, {"ok", false},
+-        {"error", "streaming_not_supported_v080_oneshot_worker"}, {"status", 501}};
+-    std::string const id = input.value("id", "");
+-    if (!id.empty())
++    std::string const sid = input.value("id", "");
++    auto it = gSessions.find(sid);
++    if (it == gSessions.end())
+     {
+-        ev["id"] = id;
++        std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "unknown_session"}}.dump()
++                  << std::endl;
++        return;
+     }
+-    std::cout << ev.dump() << std::endl;
++    SessionState st = it->second; // copy; we release the slot below regardless of outcome
++    // Allow `end` to carry the final cumulative audio too.
++    if (input.contains("mel_path") && input["mel_path"].is_string()) st.melPath = input["mel_path"].get<std::string>();
++    else if (input.contains("audio") && input["audio"].is_string()) st.melPath = input["audio"].get<std::string>();
++    if (input.contains("pcm_b64") && input["pcm_b64"].is_string()) st.pcmB64 = input["pcm_b64"].get<std::string>();
++
++    Json finalEv;
++    if (st.melPath.empty() && st.pcmB64.empty())
++    {
++        finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "no_audio_accumulated"}};
++    }
++    else
++    {
++        Json const req = buildFinalizeRequest(sid, st);
++        Json core;
++        {
++            std::lock_guard<std::mutex> lk(gEngineExecMutex);
++            core = runOneShotCore(req, runtime, stream, loraWeightsMap);
++        }
++        // Re-shape the one-shot `done` into a streaming `final` (same output_text).
++        // Also expose a lang-tag-stripped `text` so partial/final agree byte-for-byte
++        // on the bare transcript (task #10 convergence contract).
++        finalEv = Json{{"event", "final"}, {"id", sid}, {"ok", core.value("ok", false)}};
++        if (core.contains("responses")) finalEv["responses"] = core["responses"];
++        if (core.value("ok", false)) finalEv["text"] = transcriptFromCore(core);
++        if (core.contains("total_ms")) finalEv["total_ms"] = core["total_ms"];
++        if (core.contains("error")) finalEv["error"] = core["error"];
++    }
++
++    // Release the lane back to the pool (guaranteed, success or failure) and drop the session.
++    gLaneMgr->release(st.laneId);
++    gSessions.erase(sid);
++    std::cout << finalEv.dump() << std::endl;
+ }
+ 
+-void handleBegin(Json const& input) { emitStreamingNotSupported(input); }
+-void handleChunk(Json const& input) { emitStreamingNotSupported(input); }
+-void handleEnd(Json const& input) { emitStreamingNotSupported(input); }
++//! Mandatory idle-sweep: reclaim lanes of sessions silent past kIdleTimeoutMs.
++void sweepIdleSessions()
++{
++    if (gSessions.empty()) return;
++    auto const now = std::chrono::steady_clock::now();
++    std::vector<std::pair<std::string, int32_t>> reap;
++    for (auto const& [sid, st] : gSessions)
++    {
++        int64_t const idleMs
++            = std::chrono::duration_cast<std::chrono::milliseconds>(now - st.lastActivity).count();
++        if (idleMs > kIdleTimeoutMs)
++        {
++            reap.emplace_back(sid, st.laneId);
++        }
++    }
++    for (auto const& [sid, lane] : reap)
++    {
++        gLaneMgr->release(lane);
++        gSessions.erase(sid);
++        std::cout << Json{{"event", "timeout"}, {"id", sid}, {"ok", false}, {"error", "idle_timeout"},
++            {"idle_ms", kIdleTimeoutMs}}.dump() << std::endl;
++    }
++}
+ 
+-void handleOneShot(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++//! Core one-shot engine step: parse the `requests` payload, run handleRequest on
++//! each, and return the assembled response Json. This is the PROVEN golden path
++//! (CER 0.0000 + byte-identity). Both the legacy event-less one-shot path AND the
++//! streaming `end`/finalize path call this, so finalize inherits exact parity.
++//! NOT internally synchronized — callers must hold gEngineExecMutex (shared
++//! PipelineIO is mutated by handleRequest).
++Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
+     std::unordered_map<std::string, std::string>& loraWeightsMap)
+ {
+     Json response;
+@@ -240,10 +534,9 @@ void handleOneShot(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t st
+         std::error_code ec;
+         std::filesystem::remove(tempPath, ec);
+     }
+-    std::cout << response.dump() << std::endl;
++    return response;
+ }
+ 
+-
+ } // namespace
+ 
+ int main(int argc, char** argv)
+@@ -276,29 +569,25 @@ int main(int argc, char** argv)
+         LOG_WARNING("CUDA graph capture failed for ASR one-shot runtime, proceeding without.");
+     }
+     rt::LLMInferenceRuntime* runtime = runtimePtr.get();
++
++    // Task #9: lane reservation pool. asrMax = requested --max_slots, clamped to
++    // the engine's physical batch capacity (maxSessionBatchSize). The b2 engine
++    // exposes 2 rows; the b1 engine exposes 1 (so N>1 silently degrades to N=1
++    // there). TTS partition is 0 in this ASR-only worker.
++    int32_t const physBatch = runtime->maxSessionBatchSize();
++    int32_t asrMax = args.maxSlots;
++    if (asrMax > physBatch) asrMax = physBatch;
++    if (asrMax < 1) asrMax = 1;
++    gMaxSlots = asrMax;
++    gLaneMgr = std::make_unique<rt::SessionLaneManager>(physBatch, asrMax, /*ttsMax=*/0);
++
+     double const initMs
+         = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initStart).count();
+-    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}, {"max_slots", 1}}.dump() << std::endl;
+-
+-    // D1 (Step 2): build the N-slot decoder pool. Slot 0 deserializes the base
+-    // engine once; slots 1..N-1 SHARE that ICudaEngine via the fork
+-    // shared-engine constructor (weight memory paid once, contexts independent).
+-    // Each slot owns its own CUDA stream. CUDA-graph capture is per-slot.
+-
+-    // Step 3: begin/chunk/end now route by sessionId across ALL slots (see the
+-    // legacy one-shot path (lines with no `event` field) keeps using slot 0's
+-    // runtime + stream — it is a single serial request flow and never touches
+-    // the slot pool's session state.
+-
+-    // Streaming worker stdin loop. Use poll() with 1 s timeout so we can fire
+-    // an idle-timeout sweep between events (§15.6 step 4).
+-    //
+-    // Step 3 — sweep ALL slots (not just slot 0). Any slot whose session has
+-    // been idle past kIdleTimeoutMs is force-closed: emit a timeout event then
+-    // release the slot back to the pool and drop its routing mapping. Snapshot
+-    // the (sessionId, idleMs) of timed-out slots first, then release outside
+-    // the gather to keep the release path identical to the end/error path.
+-    auto const checkIdleTimeout = []() {};
++    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}, {"max_slots", gMaxSlots}}.dump() << std::endl;
++
++    // Streaming worker stdin loop. Use poll() with a 1 s timeout so we can fire
++    // the mandatory idle-timeout sweep between events (half-open lane-leak guard).
++    auto const checkIdleTimeout = []() { sweepIdleSessions(); };
+ 
+     std::string buffer;
+     char readBuf[4096];
+@@ -362,26 +651,30 @@ int main(int argc, char** argv)
+             if (!parsed.contains("event"))
+             {
+                 // Backward-compat one-shot: any line that omits `event` flows
+-                // through the M2 legacy path. handleRequest behavior unchanged.
+-                handleOneShot(std::move(parsed), *runtime, stream, loraWeightsMap);
++                // through the legacy path. BYTE-IDENTICAL with v080-0016: same
++                // core, same response shape. Mutex held for forward-compat (no
++                // contention single-threaded) so the engine step is identical.
++                Json response;
++                {
++                    std::lock_guard<std::mutex> lk(gEngineExecMutex);
++                    response = runOneShotCore(std::move(parsed), *runtime, stream, loraWeightsMap);
++                }
++                std::cout << response.dump() << std::endl;
+                 continue;
+             }
+ 
+             std::string const event = parsed.value("event", "");
+             if (event == "begin")
+             {
+-                // Step 3 — routes via acquireSlot + binds sessionId → slot.
+                 handleBegin(parsed);
+             }
+             else if (event == "chunk")
+             {
+-                // Step 3 — routes via lookupSlot to the slot bound at begin.
+-                handleChunk(parsed);
++                handleChunk(parsed, *runtime, stream, loraWeightsMap);
+             }
+             else if (event == "end")
+             {
+-                // Step 3 — routes via lookupSlot + releases the slot.
+-                handleEnd(parsed);
++                handleEnd(parsed, *runtime, stream, loraWeightsMap);
+             }
+             else
+             {
