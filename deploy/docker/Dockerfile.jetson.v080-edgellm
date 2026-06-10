@@ -43,6 +43,17 @@ COPY            bin/libNvInfer_edgellm_plugin.so /opt/edgellm-v080/plugins/libNv
 COPY --chmod=0755 pull_v080_artifacts.sh       /opt/speech/pull_v080_artifacts.sh
 COPY --chmod=0755 entrypoint.jetson.v080.sh    /opt/speech/entrypoint.jetson.v080.sh
 
+# ── voxedge worker_io robustness patch (Blocker #3) ───────────────────────────
+# The base wheel's WorkerIO._reader_loop drops a worker error event that carries
+# no routable id ("stale/unsolicited → drop silently"), so the caller hangs the
+# full 60s q.get timeout instead of surfacing the error. This patched copy routes
+# an unkeyed/unmatched ERROR event to the sole inflight queue when exactly one
+# request is in flight (N=1), so worker errors return fast. Only `event=="error"`
+# is rerouted (never partial/done) to avoid corrupting a legitimately stale
+# stream. Functionally identical otherwise (byte-equal except the reroute guard).
+COPY worker_io.voxedge-patch.py \
+     /usr/local/lib/python3.10/dist-packages/voxedge/backends/jetson/worker_io.py
+
 # ── v0.8.0 edgellm profile (generic-runner TTS worker, no explicit-KV flags) ───
 # Not present in the base image's configs/ — add it so the canonical entrypoint
 # can resolve OVS_PROFILE=jetson-edgellm-v080.
