@@ -48,8 +48,8 @@ Each file: path (relative to base) · size (bytes) · md5. 34 files, 7.577 GB to
 
 | Path | Size | md5 |
 |---|---|---|
-| engines/asr/audio/audio_encoder.engine | 377555460 | 5c877cfe58b8fcb7914679c6fe274f90 |
-| engines/asr/audio/config.json | 2564 | 0ad147209168659dc23a9081472c718d |
+| engines/asr/audio/audio_encoder.engine | 377959836 | ede676fbd99cb51d556b96637bce86fc |
+| engines/asr/audio/config.json | 2563 | 3b9ff631075bab6a8e44631fe6fa1c5f |
 | engines/asr/llm/config.json | 943 | 841508805eaa3709eaa62809e9af4326 |
 | engines/asr/llm/embedding.safetensors | 311165016 | 8db9ceda288e2470694a0bc33dbfd381 |
 | engines/asr/llm/llm.engine | 1212033660 | b133dff24c8aa96ac1679b95e2f97153 |
@@ -89,6 +89,7 @@ Each file: path (relative to base) · size (bytes) · md5. 34 files, 7.577 GB to
 - **MOSS-TTS-Nano engines** already live on HF at `harvestsu/seeed-local-voice-artifacts/models/moss-tts-nano/engines` (SKIP re-upload). The MOSS *worker binary* (`moss_tts_nano_worker`, md5 `6a03bdf5`, built by `cpp/workers/build_moss_worker.sh` to `/tmp/moss_tts_nano_worker`) IS included here under `workers/`.
 - **ASR plugin:** v0.8.0 uses a single `libNvInfer_edgellm_plugin.so`; no separate `_asr.so` was built for v080 (the pre-v080 deploy tree's `_asr.so` is stale, May-16, and was not uploaded).
 - All 34 md5s were verified identical orin-nx (source) == wsl2-local (relay) == HF (post-upload) before this doc was finalized.
+- **2026-06-10 (v080-0019) — `engines/asr/audio/` RE-STAGED.** The original audio encoder (md5 `5c877cfe…`) was built with `audio_build --minTimeSteps 1000 --maxTimeSteps 3000` → padded_feature opt profile `[10,128,100]..[30,128,100]`, which **rejects short serving mels** (production 5.5 s segments → 1–6 chunks → `satisfyProfile` FAIL). Rebuilt with `--minTimeSteps 100 --maxTimeSteps 3000` (= the `audio_build` default min; → opt profile `[1,128,100]..[30,128,100]`, min chunk = 1). Same ONNX, same FP16 weights — wider dynamic range only (neutral to accuracy; one-shot transcript still byte-exact to golden, verified EN+ZH loopback). New md5s above (engine `ede676fb…`, config `3b9ff631…`) re-uploaded to HF via wsl2-local relay (`HF_ENDPOINT=https://huggingface.co hf upload …/engines/asr/audio`).
 
 ## Verdict
 
