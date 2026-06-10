@@ -48,6 +48,16 @@ using Json = nlohmann::json;
 
 namespace
 {
+//! Global MelExtractor handle. Loaded once at startup if the caller passed
+//! --melSettings / --melFilters (or set the matching env vars). Null means PCM
+//! input is disabled and `pcm_b64` chunks are refused with pcm_input_unsupported.
+//! Restored from the v0.7.x streaming worker (asr-worker-build-verify): the #9
+//! refactor dropped this, so `pcm_b64` chunks fell through to the request parser
+//! as a non-safetensors `audio` value and SIGABRT'd. The production
+//! StreamingWorkerSession (voxedge trt_edge_llm_asr.py) sends raw float32-LE PCM
+//! via `pcm_b64`, so the worker MUST convert PCM->mel itself in stream_mode=worker.
+std::unique_ptr<MelExtractor> gMelExtractor;
+
 struct Args
 {
     std::string engineDir;
@@ -57,6 +67,129 @@ struct Args
     int32_t maxSlots{4};             //!< ASR decoder slot-pool size (D1 concurrency). Default 4.
     bool debug{false};
 };
+
+//! Minimal base64 decoder (RFC 4648; ignores '=' padding and whitespace).
+//! Restored verbatim from the v0.7.x reference worker — used to decode the
+//! `pcm_b64` payload (raw float32 little-endian PCM) the service sends.
+std::vector<uint8_t> base64Decode(std::string const& in)
+{
+    static int8_t kT[256];
+    static bool kInit = []() {
+        for (auto& v : kT) v = -1;
+        char const* a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (int i = 0; i < 64; ++i) kT[static_cast<unsigned char>(a[i])] = static_cast<int8_t>(i);
+        return true;
+    }();
+    (void)kInit;
+    std::vector<uint8_t> out;
+    out.reserve(in.size() * 3 / 4 + 4);
+    int32_t v = 0;
+    int32_t bits = 0;
+    for (char c : in)
+    {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ') continue;
+        int8_t const x = kT[static_cast<unsigned char>(c)];
+        if (x < 0) continue;
+        v = (v << 6) | x;
+        bits += 6;
+        if (bits >= 8)
+        {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((v >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+//! Write a [1, n_mels, n_frames] fp16 mel as a single-tensor safetensors file
+//! named "mel" — the exact on-disk format the requestFileParser audio path
+//! consumes (.safetensors mel-spectrogram). Restored verbatim from the v0.7.x
+//! reference worker so the PCM-derived mel is byte-compatible with the mel_path
+//! fixtures the standalone gates used.
+void writeMelSafetensors(std::vector<float> const& mel_f32, int32_t n_mels, int32_t n_frames,
+    std::filesystem::path const& out_path)
+{
+    auto f32_to_f16 = [](float f) -> uint16_t {
+        uint32_t x;
+        std::memcpy(&x, &f, sizeof(x));
+        uint32_t const sign = (x >> 16) & 0x8000u;
+        int32_t const exp = static_cast<int32_t>((x >> 23) & 0xFF) - 127 + 15;
+        uint32_t const mant = x & 0x7FFFFFu;
+        if (exp <= 0)
+        {
+            if (exp < -10) return static_cast<uint16_t>(sign);
+            uint32_t const m = (mant | 0x800000u) >> (1 - exp);
+            uint32_t const rounded = (m + 0x1000u) >> 13;
+            return static_cast<uint16_t>(sign | rounded);
+        }
+        if (exp >= 31)
+        {
+            if (((x >> 23) & 0xFF) == 0xFF && mant != 0) return static_cast<uint16_t>(sign | 0x7E00u);
+            return static_cast<uint16_t>(sign | 0x7C00u);
+        }
+        uint32_t const m = mant >> 13;
+        uint32_t const r = mant & 0x1FFFu;
+        uint16_t out = static_cast<uint16_t>(sign | (exp << 10) | m);
+        if (r > 0x1000u || (r == 0x1000u && (m & 1))) ++out;
+        return out;
+    };
+
+    int32_t const batch = 1;
+    size_t const elem_count = static_cast<size_t>(batch) * n_mels * n_frames;
+    if (elem_count != mel_f32.size())
+    {
+        throw std::runtime_error("writeMelSafetensors: tensor size mismatch");
+    }
+    std::vector<uint16_t> half(elem_count);
+    for (size_t i = 0; i < elem_count; ++i) half[i] = f32_to_f16(mel_f32[i]);
+
+    size_t const nbytes = half.size() * sizeof(uint16_t);
+    Json header = Json{{"mel", Json{{"dtype", "F16"}, {"shape", Json::array({batch, n_mels, n_frames})},
+                                  {"data_offsets", Json::array({0, nbytes})}}}};
+    std::string header_str = header.dump();
+    while ((header_str.size() % 8) != 0) header_str.push_back(' ');
+
+    std::ofstream f(out_path, std::ios::binary);
+    if (!f) throw std::runtime_error("writeMelSafetensors: cannot open " + out_path.string());
+    uint64_t const header_len = static_cast<uint64_t>(header_str.size());
+    f.write(reinterpret_cast<char const*>(&header_len), sizeof(header_len));
+    f.write(header_str.data(), static_cast<std::streamsize>(header_str.size()));
+    f.write(reinterpret_cast<char const*>(half.data()), static_cast<std::streamsize>(nbytes));
+}
+
+//! Convert a cumulative float32-LE `pcm_b64` payload into a temp mel safetensors
+//! file and return its path. Throws on malformed/too-short PCM. Caller is
+//! responsible for removing the returned tempfile. Requires gMelExtractor.
+std::filesystem::path pcmB64ToMelSafetensors(std::string const& pcmB64, std::string const& sid)
+{
+    std::vector<uint8_t> raw = base64Decode(pcmB64);
+    if (raw.empty() || (raw.size() % sizeof(float)) != 0)
+    {
+        throw std::runtime_error("pcm_b64_malformed: decoded bytes not a positive multiple of 4 (float32-LE expected)");
+    }
+    std::vector<float> pcm(raw.size() / sizeof(float));
+    std::memcpy(pcm.data(), raw.data(), raw.size());
+    int32_t n_frames = 0;
+    // Pad to the encoder chunk size so the [-1, 128, 100] static profile is
+    // satisfied for short first hops (≈0.5 s → 50 frames → pad to 100).
+    std::vector<float> mel = gMelExtractor->compute(pcm, &n_frames, kEncoderMelFramesPerChunk);
+    if (n_frames <= 0)
+    {
+        throw std::runtime_error("pcm_too_short: produced 0 mel frames");
+    }
+    std::string safeId = sid.empty() ? std::string("s") : sid;
+    for (auto& ch : safeId)
+    {
+        bool const ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'
+            || ch == '-';
+        if (!ok) ch = '_';
+    }
+    auto path = std::filesystem::temp_directory_path()
+        / ("qwen3_asr_pcm_mel_" + safeId + "_"
+            + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".safetensors");
+    writeMelSafetensors(mel, gMelExtractor->n_mels(), n_frames, path);
+    return path;
+}
 
 enum OptionId : int
 {
@@ -192,6 +325,7 @@ struct SessionState
 {
     int32_t laneId{-1};                       //!< Reserved lane (SessionLaneManager).
     std::string melPath;                      //!< Cumulative mel safetensors path (last chunk wins).
+    std::string melPathOwned;                 //!< PCM-derived temp mel safetensors we own + must rm on release.
     std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
     Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
@@ -339,6 +473,42 @@ void handleChunk(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream
         return;
     }
 
+    // PCM-input path (stream_mode=worker): the service sends raw float32-LE PCM in
+    // `pcm_b64`. Convert the CUMULATIVE PCM to a mel safetensors here so the engine
+    // request only ever carries a `.safetensors` audio path (requestFileParser
+    // accepts nothing else → without this the parser threw on a missing `audio`
+    // key and the worker SIGABRT'd; #11). Refuse cleanly if mel assets are absent.
+    if (!st.pcmB64.empty())
+    {
+        if (!gMelExtractor)
+        {
+            std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_input_unsupported"},
+                {"hint", "worker started without --melSettings/--melFilters; pass them or set "
+                         "EDGE_LLM_ASR_MEL_{SETTINGS,FILTERS}"}}
+                             .dump()
+                      << std::endl;
+            return;
+        }
+        try
+        {
+            if (!st.melPathOwned.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove(st.melPathOwned, ec);
+            }
+            st.melPathOwned = pcmB64ToMelSafetensors(st.pcmB64, sid).string();
+            st.melPath = st.melPathOwned;
+        }
+        catch (std::exception const& e)
+        {
+            std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_to_mel_failed"},
+                {"detail", e.what()}}
+                             .dump()
+                      << std::endl;
+            return;
+        }
+    }
+
     // No audio recorded yet => nothing to decode; just ack so the lane stays warm.
     if (st.melPath.empty() && st.pcmB64.empty())
     {
@@ -379,15 +549,13 @@ Json buildFinalizeRequest(std::string const& sid, SessionState const& st)
     if (!req.contains("max_generate_length")) req["max_generate_length"] = 256;
     req["id"] = sid;
     Json content = Json::array();
+    // melPath is ALWAYS a `.safetensors` mel path here: mel_path callers set it
+    // directly; pcm_b64 callers had it converted to a temp mel safetensors in
+    // handleChunk/handleEnd (st.melPathOwned). requestFileParser accepts ONLY a
+    // .safetensors audio path, so we never emit raw pcm_b64 into the request.
     if (!st.melPath.empty())
     {
         content.push_back(Json{{"type", "audio"}, {"audio", st.melPath}});
-    }
-    // (pcm path: the runtime's mel-extractor consumes pcm_b64 via the request
-    //  parser when mel assets are wired; mel_path is the primary fixture path.)
-    if (!st.pcmB64.empty())
-    {
-        content.push_back(Json{{"type", "audio"}, {"pcm_b64", st.pcmB64}});
     }
     req["requests"] = Json::array({Json{{"messages", Json::array({Json{{"role", "user"}, {"content", content}}})},
         {"reference", "ref"}}});
@@ -410,10 +578,47 @@ void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t
     // Allow `end` to carry the final cumulative audio too.
     if (input.contains("mel_path") && input["mel_path"].is_string()) st.melPath = input["mel_path"].get<std::string>();
     else if (input.contains("audio") && input["audio"].is_string()) st.melPath = input["audio"].get<std::string>();
-    if (input.contains("pcm_b64") && input["pcm_b64"].is_string()) st.pcmB64 = input["pcm_b64"].get<std::string>();
+    bool endCarriedPcm = false;
+    if (input.contains("pcm_b64") && input["pcm_b64"].is_string())
+    {
+        st.pcmB64 = input["pcm_b64"].get<std::string>();
+        endCarriedPcm = true;
+    }
 
+    // If `end` itself carried fresh cumulative PCM, convert it to a mel safetensors
+    // now (chunks already converted theirs into st.melPath/melPathOwned). Same guard
+    // + conversion as handleChunk so the engine request only ever sees a .safetensors.
     Json finalEv;
-    if (st.melPath.empty() && st.pcmB64.empty())
+    if (endCarriedPcm && gMelExtractor)
+    {
+        try
+        {
+            if (!st.melPathOwned.empty())
+            {
+                std::error_code ec;
+                std::filesystem::remove(st.melPathOwned, ec);
+            }
+            st.melPathOwned = pcmB64ToMelSafetensors(st.pcmB64, sid).string();
+            st.melPath = st.melPathOwned;
+        }
+        catch (std::exception const& e)
+        {
+            st.melPath.clear();
+            finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_to_mel_failed"},
+                {"detail", e.what()}};
+        }
+    }
+    else if (endCarriedPcm && !gMelExtractor)
+    {
+        finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_input_unsupported"},
+            {"hint", "worker started without --melSettings/--melFilters"}};
+    }
+
+    if (!finalEv.is_null())
+    {
+        // pcm-conversion error already populated finalEv; fall through to release.
+    }
+    else if (st.melPath.empty())
     {
         finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "no_audio_accumulated"}};
     }
@@ -434,6 +639,19 @@ void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t
         if (core.contains("total_ms")) finalEv["total_ms"] = core["total_ms"];
         if (core.contains("error")) finalEv["error"] = core["error"];
     }
+
+    // Remove any PCM-derived temp mel safetensors we own. Both the original
+    // session's last-chunk tempfile (it->second.melPathOwned) and a fresh one the
+    // `end` event may have produced into the local copy (st.melPathOwned) get rm'd.
+    auto rmOwned = [](std::string const& p) {
+        if (!p.empty())
+        {
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+        }
+    };
+    rmOwned(it->second.melPathOwned);
+    if (st.melPathOwned != it->second.melPathOwned) rmOwned(st.melPathOwned);
 
     // Release the lane back to the pool (guaranteed, success or failure) and drop the session.
     gLaneMgr->release(st.laneId);
@@ -458,6 +676,12 @@ void sweepIdleSessions()
     }
     for (auto const& [sid, lane] : reap)
     {
+        auto sit = gSessions.find(sid);
+        if (sit != gSessions.end() && !sit->second.melPathOwned.empty())
+        {
+            std::error_code ec;
+            std::filesystem::remove(sit->second.melPathOwned, ec);
+        }
         gLaneMgr->release(lane);
         gSessions.erase(sid);
         std::cout << Json{{"event", "timeout"}, {"id", sid}, {"ok", false}, {"error", "idle_timeout"},
@@ -551,9 +775,26 @@ int main(int argc, char** argv)
     gLogger.setLevel(args.debug ? nvinfer1::ILogger::Severity::kVERBOSE : nvinfer1::ILogger::Severity::kWARNING);
     auto pluginHandles = loadEdgellmPluginLib();
 
-    // M4 step 5: load mel-preprocessing assets if provided. PCM input via
-    // `pcm_b64` chunk events requires both files; mel_path-only callers
-    // remain fully supported when these are absent.
+    // Load mel-preprocessing assets if provided (restored from the v0.7.x worker;
+    // the #9 refactor dropped this). PCM input via `pcm_b64` chunk events requires
+    // both files; mel_path-only callers remain fully supported when these are
+    // absent. The production stream_mode=worker path ALWAYS sends pcm_b64, so these
+    // must be wired (the v080 profile sets EDGE_LLM_ASR_MEL_{SETTINGS,FILTERS}).
+    if (!args.melSettingsPath.empty() && !args.melFiltersPath.empty())
+    {
+        try
+        {
+            gMelExtractor = std::make_unique<MelExtractor>(args.melSettingsPath, args.melFiltersPath);
+            LOG_INFO("MelExtractor loaded (n_fft=%d n_mels=%d hop=%d) — pcm_b64 input enabled",
+                gMelExtractor->n_fft(), gMelExtractor->n_mels(), gMelExtractor->hop_length());
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("MelExtractor init failed: %s — PCM input disabled", e.what());
+            gMelExtractor.reset();
+        }
+    }
+
     setProfilingEnabled(true);
 
     auto const initStart = std::chrono::steady_clock::now();
