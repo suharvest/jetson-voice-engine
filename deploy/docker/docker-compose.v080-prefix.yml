@@ -66,6 +66,7 @@ services:
       OVS_V2V_ENGINE: voxedge
       OVS_V2V_SERVER_LOOP: "1"
       OVS_V2V_EVICT_ON_FULL: "1"
+      EDGE_LLM_BASE_URL: http://edge-llm:8000/v1
       NVIDIA_VISIBLE_DEVICES: all
       LD_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-cuda:/host-nvidia-libs:/host-libs
       EDGELLM_V080_AUTO_PULL: "1"
