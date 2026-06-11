@@ -26,9 +26,16 @@
 #   * voice-arm_default is owned by the voice stack compose and attached external
 #     so name resolution to seeed-voice-v080-prefix survives recreates.
 #
+#
+# DEV-VISION IMAGE (2026-06-11)
+#   image = voice-rebot-arm:dev + a docker commit of the running container
+#   capturing hand-installed Phase B vision deps (pyorbbecsdk2 + libgl1 +
+#   libglib2.0-0). The box model is NOT baked: it is mounted read-only from
+#   the host at /home/seeed/rebot-models -> /opt/rebot-models (replaceable).
+#
 services:
   voice-rebot-arm:
-    image: voice-rebot-arm:dev
+    image: voice-rebot-arm:dev-vision-20260611
     container_name: voice-rebot-arm
     restart: unless-stopped
     privileged: true
@@ -64,6 +71,7 @@ services:
     volumes:
       - /run/user:/run/user:ro
       - /dev/serial:/dev/serial:ro
+      - /home/seeed/rebot-models:/opt/rebot-models:ro   # host box model(s) for grasp config (replaceable)
 
     devices:
       - /dev/snd:/dev/snd
