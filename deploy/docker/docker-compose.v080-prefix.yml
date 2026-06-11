@@ -1,0 +1,97 @@
+# docker-compose.v080-prefix.yml — one-pull deploy for the v0.8.0 edgellm voice
+# stack with the #15 PREFIX-ROLLBACK flat-decode streaming ASR (byte-exact final).
+#
+# RELATION TO docker-compose.v080.yml
+#   That file deploys the conservative BASE v0.8.0 (accumulate one-shot ASR,
+#   profile jetson-edgellm-v080, image …-20260610e). THIS file is the ADDITIVE
+#   opt-in upgrade: the N>1 streaming-worker path PLUS the prefix-rollback
+#   flat-decode optimization (3–6× lower per-hop latency on medium/long
+#   utterances, byte-exact final). New service `seeed-voice-v080-prefix` on its
+#   own port (8623) + its own engine volume — never collides with production
+#   (8621) or the base v080 stack (8622).
+#
+# WHAT THE PREFIX IMAGE BAKES (so this compose stays thin)
+#   image :v0.8.0-edgellm-20260611-prefix bakes:
+#     * the prefix-rollback ASR worker (md5 5ddbcdf7) + #9/#10 N>1 + streaming
+#     * OVS_PROFILE=jetson-edgellm-v080-n2  (EDGE_LLM_ASR_STREAM_MODE=worker,
+#       asr_max_slots=2 → 3rd concurrent /asr/stream → 4429)
+#     * OVS_ASR_STREAM_PREFIX=1            (cheap flat-decode rollback partials:
+#       computePrefix unfixedTokenNum=5 / unfixedChunkNum=2)
+#     * OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT=1  (final = clean one-shot re-decode
+#       → byte-exact final, CER 0.0000; eliminates the rollback residual)
+#     * deploy_paths → the maxBatch=2 llm engine (engines/asr-b2/llm) + the
+#       [1,30] minchunk1 audio encoder (min_time_steps=100)
+#   All baked; the env keys below are surfaced for visibility/override only.
+#
+# THE FULL DEPLOY CONTRACT (identical to docker-compose.v080.yml — slim image)
+#   slim-lib host mounts + LD_LIBRARY_PATH + nvidia runtime are REQUIRED (the
+#   slim image carries NO TensorRT/CUDA libs). First boot HF-pulls the -n2
+#   engines (pull_v080_artifacts-n2.sh, baked entrypoint) into the dedicated
+#   `edgellm-v080-n2` volume (kept separate from the base stack's `edgellm-v080`
+#   so the per-tree llm.engine sentinel never skips the maxBatch=2 pull).
+#
+# USAGE
+#   docker compose -f docker-compose.v080-prefix.yml up -d
+#   curl localhost:8623/health      # asr_backend trt_edgellm, capabilities incl streaming
+#   # First boot: ~5-15 min HF pull (watch logs -f). Subsequent boots: ~10 s.
+#
+# MEMORY NOTE (verified 2026-06-11 on orin-nx 16GB AND orin-nano 8GB)
+#   FITS on Orin Nano 8GB with full ASR+TTS: peak 5.3GB RAM + 0.8GB swap,
+#   ~2.1GB free, no OOM. On Orin NX 16GB co-resides comfortably. Do NOT run this
+#   alongside the base v080 stack on nano (two edgellm stacks will OOM 8GB).
+#
+# DISK NOTE (have ≥10GB free at first boot)
+#   The baked pull script downloads ~4.7GB to /tmp then `cp`s to /opt before
+#   cleanup → transiently needs ~9.4GB free. Engine set on disk = 5.3GB. Both
+#   test boxes (~97% full) squeezed through to 100% and recovered, but a box
+#   with <~5GB free AT PULL TIME will fail. Follow-up: pull script cp→mv/rsync
+#   to halve peak (needs an image rebuild to land).
+#
+services:
+  seeed-voice-v080-prefix:
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v0.8.0-edgellm-20260611-prefix
+    container_name: seeed-voice-v080-prefix
+    restart: unless-stopped
+
+    runtime: nvidia
+
+    ports:
+      - "8623:8000"        # alt port; prod=8621, base-v080=8622
+
+    environment:
+      # All baked in the image; surfaced here for visibility / override.
+      OVS_PROFILE: jetson-edgellm-v080-n2
+      OVS_ASR_STREAM_PREFIX: "1"
+      OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      LD_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-cuda:/host-nvidia-libs:/host-libs
+      EDGELLM_V080_AUTO_PULL: "1"
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+
+    volumes:
+      # ── slim-lib host mounts (verbatim from prod contract) ──
+      - /usr/local/cuda/lib64:/host-cuda
+      - /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs
+      - /lib/aarch64-linux-gnu:/host-libs
+      - /usr/lib/python3.10/dist-packages/tensorrt:/usr/lib/python3.10/dist-packages/tensorrt
+      - /usr/src/tensorrt:/usr/src/tensorrt
+      # ── dedicated -n2 engine cache (maxBatch=2 llm + minchunk1 encoder) ──
+      - edgellm-v080-n2:/opt/edgellm-v080
+      # ── shared speech-models provisioner cache (MOSS codec etc.) ──
+      - speech-models:/opt/models
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 900s
+      retries: 5
+
+volumes:
+  # First-boot HF -n2 engine cache (maxBatch=2 + minchunk1). Separate from the
+  # base stack's edgellm-v080 volume so the sentinel never cross-skips.
+  edgellm-v080-n2:
+    name: edgellm-v080-n2
+  speech-models:
+    name: speech-models
+    external: true
