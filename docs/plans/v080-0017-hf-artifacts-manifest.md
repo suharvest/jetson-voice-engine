@@ -80,7 +80,7 @@ Each file: path (relative to base) · size (bytes) · md5. 34 files, 7.577 GB to
 | plugins/libNvInfer_edgellm_plugin.so | 45948424 | 8f004bb4c9ddcce30ae4eecf2f410624 |
 | toolchain/cutedsl_aarch64_sm_87_cuda12.tar.gz | 195655 | cd29d94e411e929b0521dca5a035335c |
 | workers/moss_tts_nano_worker | 562272 | 6a03bdf5c7a26b09f60597b95008ebfe |
-| workers/qwen3_asr_worker | 13921904 | be7bee91728c63253e5926a5933896c0 |
+| workers/qwen3_asr_worker | 14623704 | 5ddbcdf727063102f57ff93f08de3917 |
 | workers/qwen3_tts_worker | 14090720 | 22216e8dc724bd8619d4fca26b0c2d5b |
 
 ## Notes

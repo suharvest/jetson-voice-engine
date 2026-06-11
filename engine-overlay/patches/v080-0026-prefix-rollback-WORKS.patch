@@ -1,0 +1,393 @@
+--- a/qwen3_asr_worker.cpp(#12-clean)
++++ b/qwen3_asr_worker.cpp(+prefix-rollback-WORKS)
+@@ -329,6 +329,14 @@
+     std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
+     Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
+     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
++    //! Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1, default OFF) state. When the
++    //! flag is OFF these stay untouched and the cumulative re-decode path is
++    //! byte-identical to #12. rawDecoded mirrors v0.7.x session.rawDecoded (the
++    //! accumulated transcript WITH its leading "language <X>" tag, exactly as the
++    //! model emits it). chunkId is the per-utterance hop counter that drives the
++    //! unfixedChunkNum warmup (first N hops use NO prefix => full re-decode).
++    std::string rawDecoded;                   //!< Accumulated transcript (lang tag included).
++    int32_t chunkId{0};                       //!< Hop counter (mirrors v0.7.x chunk_id).
+ };
+ 
+ std::mutex gEngineExecMutex;                                   //!< Serializes the whole prefill+decode engine step.
+@@ -383,6 +391,32 @@
+     return std::string();
+ }
+ 
++//! Global tokenizer handle for the streaming-prefix rollback (OVS_ASR_STREAM_PREFIX).
++//! Loaded once in main() from the LLM engine dir (tokenizer.json + chat template)
++//! when the flag is ON; null otherwise. Used ONLY to encode/decode the accumulated
++//! transcript for the unfixedTokenNum roll-back (computePrefix). It is NOT used by
++//! the runtime decode path, so the cumulative/one-shot golden path is unaffected.
++std::unique_ptr<tokenizer::Tokenizer> gPrefixTokenizer;
++
++// Forward declarations for the streaming-prefix path (definitions live after the
++// asrStreamDelta namespace, alongside runOneShotCore which they reuse). handleChunk
++// / handleEnd reference these, so declare them up here.
++namespace asrStreamPrefix
++{
++struct HopOut
++{
++    bool ok{false};
++    std::string generated;   //!< CONTINUATION text from the runtime (post lang-preamble strip).
++    double totalMs{0.0};
++    std::string error;
++};
++bool enabled();
++std::string computePrefix(SessionState const& st, bool isFinish);
++HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
++    bool isFinish, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap);
++} // namespace asrStreamPrefix
++
+ //! begin: reserve a lane (pool_saturated -> 4429), register session, ack.
+ void handleBegin(Json const& input)
+ {
+@@ -516,6 +550,41 @@
+         return;
+     }
+ 
++    // Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1): chunk-and-confirm rollback.
++    // Each hop rolls back the last unfixedTokenNum tokens of the accumulated
++    // transcript (computePrefix) and re-derives them + the new words from the
++    // CURRENT cumulative audio, so a premature EOS / hallucinated tail in the
++    // unstable window is REVISED instead of permanently committed. The first
++    // unfixedChunkNum hops use NO prefix (full re-decode) while early audio is
++    // unstable. Audio stays cumulative; only DECODE is flattened.
++    if (asrStreamPrefix::enabled())
++    {
++        std::string const prefix = asrStreamPrefix::computePrefix(st, /*isFinish=*/false);
++        asrStreamPrefix::HopOut hop;
++        {
++            std::lock_guard<std::mutex> lk(gEngineExecMutex);
++            hop = asrStreamPrefix::runPrefixHop(
++                sid, st, prefix, /*capOverride*/ -1, /*isFinish=*/false, runtime, stream, loraWeightsMap);
++        }
++        if (hop.ok)
++        {
++            // Re-derive the rolled-back tail: rawDecoded = confirmed prefix + fresh
++            // continuation (NOT old-rawDecoded + continuation — that was the #25
++            // poisoning bug). The unstable last-N tokens are thus replaced each hop.
++            st.rawDecoded = prefix + hop.generated;
++            st.chunkId += 1;
++            std::cout << Json{{"event", "partial"}, {"id", sid}, {"text", stripLangTag(st.rawDecoded)}}.dump()
++                      << std::endl;
++        }
++        else
++        {
++            Json ev = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "partial_decode_failed"}};
++            if (!hop.error.empty()) ev["detail"] = hop.error;
++            std::cout << ev.dump() << std::endl;
++        }
++        return;
++    }
++
+     // Cumulative re-decode on the session's reserved lane (serialized by the engine
+     // exec mutex, identical step to the one-shot/finalize path).
+     Json const req = buildFinalizeRequest(sid, st);
+@@ -622,6 +691,30 @@
+     {
+         finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "no_audio_accumulated"}};
+     }
++    else if (asrStreamPrefix::enabled())
++    {
++        // Streaming-prefix finalize: one last chunk-and-confirm hop over the FULL
++        // cumulative audio, UNCAPPED (override=-1) so the utterance completes to
++        // EOS. isFinish=true keeps at least one confirmed token in the prefix
++        // (end=max(1,...)) so a degenerate full roll-back can still resume.
++        std::string const prefix = asrStreamPrefix::computePrefix(st, /*isFinish=*/true);
++        asrStreamPrefix::HopOut hop;
++        {
++            std::lock_guard<std::mutex> lk(gEngineExecMutex);
++            hop = asrStreamPrefix::runPrefixHop(
++                sid, st, prefix, /*uncapped*/ -1, /*isFinish=*/true, runtime, stream, loraWeightsMap);
++        }
++        std::string const finalRaw = prefix + hop.generated;
++        finalEv = Json{{"event", "final"}, {"id", sid}, {"ok", hop.ok}};
++        if (hop.ok)
++        {
++            finalEv["responses"] = Json::array(
++                {Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", finalRaw}}});
++            finalEv["text"] = stripLangTag(finalRaw);
++        }
++        finalEv["total_ms"] = hop.totalMs;
++        if (!hop.error.empty()) finalEv["error"] = hop.error;
++    }
+     else
+     {
+         Json const req = buildFinalizeRequest(sid, st);
+@@ -1095,6 +1188,233 @@
+ }
+ } // namespace asrStreamDelta
+ 
++// ===========================================================================
++// Streaming-prefix CHUNK-AND-CONFIRM ROLLBACK (v0.7.x flat-decode, faithful port).
++//
++// Gated by env OVS_ASR_STREAM_PREFIX=1 (default OFF -> handleChunk/handleEnd take
++// the cumulative re-decode path, byte-identical to #12). Mirrors the v0.7.x worker
++// (asr-worker-build-verify/qwen3_asr_worker.cpp): session params unfixedChunkNum=2,
++// unfixedTokenNum=5, maxDecodeTokensPerHop=64; computePrefix() / runStreamingHop().
++//
++// Mechanism (THE fix the #25 attempt dropped): each hop the accumulated transcript
++// is rolled back by unfixedTokenNum tokens — the last N tokens are treated as
++// UNCONFIRMED/revisable. The runtime re-derives them (plus the new words) from the
++// CURRENT cumulative audio via an assistant-prefix continuation. A premature EOS /
++// hallucinated tail in that unstable window is therefore REVISED with more audio,
++// never permanently committed. Only the confirmed prefix (all but the last N
++// tokens) is reused cheaply (prefilled, not re-decoded). The first unfixedChunkNum
++// hops use NO prefix (full re-decode) while early audio is unstable.
++//
++// Audio stays CUMULATIVE (full mel each hop) — this flattens DECODE, not encode.
++// Per hop:
++//   prefix = computePrefix(rawDecoded, chunkId)   // rolled-back confirmed text
++//   request = user(audio=full cumulative mel) + assistant(prefix)   // open turn
++//   cap = maxDecodeTokensPerHop (final hop uncapped)
++//   rawDecoded = prefix + parseAsrText(generated) // re-derive the rolled-back tail
++// ===========================================================================
++namespace asrStreamPrefix
++{
++constexpr char const* kUtf8Replacement = "\xEF\xBF\xBD"; //!< U+FFFD as UTF-8 (multibyte-split guard).
++
++//! True iff OVS_ASR_STREAM_PREFIX=1 (cached once; default OFF).
++bool enabled()
++{
++    static bool const on = []() {
++        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX");
++        return p != nullptr && std::string(p) == "1";
++    }();
++    return on;
++}
++
++//! unfixedChunkNum (mirrors v0.7.x=2): first N hops use NO prefix => full re-decode
++//! (early audio is unstable, do not confirm anything yet). Env: OVS_ASR_PREFIX_WARMUP.
++int32_t unfixedChunkNum()
++{
++    static int32_t const v = []() {
++        char const* p = std::getenv("OVS_ASR_PREFIX_WARMUP");
++        int32_t x = (p != nullptr) ? std::atoi(p) : 2;
++        return (x >= 0) ? x : 2;
++    }();
++    return v;
++}
++
++//! unfixedTokenNum (mirrors v0.7.x=5): roll back the last N tokens of the accumulated
++//! transcript each hop (treat them UNCONFIRMED/revisable). Env: OVS_ASR_PREFIX_UNFIXED
++//! (the G-correct tuning knob; sweep {5,8,12}).
++int32_t unfixedTokenNum()
++{
++    static int32_t const v = []() {
++        char const* p = std::getenv("OVS_ASR_PREFIX_UNFIXED");
++        int32_t x = (p != nullptr) ? std::atoi(p) : 5;
++        return (x >= 1) ? x : 5;
++    }();
++    return v;
++}
++
++//! maxDecodeTokensPerHop (mirrors v0.7.x=64): per-hop decode cap for non-final hops.
++//! Env: OVS_ASR_STREAM_PREFIX_CAP. Final hop overrides this with an uncapped decode.
++int32_t maxDecodeTokensPerHop()
++{
++    static int32_t const v = []() {
++        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX_CAP");
++        int32_t x = (p != nullptr) ? std::atoi(p) : 64;
++        return (x >= 1) ? x : 64;
++    }();
++    return v;
++}
++
++//! Strip a leading "language X<asr_text>" / "language Xxx " preamble from a raw
++//! model output (mirrors v0.7.x parseAsrText). On a CONTINUATION hop the model does
++//! not re-emit the tag, so this is a no-op; on a fresh (warmup) hop it strips it.
++std::string parseAsrText(std::string const& raw)
++{
++    static constexpr char const* kAsrTextTag = "<asr_text>";
++    auto tagPos = raw.find(kAsrTextTag);
++    if (tagPos != std::string::npos)
++    {
++        return raw.substr(tagPos + std::strlen(kAsrTextTag));
++    }
++    if (raw.rfind("language ", 0) == 0)
++    {
++        auto nl = raw.find('\n');
++        if (nl != std::string::npos) return raw.substr(nl + 1);
++        auto sp1 = raw.find(' ', 9);
++        if (sp1 != std::string::npos)
++        {
++            auto sp2 = raw.find(' ', sp1 + 1);
++            if (sp2 != std::string::npos) return raw.substr(sp2 + 1);
++        }
++    }
++    return raw;
++}
++
++//! THE rollback (faithful port of v0.7.x computePrefix). Returns the CONFIRMED
++//! prefix = accumulated transcript with its last unfixedTokenNum tokens dropped
++//! (those are re-derived from current audio this hop). Returns "" for the first
++//! unfixedChunkNum hops (warmup: no prefix, full re-decode). UTF-8 guard: if the
++//! truncated decode would split a multibyte char (U+FFFD appears), increment the
++//! roll-back count and retry so we never cut a CJK character mid-byte.
++std::string computePrefix(SessionState const& st, bool isFinish)
++{
++    tokenizer::Tokenizer* tok = gPrefixTokenizer.get();
++    if (tok == nullptr || st.rawDecoded.empty())
++    {
++        return "";
++    }
++    if (st.chunkId < unfixedChunkNum())
++    {
++        return "";
++    }
++    auto tokens = tok->encode(st.rawDecoded, /*addBos=*/false, /*addEos=*/false);
++    if (tokens.empty())
++    {
++        return "";
++    }
++    int k = unfixedTokenNum();
++    int const total = static_cast<int>(tokens.size());
++    while (true)
++    {
++        int end = total - k;
++        if (isFinish)
++        {
++            end = std::max(1, end);
++        }
++        else
++        {
++            end = std::max(0, end);
++        }
++        std::string prefix;
++        if (end > 0)
++        {
++            std::vector<tokenizer::Rank> slice(tokens.begin(), tokens.begin() + end);
++            prefix = tok->decode(slice, /*skipSpecialTokens=*/false);
++        }
++        if (prefix.find(kUtf8Replacement) == std::string::npos)
++        {
++            return prefix;
++        }
++        if (!isFinish && end == 0)
++        {
++            return "";
++        }
++        if (isFinish && end == 1)
++        {
++            return prefix;
++        }
++        ++k; // multibyte char split at the boundary -> roll back one more token.
++    }
++}
++
++//! Build the one-shot-style request for an assistant-prefix continuation hop. The
++//! user message carries the FULL cumulative audio; the assistant message carries the
++//! rolled-back `prefix`. apply_chat_template=true + add_generation_prompt=false
++//! leave the assistant turn OPEN so the runtime generates ONLY the continuation
++//! (= the rolled-back tail re-derived from current audio + any new words). When
++//! prefix is empty (warmup hops) we open the turn with add_generation_prompt=true
++//! and NO assistant message (a user-only message with add_generation_prompt=false
++//! does not open the turn). capOverride is plumbed as max_generate_length_override.
++Json buildPrefixRequest(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride)
++{
++    Json req = st.beginMeta.is_object() ? st.beginMeta : Json::object();
++    if (!req.contains("batch_size")) req["batch_size"] = 1;
++    if (!req.contains("temperature")) req["temperature"] = 1.0;
++    if (!req.contains("top_p")) req["top_p"] = 1.0;
++    if (!req.contains("top_k")) req["top_k"] = 1;
++    if (!req.contains("max_generate_length")) req["max_generate_length"] = 256;
++    req["id"] = sid;
++    req["apply_chat_template"] = true;
++    req["max_generate_length_override"] = capOverride;
++
++    Json userContent = Json::array();
++    if (!st.melPath.empty())
++    {
++        userContent.push_back(Json{{"type", "audio"}, {"audio", st.melPath}});
++    }
++    Json messages = Json::array();
++    messages.push_back(Json{{"role", "user"}, {"content", userContent}});
++    if (prefix.empty())
++    {
++        req["add_generation_prompt"] = true;
++    }
++    else
++    {
++        req["add_generation_prompt"] = false;
++        messages.push_back(Json{{"role", "assistant"}, {"content", prefix}});
++    }
++    req["requests"] = Json::array({Json{{"messages", messages}, {"reference", "ref"}}});
++    return req;
++}
++
++//! Run a single chunk-and-confirm hop and return {ok, generated, total_ms}. The
++//! generated text is the CONTINUATION only (lang preamble stripped via parseAsrText
++//! for the warmup-hop case); the caller forms rawDecoded = prefix + generated.
++HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
++    bool isFinish, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
++    std::unordered_map<std::string, std::string>& loraWeightsMap)
++{
++    (void) isFinish;
++    HopOut out;
++    // capOverride: >0 caps the hop (non-final), <=0 (==-1) leaves it uncapped (final).
++    Json const req = buildPrefixRequest(sid, st, prefix, capOverride);
++    // Reuse the PROVEN parse->handleRequest core. runOneShotCore honors
++    // apply_chat_template / add_generation_prompt / max_generate_length_override
++    // straight from the request JSON. (We are inside OVS_ASR_STREAM_PREFIX, so
++    // asrStreamDelta/asrSessionPath are not the active branch in runOneShotCore.)
++    Json core = runOneShotCore(req, runtime, stream, loraWeightsMap);
++    out.ok = core.value("ok", false);
++    if (core.contains("total_ms")) out.totalMs = core["total_ms"].get<double>();
++    if (out.ok && core.contains("responses") && core["responses"].is_array() && !core["responses"].empty())
++    {
++        Json const& r0 = core["responses"][0];
++        if (r0.contains("output_text") && r0["output_text"].is_string())
++            out.generated = parseAsrText(r0["output_text"].get<std::string>());
++    }
++    if (!out.ok && core.contains("error") && core["error"].is_string())
++        out.error = core["error"].get<std::string>();
++    return out;
++}
++} // namespace asrStreamPrefix
++
+ //! Core one-shot engine step: parse the `requests` payload, run handleRequest on
+ //! each, and return the assembled response Json. This is the PROVEN golden path
+ //! (CER 0.0000 + byte-identity). Both the legacy event-less one-shot path AND the
+@@ -1229,6 +1549,35 @@
+     }
+     rt::LLMInferenceRuntime* runtime = runtimePtr.get();
+ 
++    // Streaming-prefix rollback (OVS_ASR_STREAM_PREFIX=1): load the SAME tokenizer
++    // the engine uses (engineDir/tokenizer.json + processed_chat_template.json) so
++    // computePrefix can encode/decode the accumulated transcript for the
++    // unfixedTokenNum roll-back. Loaded ONLY when the flag is ON; the runtime decode
++    // path is untouched either way. A failed load leaves gPrefixTokenizer null and
++    // computePrefix degrades to "no prefix" (cumulative-equivalent, never crashes).
++    if (asrStreamPrefix::enabled())
++    {
++        auto tk = std::make_unique<tokenizer::Tokenizer>();
++        if (tk->loadFromHF(args.engineDir))
++        {
++            std::filesystem::path const ctPath
++                = std::filesystem::path(args.engineDir) / "processed_chat_template.json";
++            if (std::filesystem::exists(ctPath)) tk->loadChatTemplate(ctPath);
++            // Round-trip sanity check (stderr; does not perturb the stdout protocol).
++            std::string const probe = "language Chineseä½ å¥½ä¸ç";
++            auto ids = tk->encode(probe, false, false);
++            std::string rt2 = tk->decode(ids, false);
++            std::cerr << "[prefix-tok] loaded numVocab=" << tk->getNumVocab() << " probe_tokens=" << ids.size()
++                      << " roundtrip_ok=" << (rt2 == probe ? 1 : 0) << " decoded=" << rt2 << std::endl;
++            gPrefixTokenizer = std::move(tk);
++        }
++        else
++        {
++            std::cerr << "[prefix-tok] loadFromHF FAILED for " << args.engineDir
++                      << " -> prefix rollback degrades to no-prefix" << std::endl;
++        }
++    }
++
+     // Task #9: lane reservation pool. asrMax = requested --max_slots, clamped to
+     // the engine's physical batch capacity (maxSessionBatchSize). The b2 engine
+     // exposes 2 rows; the b1 engine exposes 1 (so N>1 silently degrades to N=1
