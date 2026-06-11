@@ -1,0 +1,65 @@
+{
+  "name": "jetson-edgellm-v080-matcha",
+  "description": "v0.8.0 edgellm STREAMING ASR (Qwen3-ASR, #15 prefix-rollback flat-decode, baked v080 engine layout /opt/edgellm-v080/engines/asr-b2/llm + asr/audio, stream_unfixed_tokens=5) + Matcha TTS (jetson.matcha_trt, ORT-CPU duration/encoder + TRT estimator + TRT vocos, /opt/models/matcha-icefall-zh-en). DERIVED from jetson-edgellm-v080-n2: the ASR half is copied VERBATIM (no explicit EDGE_LLM_ASR_ENGINE_DIR/AUDIO_ENC_DIR in this profile — those are operator-owned/baked in the prefix image and MUST NOT be overridden to matcha's old /opt/models/qwen3-edgellm layout). Only the TTS half is swapped to Matcha (TTS_BACKEND=matcha_trt + MATCHA_*/VOCOS_ENGINE env + required_engines). asr_max_slots=2 + EDGE_LLM_ASR_MAX_CONCURRENT=2 preserved.",
+  "asr_backend": "jetson.trt_edge_llm",
+  "tts_backend": "jetson.matcha_trt",
+  "execution_policy": {
+    "mode": "concurrent",
+    "shared_resource": "gpu"
+  },
+  "artifact_set": "edgellm-v080",
+  "env": {
+    "LANGUAGE_MODE": "multilanguage",
+    "ASR_BACKEND": "trt_edgellm",
+    "TTS_BACKEND": "matcha_trt",
+    "OVS_VAD_BACKEND": "silero",
+    "OVS_VAD_SILENCE_MS": "400",
+    "EDGE_LLM_QWEN3_PROFILE": "highperf",
+    "EDGE_LLM_ASR_WORKER": "1",
+    "EDGE_LLM_ASR_VOCAB_PRUNED": "0",
+    "QWEN3_EDGELLM_JETSON_ROOT": "/opt/qwen3-edgellm-jetson",
+    "EDGE_LLM_ASR_STREAM_MODE": "worker",
+    "EDGE_LLM_ASR_STREAM_CHUNK_SEC": "0.5",
+    "EDGE_LLM_ASR_STREAM_UNFIXED_CHUNKS": "2",
+    "EDGE_LLM_ASR_STREAM_UNFIXED_TOKENS": "5",
+    "EDGE_LLM_ASR_MEL_SETTINGS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/whisper_feature_extractor.json",
+    "EDGE_LLM_ASR_MEL_FILTERS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/mel_filters.bin",
+    "EDGE_LLM_ASR_MAX_CONCURRENT": "2",
+    "MATCHA_MODEL_BASE": "/opt/models/matcha-icefall-zh-en",
+    "MATCHA_ACOUSTIC_EP": "SPLIT_TRT",
+    "MATCHA_SPLIT_ENCODER_ONNX": "/opt/models/matcha-icefall-zh-en/onnx/matcha_encoder_trt.onnx",
+    "MATCHA_SPLIT_ESTIMATOR_ENGINE": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine",
+    "OVS_TTS_LOW_LATENCY_CJK_MIN_CHARS": "15",
+    "OVS_TTS_LOW_LATENCY_CJK_TARGET_CHARS": "24",
+    "OVS_TTS_LOW_LATENCY_CJK_MAX_CHARS": "40",
+    "OVS_TTS_LOW_LATENCY_LATIN_MIN_CHARS": "40",
+    "OVS_TTS_LOW_LATENCY_LATIN_TARGET_CHARS": "60",
+    "OVS_TTS_LOW_LATENCY_LATIN_MAX_CHARS": "120"
+  },
+  "required_engines": [
+    {
+      "model_id": "matcha-icefall-zh-en",
+      "engine_file": "vocos_fp16.engine",
+      "engine_path": "/opt/models/matcha-icefall-zh-en/engines/vocos_fp16.engine",
+      "env_var": "VOCOS_ENGINE",
+      "build_env": {
+        "VOCOS_NAME": "vocos_fp16.engine"
+      },
+      "hf_only": false,
+      "required": true
+    },
+    {
+      "model_id": "matcha-icefall-zh-en",
+      "engine_file": "matcha_estimator_step0_bf16.engine",
+      "engine_path": "/opt/models/matcha-icefall-zh-en/engines/matcha_estimator_step0_bf16.engine",
+      "env_var": "MATCHA_SPLIT_ESTIMATOR_ENGINE",
+      "build_env": {
+        "ONNX_DIR": "/opt/models/matcha-icefall-zh-en/onnx",
+        "OUT_DIR": "/opt/models/matcha-icefall-zh-en/engines"
+      },
+      "hf_only": false,
+      "required": true
+    }
+  ],
+  "tts_model_id": "matcha-icefall-zh-en"
+}

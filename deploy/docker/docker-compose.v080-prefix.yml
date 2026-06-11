@@ -60,13 +60,13 @@ services:
 
     environment:
       # All baked in the image; surfaced here for visibility / override.
-      OVS_PROFILE: jetson-edgellm-v080-n2
+      OVS_PROFILE: jetson-edgellm-v080-matcha
       OVS_ASR_STREAM_PREFIX: "1"
       OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT: "1"
       NVIDIA_VISIBLE_DEVICES: all
       LD_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-cuda:/host-nvidia-libs:/host-libs
       EDGELLM_V080_AUTO_PULL: "1"
-      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
 
     volumes:
       # ── slim-lib host mounts (verbatim from prod contract) ──
@@ -79,6 +79,11 @@ services:
       - edgellm-v080-n2:/opt/edgellm-v080
       # ── shared speech-models provisioner cache (MOSS codec etc.) ──
       - speech-models:/opt/models
+      # ── derived profile: v080 streaming ASR + Matcha TTS (host-persisted) ──
+      - ./profiles/jetson-edgellm-v080-matcha.json:/opt/speech/configs/profiles/jetson-edgellm-v080-matcha.json:ro
+
+    networks:
+      - voice-arm_default
 
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS localhost:8000/health || exit 1"]
@@ -86,6 +91,13 @@ services:
       timeout: 10s
       start_period: 900s
       retries: 5
+
+networks:
+  # Externally-managed bridge owned by the voice-arm compose project. Attaching
+  # here (instead of a manual `docker network connect` after each recreate) keeps
+  # voice-rebot-arm able to reach this container by name across `up -d` rebuilds.
+  voice-arm_default:
+    external: true
 
 volumes:
   # First-boot HF -n2 engine cache (maxBatch=2 + minchunk1). Separate from the

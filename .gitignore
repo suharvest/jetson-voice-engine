@@ -34,3 +34,6 @@ models/
 !models/**/*.html
 !models/**/*.md
 engines/
+
+# transient backup of the prefix compose (host-local, never commit)
+deploy/docker/docker-compose.v080-prefix.yml.bak
