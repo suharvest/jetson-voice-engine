@@ -65,14 +65,29 @@ def _transposed_conv_step(module, x: torch.Tensor, pending: torch.Tensor) -> tup
         groups=module.conv.groups,
         dilation=module.conv.dilation,
     )
-    if pending.shape[-1] > 0:
-        raw = raw.clone()
-        raw[..., : pending.shape[-1]] = raw[..., : pending.shape[-1]] + pending
-    emit_len = x.shape[-1] * stride
-    y = raw[..., :emit_len]
+    # Static-shape state update (2026-06-16): the original in-place slice-assign
+    # `raw[..., :N] += pending` + `raw[..., emit_len:]` traced to a dynamic
+    # ScatterND + Range that TensorRT v10.3 cannot compile ("Could not find any
+    # implementation for ForeignNode"). The overlap S = right_pad = kernel - stride
+    # is a compile-time constant and raw_len = emit_len + S (P=0, output_padding=0,
+    # dilation=1 for the stateful tconv blocks), so the update is bit-exactly
+    # expressible with static Concat/Slice — verified max_abs 0.0 vs full inference
+    # and onnxruntime A/B (all state outputs identical). This keeps every index a
+    # constant, so only static Slice nodes are emitted (no ScatterND/Range).
+    S = int(module.right_pad)
+    if S > 0:
+        head = raw[..., :S] + pending
+        body = raw[..., S:-S]
+        # GUARD: when chunk_frames==1 and kernel==2*stride (e.g. block-0 S==stride),
+        # body has length 0 — drop it from the cat to avoid a zero-length Slice/cat
+        # that TRT may reject.
+        y = torch.cat([head, body], dim=-1) if body.shape[-1] != 0 else head
+        next_pending = raw[..., -S:]
+    else:
+        y = raw[..., : x.shape[-1] * stride]
+        next_pending = raw.new_zeros(raw.shape[0], raw.shape[1], 0)
     if module.conv.bias is not None:
         y = y + module.conv.bias.view(1, -1, 1)
-    next_pending = raw[..., emit_len:]
     return y, next_pending
 
 
