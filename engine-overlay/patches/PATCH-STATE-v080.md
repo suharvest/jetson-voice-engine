@@ -109,6 +109,93 @@ guard).** Files left in place; just out of the build apply list.
 
 Shipped binary md5 (built from chain §2 + workers above) — §0.
 
+## 9. N>1 ASR streaming — formalized into overlay + n2 profile (THIS ROUND)
+
+**Goal:** make the real-machine-verified N>1 ASR streaming path (v080-0021 / 0022 /
+0023, orin-nx PASS) reproducible from `build.sh` + an out-of-the-box N=2 profile —
+WITHOUT building engines/images or touching devices.
+
+### 9.1 Decisive finding — N>1 needs ZERO additional engine patches
+The recon premise was that N>1 requires re-adding runtime patches
+`v080-0001..0006` to the apply chain. **Ground truth from the acceptance docs
+disproves this:**
+- The verified worker (`native/edgellm_voice_worker/qwen3_asr_worker.cpp`) runs
+  **`runOneShotCore` on the VANILLA `rt::LLMInferenceRuntime`** for both the N>1
+  lane path and per-hop streaming (worker.cpp:17 *"v0.8.0 vanilla rt::LLMInferenceRuntime
+  on the ONE-SHOT path only"*; :304 *"lane reservation only, NOT
+  AsrStreamingSessionRuntime KV-append"*; :435-440 the `appendChunk/decodeToTranscript`
+  incremental path is the **DEFERRED** optimization, NOT called).
+- v080-0021 §1 + v080-0023 §1 confirm: N>1 = lane reservation pool + per-hop
+  **cumulative re-decode via the proven one-shot core**. No engine-source change.
+- The `v080-0001..0006` patches build `examples/llm/spike_v080_m1..m6` experiment
+  binaries + `asrStreamingSessionRuntime` / `asrContinuousBatcher` /
+  `hybridCacheManager` per-lane KV = the **incremental-KV spike track** (the
+  deferred optimization), irrelevant to serving.
+
+**git-apply --check verdict (temp worktree @ f9cc746 + addon/, minimal chain
+0001+v080-0007+v080-0008 applied):**
+| patch | check | note |
+|---|---|---|
+| v080-0001-asr-audio-chunk-api | CLEAN | spike-track, not needed |
+| v080-0002-asr-streaming-runtime-hooks | CLEAN | spike-track, not needed |
+| v080-0003-asr-streaming-spikes | **FAIL** | `examples/llm/spike_v080_m1/m2.cpp` already exist in working dir (collide with addon spikes) |
+| v080-0004-asr-single-token-chunk-guard | **FAIL** | needs `cpp/runtime/asrStreamingSessionRuntime.{h,cpp}` (created only by 0002) — order-fragile |
+| v080-0005-per-lane-kv-reset-and-lane-manager | **FAIL** | missing asrStreamingSessionRuntime + `llmInferenceRuntime.{h,cpp}` / `examples/llm/CMakeLists.txt` offsets do not apply |
+| v080-0006-asr-continuous-batcher | CLEAN | spike-track, not needed |
+
+→ The spike track is **NOT clean-applicable** standalone AND **not used** by the
+verified path. **DROPPED from the N>1 scope** (stay in C3 backlog, §5). The
+**minimal serving chain is the complete engine basis for N>1** — full-chain
+`git apply --check` CLEAN, unchanged from §2.
+
+### 9.2 What WAS formalized this round
+1. **`build.sh` voice-worker stage (NEW, step 4b):** wired the previously
+   hand-built workers (v080-0021 "Box build dir `~/project/v080-worker-build`")
+   into the reproduction flow. After the engine core builds `libedgellmCore.a`,
+   `build.sh` now runs the `native/edgellm_voice_worker/` CMake project
+   (`-DEDGE_LLM_SOURCE_DIR=${WORKDIR} -DEDGE_LLM_BUILD_DIR=${WORKDIR}/build`),
+   building targets `qwen3_asr_worker` (N>1) + `qwen3_tts_worker`. MOSS unchanged
+   (step 4c).
+2. **n2 profile session-gate triplet (was MISSING → N=2 was NOT open):** the
+   profile shipped `OVS_TTS_WORKER_CONCURRENCY=1`, so `effective_limit=min(asr=2,
+   tts=1)=1` clamped admission to 1. Added the v080-0023 §"Session-gate change"
+   triplet — `LAZY_TTS=1` + `OVS_TTS_WORKER_CONCURRENCY=2` +
+   `OVS_MAX_CONCURRENT_SESSIONS=2` — so N=2 is OPEN OUT OF THE BOX (TTS never
+   spawned with `--max_slots`, so the generic-runner worker never aborts). Also
+   added `EDGE_LLM_ASR_ENGINE_DIR→engines/asr-b2/llm` + `OVS_ASR_STREAM_PREFIX=1`
+   + `OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT=1`.
+
+### 9.3 n2 profile formalization — LOCATION
+The profile lives in **this repo (jetson-voice-engine)**, NOT seeed-local-voice:
+- `deploy/docker/jetson-edgellm-v080-n2.json` — the source-of-truth profile
+  (env + asr_max_slots=2), updated with the triplet + engine_dir + prefix.
+- `deploy/docker/Dockerfile.jetson.v080-edgellm-n2` — bakes the profile +
+  operator-owned ENV (triplet now baked as image ENV so it wins at runtime), and
+  the worker md5 comments corrected `f9bb821d` → `5ebd436b` (the pcm-fixed binary).
+- seeed-local-voice `configs/profiles/` was checked — it does NOT carry an n2
+  profile; **no new branch needed there.** (Its v080 profiles are baked from this
+  repo's deploy/docker via the thin-overlay Dockerfile.)
+
+### 9.4 Final apply order (minimal + N>1) — UNCHANGED engine chain
+N>1 adds NO engine patch. The apply order is exactly §2:
+`0001-orin-tegra-build-compat` → `v080-0007-customvoice-language-conditioning` →
+`v080-0008-tts-cutedsl-wrap`. N>1 is delivered by the build.sh voice-worker stage
+(§9.2.1) + the n2 profile (§9.3) + the asr-b2 engine export (md5 4122dfcc, an
+artifact, not a patch).
+
+### 9.5 Engine / worker md5 reconciliation (N>1)
+| artifact | md5 | source | role |
+|---|---|---|---|
+| `native/edgellm_voice_worker/qwen3_asr_worker.cpp` | `ab09b992` | feat HEAD = `c6bf483` (v080-0023 pcm fix) | N>1 worker SOURCE |
+| qwen3_asr_worker binary | `5ebd436b` | built from the above on orin-nx (v080-0023 §1) | N>1 worker BINARY |
+| `engines/asr-b2/llm/llm.engine` (max_batch_size=2) | `4122dfcc` | export artifact (v080-0022 §1) | N>1 ASR engine |
+| `engines/asr-b2/llm/config.json` (`max_batch_size:2`) | `0e6bb1f6` | export artifact | N>1 engine config |
+| audio encoder `engines/asr/audio/config.json` (min_time_steps=100) | `3b9ff631` | minchunk1 export (v080-0019) | streaming encoder |
+
+(The Dockerfile/profile previously referenced the SUPERSEDED `f9bb821d` worker =
+the pre-pcm-fix v080-0022 binary that SIGABRT'd on real `pcm_b64`; corrected to
+`5ebd436b` throughout this round.)
+
 ## 8. addon/ note
 C2a already removed the v0.7.1-vendored `addon/examples/omni/qwen3_tts_streaming_worker.cpp`
 and `addon/cpp/runtime/slotPool.h` (both belonged to the dropped fork-port path).
