@@ -381,3 +381,55 @@ in this overlay / build.sh run.** Definition for the future variant:
 This overlay's `UPSTREAM_PIN` + apply chain + build.sh stay **Base-only**. The CV
 variant is a follow-up task (own pin chain may equal a361221 too, just with the
 two CV patches applied + the CV int4 engine bundle).
+
+---
+
+## 11. Coexistence disambiguation — easily-confused parallel artifacts (2026-06-22)
+
+Several look-alike artifacts coexist on disk / in HF and have repeatedly been
+mistaken for each other. This section is the single authoritative "which is
+production, which is alternative/deferred" map. **None of the deferred items
+below are dead — they are validated artifacts kept for the alternative track;
+do not delete. This is annotation only.**
+
+### 11.1 Dual N>1 TTS worker — slot-pool (PRODUCTION) vs batch-lane (alt/deferred)
+| path | what it is | status |
+|---|---|---|
+| **slot-pool** | `examples/omni/qwen3_tts_streaming_worker` + `cpp/runtime/slotPool.h` + shared-engine ctor (`Qwen3OmniTTSRuntime(ICudaEngine*, ICudaEngine*, …)` + `initializeEngineRunnersShared`). One **runtime per lane** over **shared read-only engine weights**; uses the ordinary `maxBatchSize=1` Talker. In the pinned fork branch `a361221`; built by `build.sh` step 4. | **PRODUCTION N>1 TTS path.** |
+| **batch-lane** | patch `v080-0010-tts-batch-lane-concurrency` — rewrites `Qwen3OmniTTSRuntime` so a SINGLE runtime with a `maxBatchSize=2` Talker (the `talker-b2` engine, md5 `f7339e02`) natively batches two lanes (replacing the per-slot replication that patch-0004 used). Lockstep batched prefill/decode. | **ALTERNATIVE / DEFERRED — NOT a production path.** Not in the Base apply chain (see §4 line for `…/0010/…` and §C2-repin apply table). Build chain does **not** apply it. Validated GREEN (byte-identical per-lane audio) and kept for the alt track. |
+
+Rule of thumb: production N>1 TTS = **replicate runtime, share weights** (slot-pool).
+batch-lane = **one runtime, batched Talker engine** (the b2 engine). The
+`recipes/talker-b2-engine.md` formerly called itself "slot-pool" — corrected
+2026-06-22 to "batch-lane".
+
+### 11.2 Dual TTS Talker engine — int4 (CV, prod) vs talker-b2 (batch-lane)
+| engine | role | consumed by |
+|---|---|---|
+| **CustomVoice int4 talker** (`harvestsu/qwen3-tts-0.6b-customvoice-jetson-trtllm-int4fp8`) | the verified production CustomVoice talker (int4/fp8). | the CustomVoice variant (§10). Production CV path. |
+| **talker-b2** (`engines-v080-tts-b2/talker/llm.engine`, md5 `f7339e02`) | `maxBatchSize=2` Talker, build-flag-only rebuild of the maxBatch=1 Talker ONNX. | the **batch-lane** runtime (`v080-0010`) ONLY — see §11.1. NOT the slot-pool, NOT the CV int4 path. |
+
+(The Base N>1 slot-pool path uses neither of these — it uses the ordinary Base
+maxBatch=1 talker + code-predictor + speaker-encoder; see §C2-repin "build.sh".)
+
+### 11.3 Incremental-KV spike track — confirmed NON-serving (cross-ref §5 / §9.1)
+Patch files `v080-0001..0006` (ASR-streaming runtime hooks / spikes / lane mgr /
+continuous batcher) **and** `v080-0024..0027` (incremental-KV + prefix-cap /
+rollback snapshots) are the **DEFERRED incremental-KV spike track**, NOT in any
+serving build, NOT applied by `build.sh`. Already established in §5 (C3 backlog)
+and §9.1 (decisive finding: N>1 needs ZERO additional engine patches; the spike
+binaries are `examples/llm/spike_v080_m1..m6` experiments). Filename markers
+confirm their non-serving nature: `v080-0025-prefix-cap-BROKEN.patch` is
+explicitly `-BROKEN`, and `0025/0026/0027` target a non-git working-copy path
+literally named `qwen3_asr_worker.cpp(+prefix-…)` / `(#12-state)` — they are
+**not git-applicable** and must stay OUT of the apply sequence. The build chain
+must never reference them.
+
+### 11.4 prefix-multiturn image — EXPERIMENT, not the v0.8.0 n1n2-rebake production image
+Any `prefix-multiturn` image depends on an **unreleased `asr-b2` dependency
+chain** and the `OVS_ASR_STREAM_PREFIX*` flags wired only for the streaming
+spike. It is an **experiment**, NOT the `v0.8.0-n1n2-rebake` production image.
+The production N>1 image is built from `deploy/docker/Dockerfile.jetson.v080-edgellm-n2`
++ `jetson-edgellm-v080-n2.json` (see §9.3) on the **vanilla one-shot** ASR worker
++ asr-b2 engine artifact — no incremental-prefix runtime. Do not promote a
+`prefix-multiturn` build to production.
