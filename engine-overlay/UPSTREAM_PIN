@@ -1,3 +1,5 @@
-364769036fc83351d9d0aac4cc064a8e56a83178
-# = NVIDIA TensorRT-Edge-LLM tag v0.7.1 (Merge PR #90, dev-release/0.7.1)
+f9cc74623d95d7acf1addab6026b9d410ba81f52
+# = NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD
+#   "Merge pull request #101 from JCalafato/dev-release/0.8.0"
 # upstream: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+# fork port branch (6 commit / 9 files on this base): port/qwen3-tts-base-v080
