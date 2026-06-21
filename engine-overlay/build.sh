@@ -28,7 +28,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIN="$(grep -vE '^[[:space:]]*#' "${HERE}/UPSTREAM_PIN" | head -1 | tr -d '[:space:]')"
-REMOTE="$(grep -vE '^[[:space:]]*#' "${HERE}/upstream.remote" | head -1 | tr -d '[:space:]')"
+# REMOTE source of the upstream fork. Default = upstream.remote file (the github fork).
+# Override via EDGELLM_UPSTREAM_REMOTE for cross-wall / offline devices that cannot
+# reach github.com — point it at a LOCAL fork checkout or git bundle, e.g.
+#   EDGELLM_UPSTREAM_REMOTE=/home/harvest/project/edgellm-v080 bash build.sh
+# (any path/URL `git clone` accepts; the PIN must be fetchable from it).
+REMOTE="${EDGELLM_UPSTREAM_REMOTE:-$(grep -vE '^[[:space:]]*#' "${HERE}/upstream.remote" | head -1 | tr -d '[:space:]')}"
 WORKDIR="${VOXEDGE_WORKDIR:-${HERE}/.build/upstream}"
 MANIFEST="${1:-}"
 APPLY_ONLY=0
