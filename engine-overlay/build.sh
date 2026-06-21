@@ -51,6 +51,10 @@ fi
 git -C "${WORKDIR}" fetch --depth 1 origin "${PIN}" || git -C "${WORKDIR}" fetch origin
 git -C "${WORKDIR}" checkout -q "${PIN}"
 git -C "${WORKDIR}" clean -fdq
+# Integration branch carries 3rdParty submodules (googletest, nlohmannJson, NVTX).
+# Without this the CMake configure fails on the missing 3rdParty/* trees.
+echo "==> submodule update --init --recursive (3rdParty: googletest, nlohmannJson, NVTX)"
+git -C "${WORKDIR}" submodule update --init --recursive --depth 1
 
 # --- 2. copy addon/ over the checkout ----------------------------------------
 echo "==> copying addon/ (new files)"
@@ -66,8 +70,9 @@ echo "==> copying addon/ (new files)"
 #
 # Ground truth: this overlay reproduces the BASE Qwen3-TTS N>1 stack (streaming
 # worker + slot-pool + shared-engine ctor) WITHOUT CustomVoice. The single source
-# for the N>1 TTS runtime is now the fork integration branch pinned in
-# UPSTREAM_PIN (a361221 = suharvest/port/qwen3-tts-base-v080-n1n2), which is:
+# for the FULL N>1 stack (TTS streaming worker + ASR voice worker) is now the fork
+# integration branch pinned in UPSTREAM_PIN
+# (7142a30 = suharvest/port/qwen3-tts-base-v080-n1n2), which is:
 #
 #     f9cc746  (NVIDIA release/0.8.0 HEAD)
 #   + 10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
@@ -77,6 +82,10 @@ echo "==> copying addon/ (new files)"
 #   + 50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
 #   + 873ca22  fp8 text_embedding (native kernel path)
 #   + a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
+#   + 8de933f  C3 N<=0 prefill guard (defensive; N>0 paths unchanged)
+#   + 7142a30  SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp}) —
+#              the ASR voice worker's #include target (lane allocator ONLY, no
+#              deferred streaming wrapper). Makes step 4b self-contained.
 #
 # Because the 6 fork-port commits are IN the pinned branch, the old
 # engine-overlay/patches/v080-port-0001..0006 are REDUNDANT and are NOT applied
@@ -153,10 +162,21 @@ esac
 #   (empty type ≈ 2x slower runtime).
 CUDA_CTK="${CUDA_CTK_VERSION:-12.6}"
 TRT_PKG="${TRT_PACKAGE_DIR:-/usr}"
-echo "==> cmake configure (CUDA_CTK_VERSION=${CUDA_CTK}, TRT_PACKAGE_DIR=${TRT_PKG}, Release)"
+# CUDA target SM. On aarch64/Tegra (Orin) the upstream CMakeLists, hardened by
+# 0001, SKIPS the desktop "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block — so
+# nothing sets the arch and the int4 WOQ GEMM fails to compile with
+# "cp.async requires sm_80+". Orin is sm_87, so default to 87 there (matching
+# the EMBEDDED_TARGET=jetson-orin Tegra detection in 0001). Override via
+# CMAKE_CUDA_ARCHITECTURES for other targets.
+case "$(uname -m)" in
+  aarch64) CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-87}" ;;
+  *)       CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-}" ;;
+esac
+echo "==> cmake configure (CUDA_CTK_VERSION=${CUDA_CTK}, TRT_PACKAGE_DIR=${TRT_PKG}, CUDA_ARCH=${CUDA_ARCH:-<cmake default>}, Release)"
 cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
       -DCUDA_CTK_VERSION="${CUDA_CTK}" \
       -DTRT_PACKAGE_DIR="${TRT_PKG}" \
+      ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"} \
       -DCMAKE_BUILD_TYPE=Release
 echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so + Base TTS N>1 streaming worker)"
 cmake --build "${WORKDIR}/build" -j"$(nproc)"
@@ -196,6 +216,20 @@ if [ -x "${WORKDIR}/cpp/workers/build_moss_worker.sh" ]; then
   echo "==> building MOSS worker"
   ( cd "${WORKDIR}/cpp/workers" && bash build_moss_worker.sh )
 fi
+# --- 4d. plugin unversioned symlink -----------------------------------------
+# The plugin builds as libNvInfer_edgellm_plugin.so.1.0 (VERSION 1.0/SOVERSION 1).
+# The workers default to the UNVERSIONED relative path build/libNvInfer_edgellm_plugin.so.
+# Create the unversioned symlink so the workers load it without an explicit
+# EDGELLM_PLUGIN_PATH override. (Override still honored if exported.)
+PLUGIN_VERSIONED="$(ls "${WORKDIR}/build"/libNvInfer_edgellm_plugin.so.* 2>/dev/null | head -1 || true)"
+if [ -n "${PLUGIN_VERSIONED}" ]; then
+  ln -sf "$(basename "${PLUGIN_VERSIONED}")" "${WORKDIR}/build/libNvInfer_edgellm_plugin.so"
+  echo "==> plugin symlink: ${WORKDIR}/build/libNvInfer_edgellm_plugin.so -> $(basename "${PLUGIN_VERSIONED}")"
+  echo "    (export EDGELLM_PLUGIN_PATH=${WORKDIR}/build/libNvInfer_edgellm_plugin.so to override)"
+else
+  echo "WARN: libNvInfer_edgellm_plugin.so.* not found in ${WORKDIR}/build — no symlink created." >&2
+fi
+
 echo "==> build done. Artifacts:"
 echo "      ${WORKDIR}/build/                       libNvInfer_edgellm_plugin.so*"
 echo "      ${WORKDIR}/build/examples/omni/         qwen3_tts_streaming_worker (Base N>1, slot-pool + shared-engine ctor)"

@@ -1,6 +1,16 @@
-a3612217d167772744aacac8be8df8ecd226dc1c
+7142a30e7d3b7fa68919b605c6c51b480f77b3ff
 # = fork integration branch HEAD: suharvest/port/qwen3-tts-base-v080-n1n2
-#   "feat(tts): D2-1 shared-engine ctor for slot-pool (share read-only engine weights)"
+#   "feat(asr): expose maxSessionBatchSize() on LLMInferenceRuntime for N>1 worker"
+#
+# Repinned from a361221 -> 7142a30 (C2b hardening) so the SINGLE branch can
+# build the FULL v0.8.0 N>1 stack (TTS streaming worker + ASR voice worker).
+# Three commits were added on top of the previous a361221 pin:
+#   8de933f  C3 N<=0 prefill guard (defensive early-return; N>0 paths unchanged)
+#   a099544  add minimal SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp})
+#            — the ASR voice worker's #include target. ONLY the lane allocator
+#            (no deferred AsrStreamingSessionRuntime streaming wrapper).
+#   7142a30  expose LLMInferenceRuntime::maxSessionBatchSize() (trivial accessor;
+#            sizes the worker's lane manager to the engine's physical batch).
 #
 # This pin is the SINGLE SOURCE for the Base TTS N>1 serving stack. It is
 # NVIDIA release/0.8.0 (f9cc746) + 6 fork-port commits + the D2-1 shared-engine

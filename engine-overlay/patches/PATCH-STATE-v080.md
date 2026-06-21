@@ -78,6 +78,69 @@ Removed / re-homed (NOT in the Base apply chain):
 keep the session-gate triplet (`LAZY_TTS=1` + `OVS_TTS_WORKER_CONCURRENCY=2` +
 `OVS_MAX_CONCURRENT_SESSIONS=2`), asr-b2 engine dir, and prefix flags. See §9.3.
 
+### §C2b — build.sh self-sufficiency + ASR-worker header gap (2026-06-21)
+
+C2b real-run found build.sh built the TTS streaming worker (Base N>1, smoke
+PASS) but was NOT self-sufficient. Four gaps, all resolved here:
+
+1. **submodules** — checkout did not init `3rdParty/{googletest,nlohmannJson,NVTX}`.
+   → build.sh now runs `git submodule update --init --recursive --depth 1` after
+   checkout + clean.
+2. **sm_87 arch** — the cmake configure passed no `CMAKE_CUDA_ARCHITECTURES`. On
+   aarch64 the upstream `set(CMAKE_CUDA_ARCHITECTURES 80;86;89)` block is SKIPPED
+   (0001 guards it with `NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64"`), so the
+   arch was left unset → int4 WOQ GEMM `cp.async requires sm_80+`. → build.sh now
+   defaults `-DCMAKE_CUDA_ARCHITECTURES=87` on aarch64 (override via env), matching
+   the EMBEDDED_TARGET=jetson-orin Tegra detection in 0001.
+3. **plugin path** — the plugin builds as `libNvInfer_edgellm_plugin.so.1.0`
+   (VERSION 1.0/SOVERSION 1) but workers default to the unversioned relative
+   `build/libNvInfer_edgellm_plugin.so`. → build.sh step 4d now `ln -sf` the
+   unversioned symlink and prints the `EDGELLM_PLUGIN_PATH` override.
+4. **ASR worker header gap (KEY)** — `qwen3_asr_worker.cpp` does
+   `#include "runtime/asrStreamingSessionRuntime.h"` for `rt::SessionLaneManager`
+   + `rt::LaneOwnerKind::kAsr` (lane RESERVATION only; the worker runs the vanilla
+   one-shot `LLMInferenceRuntime` core, NOT the chunked-streaming wrapper). That
+   header did NOT exist on the Base port branch — it was only ever created by the
+   DEFERRED ASR-streaming spike `v080-0002` (full `AsrStreamingSessionRuntime`
+   incremental-prefill runtime) and extended by `v080-0005` (the lane manager).
+
+   **Solution chosen = 甲 (single source):** add a MINIMAL
+   `cpp/runtime/asrStreamingSessionRuntime.{h,cpp}` to the fork integration branch
+   containing ONLY `LaneOwnerKind` + `SessionLaneManager` (verbatim from the
+   v080-0005 definitions). The full `AsrStreamingSessionRuntime` streaming wrapper
+   (appendChunk / beginAsrSession / per-lane KV reset + its `LLMInferenceRuntime`
+   hooks) is intentionally EXCLUDED — so the deferred streaming spike and any
+   talker-prefill changes are NOT dragged into the Base build. Rationale: the
+   lane manager is fully self-contained (`<cstdint>/<mutex>/<vector>/<stdexcept>`
+   + `LOG_ERROR`); it has no dependency on the streaming wrapper. The `.cpp` is
+   auto-globbed into `edgellmCore` by the existing
+   `file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")` — no CMake edit needed.
+
+   A SECOND, smaller gap surfaced once the include resolved: the worker also calls
+   `runtime->maxSessionBatchSize()` (to size the lane manager to the engine's
+   physical batch). That accessor existed only on the deferred spike's modified
+   runtime. Added as a trivial read-only inline accessor on `LLMInferenceRuntime`
+   (`return mDeployment.base.maxSupportedBatchSize;` — same field already used at
+   `llmInferenceRuntime.cpp:293`). No streaming state; deferred wrapper still out.
+
+   Fork commits (on suharvest fork branch, on top of `8de933f`):
+   - `a099544` add minimal SessionLaneManager (`asrStreamingSessionRuntime.{h,cpp}`)
+   - `7142a30` expose `maxSessionBatchSize()` on LLMInferenceRuntime   ← new HEAD
+
+**Repin:** `UPSTREAM_PIN a361221 → 7142a30` (= new branch HEAD). Three commits
+added on top of the previous pin: `8de933f` (C3 N<=0 prefill guard — defensive
+early-return; N>0 paths unchanged), `a099544` (lane-manager header), `7142a30`
+(maxSessionBatchSize accessor). Apply chain UNCHANGED (still exactly
+`0001-orin-tegra-build-compat` on top of branch + addon/).
+
+**Targeted verify (orin-nx, jve-c2b/.build/upstream):** dropped the new files in,
+reconfigured (refresh source glob), `cmake --build build --target edgellmCore`
+(compiles asrStreamingSessionRuntime.cpp; `SessionLaneManager::acquire` now in
+libedgellmCore.a) then `cmake --build build/voice-workers --target qwen3_asr_worker`
+→ **RC=0**, ARM aarch64 ELF `qwen3_asr_worker` (17.9 MB, md5 d9c863e2). No full
+rebuild. MOSS worker (step 4c) layout is a separate follow-up; not blocking Base
+N>1 + ASR.
+
 ---
 
 ## (HISTORICAL) Patch state — v0.8.0 authoritative serving chain (C2b)
