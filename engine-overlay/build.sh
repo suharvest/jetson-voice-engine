@@ -4,7 +4,7 @@
 # CONTRACT
 #   inputs : UPSTREAM_PIN, upstream.remote, addon/, patches/0001..0008, a build manifest
 #            (manifests/*.toml), target sm (e.g. sm_87 Orin), CUDA/TRT version, model src ref.
-#   outputs: worker binaries  (qwen3_asr_worker / qwen3_tts_streaming_worker / moss_tts_nano_worker)
+#   outputs: worker binaries  (qwen3_asr_worker [N>1] / qwen3_tts_worker / moss_tts_nano_worker)
 #            plugin .so       (libNvInfer_edgellm_plugin.so)
 #            .engine artifacts (per manifest)
 #            sidecar checksums (md5) for each produced artifact.
@@ -74,10 +74,21 @@ echo "==> copying addon/ (new files)"
 #  v080-0007 / v080-0008". Workers: native/edgellm_voice_worker/*.cpp +
 #  addon/cpp/workers/moss_tts_nano_worker.cpp — compiled, NOT in this patch chain.)
 #
+# N>1 ASR (verified path, v080-0021/0022/0023): delivered NOT by any engine-source
+# patch but by (a) the vendored worker native/edgellm_voice_worker/qwen3_asr_worker.cpp
+# (lane-reservation pool + per-hop cumulative re-decode on the PROVEN vanilla
+# rt::LLMInferenceRuntime one-shot core — md5 ab09b992 → binary 5ebd436b) and
+# (b) the maxBatch=2 ASR llm engine (asr-b2, md5 4122dfcc — an EXPORT artifact, not a
+# patch) selected via the n2 profile. The worker calls runOneShotCore on the SAME
+# vanilla runtime this minimal chain produces — it needs NONE of the v080-0001..0006
+# engine patches (those are the DEFERRED incremental-KV spike track → C3 backlog;
+# 0003/0004/0005 also FAIL git-apply on f9cc746, see PATCH-STATE-v080.md §4/§9).
+#
 # The shipped TTS worker is the GENERIC qwen3_tts_worker on Qwen3OmniTTSRuntime;
-# ASR is one-shot (stream_mode=accumulate). The fork-port streaming-worker stack,
-# the slot-pool, and all v080-NNNN ASR-streaming / TTS-batch / N>1 experiments are
-# NOT part of the serving build and are DROPPED here (see PATCH-STATE-v080.md §4).
+# ASR one-shot is stream_mode=accumulate, N>1+streaming is stream_mode=worker (n2
+# profile). The fork-port streaming-worker stack, the slot-pool, and all v080-NNNN
+# ASR-streaming / TTS-batch incremental-KV experiments are NOT part of the serving
+# build and are DROPPED here (see PATCH-STATE-v080.md §4).
 echo "==> applying patches"
 apply_one() {
   local p="$1"
@@ -131,14 +142,41 @@ cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
       -DCUDA_CTK_VERSION="${CUDA_CTK}" \
       -DTRT_PACKAGE_DIR="${TRT_PKG}" \
       -DCMAKE_BUILD_TYPE=Release
-echo "==> make -j$(nproc) (plugin .so + workers)"
+echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so)"
 cmake --build "${WORKDIR}/build" -j"$(nproc)"
-# MOSS worker has its own helper (addon/cpp/workers/build_moss_worker.sh):
+
+# --- 4b. voice workers (N>1 ASR + generic TTS) — VERIFIED reproducible path -----
+# native/edgellm_voice_worker/ is a SEPARATE CMake project that links the
+# qwen3_asr_worker (N>1 lane-pool + streaming PARTIALs, v080-0023, binary md5
+# 5ebd436b) and qwen3_tts_worker against the libedgellmCore.a just built above.
+# This is the formalization of the previously hand-built worker (v080-0021 "Box
+# build dir ~/project/v080-worker-build"): now reproducible from THIS overlay.
+# Source of truth = ${HERE}/../native/edgellm_voice_worker (vendored at feat HEAD).
+VOICE_WORKER_SRC="${VOICE_WORKER_SRC:-${HERE}/../native/edgellm_voice_worker}"
+if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
+  echo "==> building voice workers (qwen3_asr_worker N>1 + qwen3_tts_worker)"
+  echo "    src=${VOICE_WORKER_SRC}  EDGE_LLM_BASE=${WORKDIR}  EDGE_LLM_BUILD=${WORKDIR}/build"
+  cmake -S "${VOICE_WORKER_SRC}" -B "${WORKDIR}/build/voice-workers" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCUDA_CTK_VERSION="${CUDA_CTK}" \
+        -DEDGE_LLM_SOURCE_DIR="${WORKDIR}" \
+        -DEDGE_LLM_BUILD_DIR="${WORKDIR}/build"
+  cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
+        --target qwen3_asr_worker qwen3_tts_worker
+else
+  echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR/TTS workers NOT built." >&2
+fi
+
+# --- 4c. MOSS worker (own helper) --------------------------------------------
 if [ -x "${WORKDIR}/cpp/workers/build_moss_worker.sh" ]; then
   echo "==> building MOSS worker"
   ( cd "${WORKDIR}/cpp/workers" && bash build_moss_worker.sh )
 fi
-echo "==> build done. Artifacts under ${WORKDIR}/build/ :"
-echo "      libNvInfer_edgellm_plugin.so*  examples/omni/qwen3_tts_streaming_worker"
+echo "==> build done. Artifacts:"
+echo "      ${WORKDIR}/build/                       libNvInfer_edgellm_plugin.so*"
+echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1, 5ebd436b) qwen3_tts_worker"
 echo "    Collect worker binaries + plugin .so + .engine, write md5 sidecars,"
 echo "    and reconcile against ${MANIFEST}. Engine build uses build_engine_bundle.py."
+echo "    N=2 runtime: select profile jetson-edgellm-v080-n2 (stream_mode=worker,"
+echo "    asr-b2 engine 4122dfcc, session-gate triplet LAZY_TTS=1 +"
+echo "    OVS_TTS_WORKER_CONCURRENCY=2 + OVS_MAX_CONCURRENT_SESSIONS=2)."
