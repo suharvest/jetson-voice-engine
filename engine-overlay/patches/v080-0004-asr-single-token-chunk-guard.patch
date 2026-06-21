@@ -1,0 +1,244 @@
+From: suharvest <suharvest@gmail.com>
+Subject: [PATCH] v080-0004: ASR streaming single-token append-prefill guard
+
+Phase 3b found a deterministic R2 chunk-prefill parity regression: a FINAL
+prefill chunk of exactly 1 token with prior non-empty KV produced wrong sampled
+last-token logits (argmax could flip; max-abs-diff ~2e+01 vs the one-shot path).
+Multi-token final chunks were byte-identical (diff 0.0). KV length/commit were
+correct.
+
+Root cause (cpp/plugins/attentionPlugin/attentionPlugin.cpp deduceModeVanilla):
+the AttentionPlugin distinguishes a chunked-prefill step from a vanilla decode
+step PURELY by the runtime sequence length of Q:
+
+    non-empty kvcache_start_index && qSeqLen >  1  -> kCHUNKED_PREFILL
+    non-empty kvcache_start_index && qSeqLen == 1  -> kVANILLA_DECODING
+
+So a 1-token append-prefill chunk landing on a non-empty KV cache is misrouted
+to the DECODE path. In decode, RoPE position is taken from contextLength
+(launchApplyRopeWriteKV(..., contextLengthTensor, ...) in
+cpp/kernels/posEncoding/applyRopeWriteKV.cu computes posStartId =
+kvCacheEndLens[b] - qSeqLen). The chunk path sets contextLength to the CHUNK
+length (=1), so the RoPE position collapses to 0 (chunk-relative) instead of the
+absolute priorKV+0, and XQA attends over sequence_lengths=1 instead of the full
+KV. Hence wrong last-token logits. The chunked-prefill path instead derives the
+absolute position from kvCacheEndIdxs = kvCacheStartIdx + contextLength and FMHA
+attends the full KV via cuKVSeqLens. The plugin boundary has NO shape-distinct
+signal: a genuine decode and a 1-token prefill-append are both qSeqLen==1 with
+non-empty KV. A 1-token INTERMEDIATE chunk is equally affected (it bakes a wrong
+RoPE position into the committed KV cache).
+
+Fix: enforce the invariant in the runtime (AsrStreamingSessionRuntime) rather
+than changing the plugin/engine ABI: a prefill step with qSeqLen==1 must never
+run on a non-empty KV cache. We carry the trailing token of a non-final TEXT
+chunk forward into the next chunk, so every step after the first (and the final
+step) packs >= 2 tokens and stays on the chunked-prefill path. The first chunk
+runs on an empty KV cache (kNORMAL_PREFILL, valid at length 1) and is never
+deferred. Carry-over is text-only (an audio-bearing chunk binds its own per-chunk
+audio embeddings and is never length 1 in practice); an audio 1-token step on a
+non-empty cache is hard-refused. Carry state is committed only after the prefill
+succeeds, so a refused append (capacity / guard) leaves it intact.
+
+The one-shot path (LLMInferenceRuntime::runBaseModelPrefill ->
+runBaseModelPrefillChunk(fullSpans)) is NOT touched and stays byte-identical.
+
+The m1 spike R3 KV-continuity assertion is relaxed to accept the coalesced
+intermediate boundary (kvB1 in {splitAt-1, splitAt}); the final cumulative KV
+(kvB2 == totalTokens) and strict monotonicity are unchanged.
+
+Empirical gate (orin-nx, engines-v080 Qwen3-ASR-0.6B):
+  m1 N-1 (1-tok final) splits 30/29, 40/39, 64/63, 100/99:
+    argmax MATCH, max-abs logit diff = 0.000000e+00 (was ~1.9-2.3e+01 FAIL).
+  m1 multi-token splits 64/32, 40/17, 100/50, 64/62, 40/38: still diff 0.0.
+  m2 session lifecycle: PASS x3.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+--- a/cpp/runtime/asrStreamingSessionRuntime.h
++++ b/cpp/runtime/asrStreamingSessionRuntime.h
+@@ -159,6 +159,15 @@
+     DecodingInferenceContext mContext; //!< Session-scoped inference context.
+     rt::Tensor mChunkAudioEmbedding;   //!< Reusable FP16 buffer for per-chunk encoded audio.
+ 
++    //! @brief Carried trailing token of a previous non-final TEXT chunk (v080-0004).
++    //! @details Single-token append-prefill guard: the AttentionPlugin routes a qSeqLen==1
++    //!          prefill step on a non-empty KV cache to the DECODE path (wrong RoPE position /
++    //!          attention length), so we never emit a 1-token prefill step after the first chunk.
++    //!          The trailing token of a non-final text chunk is held here and prepended to the
++    //!          next chunk, guaranteeing every subsequent (and the final) step packs >= 2 tokens.
++    //!          Empty in steady state. Never holds an audio-bound token.
++    std::vector<int32_t> mPendingTextTail;
++
+     bool appendChunkImpl(std::vector<int32_t> const& chunkTokenIds, rt::audioUtils::AudioData const* mel,
+         bool isFinalChunk, cudaStream_t stream);
+ };
+--- a/cpp/runtime/asrStreamingSessionRuntime.cpp
++++ b/cpp/runtime/asrStreamingSessionRuntime.cpp
+@@ -123,15 +123,106 @@
+         return false;
+     }
+ 
+-    // Overflow guard: this chunk must not push the cumulative positions past the MRope/KV capacity
+-    // the session was initialized for (spec R3 invariant).
+-    if (mMaxPositions > 0 && mAppendedTokens + static_cast<int32_t>(chunkTokenIds.size()) > mMaxPositions)
++    // ─────────────────────────────────────────────────────────────────────────
++    // Single-token append-prefill guard (v080-0004).
++    //
++    // The AttentionPlugin distinguishes a chunked-prefill step from a vanilla
++    // decode step PURELY by the runtime sequence length of Q:
++    //   deduceModeVanilla() (cpp/plugins/attentionPlugin/attentionPlugin.cpp):
++    //     non-empty kvcache_start_index && qSeqLen > 1  -> kCHUNKED_PREFILL
++    //     non-empty kvcache_start_index && qSeqLen == 1  -> kVANILLA_DECODING
++    // So an append-prefill chunk of EXACTLY 1 token landing on a NON-EMPTY KV
++    // cache is misrouted to the decode path. In decode, RoPE position is taken
++    // from contextLength (launchApplyRopeWriteKV(..., contextLengthTensor, ...) →
++    // posStartId = contextLength - qSeqLen). The chunk path sets contextLength to
++    // the CHUNK length (=1), so the position collapses to 0 (chunk-relative)
++    // instead of the absolute priorKV+0, and XQA attends over sequence_lengths=1
++    // instead of the full KV. The sampled logits are wrong (argmax can flip).
++    // Multi-token chunks (qSeqLen>1) route correctly and are byte-identical.
++    // This corrupts BOTH a 1-token FINAL chunk (wrong sampled token) and a
++    // 1-token INTERMEDIATE chunk (wrong RoPE position baked into the KV cache).
++    //
++    // There is no signal at the plugin boundary to disambiguate a 1-token
++    // prefill-append from a genuine decode by shape alone, so we enforce the
++    // invariant in the runtime instead: a prefill step with qSeqLen==1 must
++    // never run on a non-empty KV cache. We coalesce by carrying the trailing
++    // token of a non-final TEXT chunk forward into the next chunk, so every
++    // subsequent (and the final) prefill step packs >= 2 tokens. The FIRST chunk
++    // runs on an empty KV cache (priorKV==0 ⇒ kNORMAL_PREFILL, which is valid at
++    // length 1), so it is never deferred. Carry-over is applied only to
++    // text-only chunks: an audio-bearing chunk binds its own per-chunk audio
++    // embeddings, and an audio chunk is never length 1 in practice, so its
++    // token↔embedding correspondence is left untouched.
++    //
++    // A non-empty KV cache is equivalent to "at least one chunk already
++    // committed" (beginAsrSession resets KV and commits nothing), i.e.
++    // mChunkCount > 0.
++    bool const priorKvNonEmpty = (mChunkCount > 0) || !mPendingTextTail.empty();
++
++    // Build the effective token slice for this step: any carried text tail from a
++    // previous non-final text chunk, followed by this chunk's tokens. NOTE: member
++    // state (mPendingTextTail) is NOT mutated until the prefill below succeeds, so a
++    // refused append (capacity / 1-token guard) leaves the carry state intact.
++    std::vector<int32_t> effectiveTokens;
++    bool const textOnly = (mel == nullptr);
++    if (!mPendingTextTail.empty())
+     {
+-        LOG_ERROR("appendChunk: chunk would exceed session capacity (appended=%d + chunk=%zu > maxPositions=%d)",
+-            mAppendedTokens, chunkTokenIds.size(), mMaxPositions);
++        // A pending tail can only have come from a previous TEXT chunk. It is safe
++        // to prepend to a text chunk (pure text gather) and to an audio chunk
++        // (the deferred text token takes a text embedding; the audio chunk's audio
++        // embeddings are indexed by its own audio-pad positions and are unaffected).
++        effectiveTokens.reserve(mPendingTextTail.size() + chunkTokenIds.size());
++        effectiveTokens.insert(effectiveTokens.end(), mPendingTextTail.begin(), mPendingTextTail.end());
++        effectiveTokens.insert(effectiveTokens.end(), chunkTokenIds.begin(), chunkTokenIds.end());
++    }
++    else
++    {
++        effectiveTokens = chunkTokenIds;
++    }
++
++    // Decide whether to defer this step's trailing token. We defer when the step
++    // is NOT final, is text-only, and running the remainder now would still leave
++    // a valid prefill (effectiveTokens.size() >= 2 so the deferred-1 step has >=1
++    // token). The carried token guarantees the NEXT step (final or not) packs
++    // >= 2 tokens, keeping it on the chunked-prefill path even if the producer
++    // hands us a single trailing token.
++    bool const deferTail = (!isFinalChunk && textOnly && effectiveTokens.size() >= 2);
++
++    std::vector<int32_t> stepTokens;
++    std::vector<int32_t> nextPendingTail; // committed to mPendingTextTail only on success.
++    if (deferTail)
++    {
++        nextPendingTail.assign(effectiveTokens.end() - 1, effectiveTokens.end());
++        stepTokens.assign(effectiveTokens.begin(), effectiveTokens.end() - 1);
++    }
++    else
++    {
++        stepTokens = std::move(effectiveTokens);
++    }
++
++    // Hard invariant: a 1-token prefill step must never run on a non-empty KV
++    // cache (would be misrouted to the decode path). After the carry-over logic
++    // above this can only happen for an audio-bearing chunk of length 1 on a
++    // non-empty cache, which is not produced by any real ASR chunker. Refuse
++    // rather than emit silently-wrong logits.
++    if (stepTokens.size() == 1 && priorKvNonEmpty)
++    {
++        LOG_ERROR("appendChunk: refusing a 1-token prefill step on a non-empty KV cache (chunk %d, audio=%d) — "
++                  "this would be misrouted to the decode path and produce wrong logits",
++            mChunkCount, static_cast<int32_t>(!textOnly));
+         return false;
+     }
+ 
++    // Overflow guard: this step must not push the cumulative positions past the MRope/KV capacity
++    // the session was initialized for (spec R3 invariant). Use the actual committed step length
++    // (carry-over preserves the cumulative token count across deferral).
++    if (mMaxPositions > 0 && mAppendedTokens + static_cast<int32_t>(stepTokens.size()) > mMaxPositions)
++    {
++        LOG_ERROR("appendChunk: chunk would exceed session capacity (appended=%d + step=%zu > maxPositions=%d)",
++            mAppendedTokens, stepTokens.size(), mMaxPositions);
++        return false;
++    }
++
+     // Encode the mel chunk (if any) into a per-chunk audio embedding buffer and bind it for THIS
+     // chunk's embedding lookup. Text-only chunks pass no audio embeddings.
+     rt::OptionalInputTensor audioEmbeds = std::nullopt;
+@@ -145,17 +236,19 @@
+         audioEmbeds = std::optional<std::reference_wrapper<rt::Tensor const>>(std::cref(mChunkAudioEmbedding));
+     }
+ 
+-    // Append-only prefill: pack ONLY this chunk's slice onto the committed KV cache. Sampling is
++    // Append-only prefill: pack ONLY this step's slice onto the committed KV cache. Sampling is
+     // enabled only on the final chunk.
+     std::vector<rt::SpanI32> chunkSpans;
+-    chunkSpans.emplace_back(chunkTokenIds.data(), chunkTokenIds.size());
++    chunkSpans.emplace_back(stepTokens.data(), stepTokens.size());
+     if (!mRuntime.appendPrefillChunk(mContext, chunkSpans, audioEmbeds, /*sampleAfterPrefill=*/isFinalChunk))
+     {
+         LOG_ERROR("appendChunk: prefill chunk %d failed", mChunkCount);
+         return false;
+     }
+ 
+-    mAppendedTokens += static_cast<int32_t>(chunkTokenIds.size());
++    // Commit carry state only now that the prefill has succeeded.
++    mPendingTextTail = std::move(nextPendingTail);
++    mAppendedTokens += static_cast<int32_t>(stepTokens.size());
+     ++mChunkCount;
+     if (isFinalChunk)
+     {
+@@ -176,6 +269,7 @@
+     mMaxPositions = 0;
+     mAppendedTokens = 0;
+     mChunkCount = 0;
++    mPendingTextTail.clear();
+     mStatus = AsrSessionStatus::kIdle;
+ }
+ 
+--- a/examples/llm/spike_v080_m1_append_prefill.cpp
++++ b/examples/llm/spike_v080_m1_append_prefill.cpp
+@@ -184,9 +184,19 @@
+     bool ok = true;
+ 
+     // R3: KV-length continuity across chunks.
+-    bool kvR3 = (kvB1 == splitAt) && (kvB2 == totalTokens) && (kvA == totalTokens);
+-    printf("R3 KV continuity: A_kv=%d  B_kv1=%d(exp %d)  B_kv2=%d(exp %d)  => %s\n", kvA, kvB1, splitAt, kvB2,
+-        totalTokens, kvR3 ? "PASS" : "FAIL");
++    //
++    // The single-token append-prefill guard (v080-0004) coalesces a non-final TEXT chunk's
++    // trailing token forward into the next chunk so that no prefill step of length 1 ever
++    // lands on a non-empty KV cache (which the AttentionPlugin would misroute to the decode
++    // path). After a non-final text chunk of length L>=2 the runtime therefore commits L-1
++    // tokens and carries 1 forward; the carried token is committed by the next chunk. The
++    // FINAL cumulative KV is unchanged (kvB2 == totalTokens) and KV is still strictly
++    // monotonic — only the intermediate boundary is pulled back by exactly the one carried
++    // token. We accept kvB1 in {splitAt-1, splitAt} accordingly.
++    bool const kvB1Ok = (kvB1 == splitAt) || (kvB1 == splitAt - 1);
++    bool kvR3 = kvB1Ok && (kvB2 == totalTokens) && (kvA == totalTokens);
++    printf("R3 KV continuity: A_kv=%d  B_kv1=%d(exp %d or %d, carry-over)  B_kv2=%d(exp %d)  => %s\n", kvA, kvB1,
++        splitAt - 1, splitAt, kvB2, totalTokens, kvR3 ? "PASS" : "FAIL");
+     ok = ok && kvR3;
+ 
+     if (logitsA.empty() || logitsB.empty() || logitsA.size() != logitsB.size())

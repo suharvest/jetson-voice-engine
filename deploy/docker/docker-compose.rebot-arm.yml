@@ -1,0 +1,90 @@
+# docker-compose.rebot-arm.yml — the reBot B601-DM grasp-arm voice agent,
+# pinned to the v0.8.0 streaming voice stack.
+#
+# WHY THIS FILE EXISTS
+#   The LIVE voice-rebot-arm container was started as a bare `docker run` whose
+#   repoint to the v080 stack was never written to disk. This compose freezes
+#   that exact running config so a rebuild does not lose it and another device
+#   can reproduce it. It SUPERSEDES the older run scripts that still point the
+#   agent at the legacy `seeed-voice` stack (see commit message for the list).
+#
+#   Captured verbatim from `docker inspect voice-rebot-arm` on seeed-orin-nx
+#   (2026-06-11). Key repoint: VOICE_SERVICE_HOST=seeed-voice-v080-prefix
+#   (the v080 prefix container), reached over the shared external
+#   voice-arm_default bridge; LLM via edge-llm:8000.
+#
+# DEPLOY (only when intentionally (re)creating the arm container — this repo's
+# convention is NOT to auto-touch the running arm):
+#   docker compose -f docker-compose.rebot-arm.yml up -d
+#
+# CONTRACT
+#   * privileged + user 0 + /dev/snd + /dev/ttyACM0 (B601 arm; SO-ARM is ttyACM0
+#     too — REBOT_CHANNEL=auto lets the SDK resolve the correct serial node).
+#   * /run/user (ro) for the PipeWire/PulseAudio socket; /dev/serial (ro) for
+#     by-id serial resolution.
+#   * port 8775 = agent observation/health endpoint (OBSERVATION_PORT).
+#   * voice-arm_default is owned by the voice stack compose and attached external
+#     so name resolution to seeed-voice-v080-prefix survives recreates.
+#
+#
+# VISION IMAGE (2026-06-11) — REGISTRY + REPRODUCIBLE
+#   image = sensecraft-missionpack.seeed.cn/solution/voice-rebot-arm:v0.8.0-vision-20260611
+#   This is now a CLEAN `docker build` from agent/Dockerfile.rebot-arm (which
+#   bakes the Phase B vision deps pyorbbecsdk2 + libgl1 + libglib2.0-0), pushed
+#   to the Seeed registry. It NO LONGER depends on a docker-commit of a running
+#   container — pull `:v0.8.0-vision-20260611` to reproduce/restore exactly.
+#   The box model is NOT baked: it is mounted read-only from the host at
+#   /home/seeed/rebot-models -> /opt/rebot-models (replaceable).
+#
+services:
+  voice-rebot-arm:
+    image: sensecraft-missionpack.seeed.cn/solution/voice-rebot-arm:v0.8.0-vision-20260611
+    container_name: voice-rebot-arm
+    restart: unless-stopped
+    privileged: true
+    user: "0"
+
+    ports:
+      - "8775:8775"        # agent observation / health (OBSERVATION_PORT)
+
+    environment:
+      # ── voice stack repoint (the whole point of this file) ──
+      VOICE_SERVICE_HOST: seeed-voice-v080-prefix
+      VOICE_SERVICE_PORT: "8000"
+      LLM_SERVICE_HOST: edge-llm
+      LLM_SERVICE_PORT: "8000"
+      # ── agent behaviour ──
+      OVS_AGENT_SERVER_LOOP: "1"
+      WAKEWORD_MODEL: "hey jarvis"
+      OBSERVATION_PORT: "8775"
+      # ── audio device selection (reSpeaker 6-mic, channel 0) ──
+      MIC_INDEX: reSpeaker
+      SPEAKER_DEVICE: reSpeaker
+      MIC_CHANNELS: "6"
+      MIC_CHANNEL_SELECT: "0"
+      # ── reBot arm serial channel (auto-resolve B601 vs SO-ARM node) ──
+      REBOT_CHANNEL: auto
+      REBOT_REPO_ROOT: /opt/rebot
+      # ── agent app config + import roots (baked layout) ──
+      CONFIG_DIR: /opt/slv/agent/ovs_agent/apps/voice_rebot_arm
+      PYTHONPATH: /opt/slv/agent
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+
+    volumes:
+      - /run/user:/run/user:ro
+      - /dev/serial:/dev/serial:ro
+      - /home/seeed/rebot-models:/opt/rebot-models:ro   # host box model(s) for grasp config (replaceable)
+
+    devices:
+      - /dev/snd:/dev/snd
+      - /dev/ttyACM0:/dev/ttyACM0
+
+    networks:
+      - voice-arm_default
+
+networks:
+  # Owned by the voice stack compose project; attached external so the arm can
+  # reach seeed-voice-v080-prefix by name across recreates of either side.
+  voice-arm_default:
+    external: true

@@ -135,7 +135,7 @@ upstream_pr:  —
 rationale:    MOSS-TTS-Nano 产品模型移植 (linear-attention KV kernel + stateful runtime + JSON-line worker)。上游无此模型。TTFA 157ms, 19× faster than ORT。最干净一类: 几乎全 ISO 新文件, 仅 1 处 CMake 注册算 CORE
 scope:        addon=cpp/kernels/kvCacheUtilKernels/mossLinearKvKernels.{cu,h}, cpp/runtime/mossTtsNanoRuntime.{cpp,h}, cpp/workers/moss_tts_nano_worker.cpp, cpp/workers/build_moss_worker.sh, unittests/mossLinearKvKernelsTests.cu, unittests/mossTtsNanoSmokeMain.cpp; CORE 触点=0001 patch cpp/CMakeLists.txt MOSS 注册 hunk only
 validation:   unittests/mossLinearKvKernelsTests (5/5 PASS), mossTtsNanoSmokeMain; hardware 3 zh prompts CER=0, N=2 byte-identical
-last_replay:  —
+last_replay:  2026-06-10 v0.8.0 (patch v080-0011): ported verbatim (0 source adaptation, GLOB auto-register + 1 CMake smoke-main-exclude hunk); edgellmCore+worker built; mossLinearKvKernelsTests 5/5 PASS; 3 zh prompts roundtrip-correct on orin-nx (paraformer_trt). See docs/plans/v080-0011-moss-tts-nano-roundtrip-acceptance.md
 
 ## worker-cancel-protocol
 category:     b

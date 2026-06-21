@@ -1,3 +1,35 @@
-364769036fc83351d9d0aac4cc064a8e56a83178
-# = NVIDIA TensorRT-Edge-LLM tag v0.7.1 (Merge PR #90, dev-release/0.7.1)
-# upstream: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+7142a30e7d3b7fa68919b605c6c51b480f77b3ff
+# = fork integration branch HEAD: suharvest/port/qwen3-tts-base-v080-n1n2
+#   "feat(asr): expose maxSessionBatchSize() on LLMInferenceRuntime for N>1 worker"
+#
+# Repinned from a361221 -> 7142a30 (C2b hardening) so the SINGLE branch can
+# build the FULL v0.8.0 N>1 stack (TTS streaming worker + ASR voice worker).
+# Three commits were added on top of the previous a361221 pin:
+#   8de933f  C3 N<=0 prefill guard (defensive early-return; N>0 paths unchanged)
+#   a099544  add minimal SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp})
+#            — the ASR voice worker's #include target. ONLY the lane allocator
+#            (no deferred AsrStreamingSessionRuntime streaming wrapper).
+#   7142a30  expose LLMInferenceRuntime::maxSessionBatchSize() (trivial accessor;
+#            sizes the worker's lane manager to the engine's physical batch).
+#
+# This pin is the SINGLE SOURCE for the Base TTS N>1 serving stack. It is
+# NVIDIA release/0.8.0 (f9cc746) + 6 fork-port commits + the D2-1 shared-engine
+# ctor, in one branch:
+#   f9cc746  NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD (PR #101)
+#   10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
+#   ba9ecdb  backport Base speaker-encoder (external-embedding) path onto v0.8.0
+#   867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
+#   26a4a69  cuBLAS-free tiled FP16 GEMM fallback for talker MLP/linear (sm_87)
+#   50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
+#   873ca22  fp8 text_embedding (native kernel path)
+#   a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
+#
+# Because these are now IN the pinned branch, the old engine-overlay/patches/
+# v080-port-0001..0006 are REDUNDANT and are NO LONGER in the build.sh apply
+# chain (kept on disk for archival only). See patches/PATCH-STATE-v080.md §4.
+#
+# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+# fork remote (suharvest): branch suharvest/port/qwen3-tts-base-v080-n1n2
+#
+# NOTE: build.sh fetches this SHA. The fork ref must be reachable from the
+# configured upstream.remote (set it to the suharvest fork for reproduction).

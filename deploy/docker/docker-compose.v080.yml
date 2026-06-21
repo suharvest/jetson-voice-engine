@@ -1,0 +1,99 @@
+# docker-compose.v080.yml — one-pull deploy for the v0.8.0 edgellm voice stack.
+#
+# PURPOSE
+#   Cements the v0.7.1 → v0.8.0 migration into a single `docker compose up -d`.
+#   The v0.8.0 image is SLIM: it bakes only the 3 serving-worker binaries + the
+#   edgellm plugin .so, and on first boot HF-pulls the multi-GB TensorRT engines
+#   into the `edgellm-v080` named volume, then chains to uvicorn. No host build,
+#   no manual engine staging.
+#
+# WHY A SEPARATE COMPOSE (not the production run-spec)
+#   Production `seeed-voice` is launched ad-hoc via `docker run` (image
+#   :prod-unified-v8, port 8621, profile jetson-zh-en) — there is no committed
+#   production compose to edit. This file is purely ADDITIVE: a NEW service
+#   `seeed-voice-v080` on an alternate port (8622) so it never collides with the
+#   running production container. Flip production over by pointing its run-spec
+#   at this image + OVS_PROFILE once validated (see runbook).
+#
+# THE FULL DEPLOY CONTRACT (verified in v080-0018 / v080-0019 serve gate)
+#   * OVS_PROFILE=jetson-edgellm-v080  — baked in the image; the v0.8.0
+#     generic-runner TTS worker rejects the explicit-KV flags the old multilang
+#     profile emits, so the v0.8.0 profile is mandatory (it is baked, listed here
+#     only for visibility/override).
+#   * deploy_paths env (EDGE_LLM_ASR/TTS_* dirs, MOSS_WORKER_BIN, plugin path) —
+#     ALL baked in the image pointing at /opt/edgellm-v080/... — NOT repeated
+#     here (operator-owned snapshot would otherwise be needed; the image wins).
+#   * slim-lib host mounts + LD_LIBRARY_PATH + nvidia runtime — REQUIRED here
+#     (the slim image carries NO TensorRT/CUDA libs; without these the worker
+#     dies `libnvinfer.so.10: cannot open shared object file`). Captured verbatim
+#     from `docker inspect seeed-voice` (the production contract).
+#   * engine volume (edgellm-v080) — persists the first-boot HF pull across
+#     restarts (3.8 GB; pull is skipped once the sentinel llm.engine exists).
+#   * speech-models volume — MOSS codec + misc model provisioner cache, shared
+#     with production (named volume `speech-models`, external).
+#
+# USAGE
+#   docker compose -f docker-compose.v080.yml up -d
+#   curl localhost:8622/health
+#   # First boot: ~5-15 min HF pull (watch `docker compose -f … logs -f`).
+#   # Subsequent boots: pull skipped, uvicorn up in ~10 s.
+#
+services:
+  seeed-voice-v080:
+    image: sensecraft-missionpack.seeed.cn/solution/seeed-local-voice:v0.8.0-edgellm-20260610e
+    container_name: seeed-voice-v080
+    restart: unless-stopped
+
+    # NVIDIA runtime + all GPUs (Orin NX iGPU). Equivalent of `--runtime nvidia
+    # --gpus all` on the production run-spec.
+    runtime: nvidia
+
+    ports:
+      - "8622:8000"        # alt port; production seeed-voice holds 8621
+
+    environment:
+      # Baked in the image already; surfaced here for visibility / override.
+      OVS_PROFILE: jetson-edgellm-v080
+      NVIDIA_VISIBLE_DEVICES: all
+      # slim-image: TRT/CUDA libs come from the host bind-mounts below.
+      LD_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/onnxruntime/capi:/host-cuda:/host-nvidia-libs:/host-libs
+      # First-boot HF pull (default 1). Set to 0 only if engines are pre-staged
+      # into the edgellm-v080 volume out-of-band.
+      EDGELLM_V080_AUTO_PULL: "1"
+      # HF mirror (on-device cross-wall). Honoured by pull_v080_artifacts.sh.
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+
+    volumes:
+      # ── slim-lib host mounts (Blocker 4 contract — verbatim from prod) ──
+      - /usr/local/cuda/lib64:/host-cuda
+      - /usr/lib/aarch64-linux-gnu/nvidia:/host-nvidia-libs
+      - /lib/aarch64-linux-gnu:/host-libs
+      - /usr/lib/python3.10/dist-packages/tensorrt:/usr/lib/python3.10/dist-packages/tensorrt
+      - /usr/src/tensorrt:/usr/src/tensorrt
+      # ── v0.8.0 engine cache (first-boot HF pull lands here; persists) ──
+      - edgellm-v080:/opt/edgellm-v080
+      # ── shared speech-models provisioner cache (MOSS codec etc.) ──
+      - speech-models:/opt/models
+
+    # The image's ENTRYPOINT (entrypoint.jetson.v080.sh) pulls engines then
+    # chains to the canonical profile-resolving entrypoint + the uvicorn CMD.
+    # Do NOT override command/entrypoint here.
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      # generous start_period: first boot HF-pulls multi-GB engines before serving.
+      start_period: 900s
+      retries: 5
+
+volumes:
+  # First-boot HF engine cache. Local named volume — survives container
+  # recreation so the 3.8 GB pull happens only once.
+  edgellm-v080:
+    name: edgellm-v080
+  # Shared with production seeed-voice. Marked external so compose never
+  # creates/destroys it (it predates this stack).
+  speech-models:
+    name: speech-models
+    external: true

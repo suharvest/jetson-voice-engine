@@ -9,14 +9,24 @@ vendoring the full NVIDIA source tree**.
 
 ```
 voxedge-engine/
-  UPSTREAM_PIN       # exact NVIDIA commit (= v0.7.1, 364769036…)
+  UPSTREAM_PIN       # exact NVIDIA commit (= v0.8.0, f9cc746…, release/0.8.0 HEAD)
   upstream.remote    # https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-  addon/             # 40 new files (upstream does not have these), original relative paths
-  patches/           # 8 theme patches (0001..0008) over the upstream pin → 27 modified files
+  addon/             # new files (upstream does not have these), original relative paths
+  patches/           # legacy 000N theme patches (v0.7.1 era) + v080-port-000N
+                     #   (fork port/qwen3-tts-base-v080 TTS runtime) + v080-NNNN
+                     #   feat patches. SEE patches/PATCH-STATE-v080.md for which
+                     #   apply on v0.8.0 and which are pending rebase.
   build.sh           # clone upstream@pin → copy addon → apply patches → build (Jetson host)
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a)/(b) classification + upstream-PR / retirement plan
 ```
+
+> **v0.8.0 re-pin (C2a):** pin moved v0.7.1 `364769…` → v0.8.0 `f9cc746…`. The
+> canonical TTS-runtime source is now the fork branch `port/qwen3-tts-base-v080`
+> (6 commits / 9 files), regenerated into `patches/v080-port-000N`. Of the legacy
+> `000N` patches only `0001` clean-applies on v0.8.0; `0002`–`0007` are superseded
+> and `0008` needs a hunk-split. The `v080-NNNN` feat series (ASR/MOSS/CV/TTS-batch)
+> is pending rebase. Full apply-check evidence: `patches/PATCH-STATE-v080.md`.
 
 The full source tree is **reconstructed at build time**: clone upstream at
 `UPSTREAM_PIN`, copy `addon/` over it, apply `patches/*.patch` in order, build.
