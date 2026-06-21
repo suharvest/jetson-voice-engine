@@ -57,17 +57,27 @@ echo "==> copying addon/ (new files)"
   done )
 
 # --- 3. apply patches in order -----------------------------------------------
-# Apply ORDER (v0.8.0 re-pin, C2a):
-#   1. legacy 000N theme patches that still clean-apply on v0.8.0 base: 0001, 0008
-#      (0002/0003/0004/0005/0006/0007 are SUPERSEDED on v0.8.0 — see
-#       patches/PATCH-STATE-v080.md; they are NOT applied here)
-#   2. fork-port TTS-runtime stack v080-port-000N (canonical source =
-#      fork port/qwen3-tts-base-v080; streaming worker, Base speaker-encoder,
-#      cutedsl shim, cuBLAS-free GEMM, M=1 GEMV, fp8 text_embedding)
-#   3. v080-NNNN ASR-streaming / MOSS / CustomVoice / TTS-batch feat patches
-#      *** PENDING REBASE — several do NOT clean-apply from base yet ***
-#      (double-source vs addon/, corrupt v080-0008, non-applicable
-#       v080-0024..0027 worker-diff snapshots). See PATCH-STATE-v080.md.
+# AUTHORITATIVE SERVING BUILD CHAIN (v0.8.0, C2b).
+#
+# Ground truth: the v0.8.0 image that passed the real serve gate
+# (docs/plans/v080-0019 in the feat tree) is a THIN binary overlay. Its 3 worker
+# binaries + edgellm plugin were built from EXACTLY:
+#
+#     f9cc746  (NVIDIA release/0.8.0 HEAD)
+#   + addon/   (new files: MOSS runtime+worker, w8a16 kernels, statefulCode2Wav,
+#               spikes, scripts — all additive; copied in step 2 above)
+#   + 0001-orin-tegra-build-compat   (Orin/Tegra CUDA-12.6 build-host compat)
+#   + v080-0007-customvoice-language-conditioning (Qwen3OmniTTSRuntime struct port)
+#   + v080-0008-tts-cutedsl-wrap     (CuTe-DSL --wrap shim, load-bearing toolchain)
+#
+# (HF MANIFEST v080-0017 §header: "edgellm base: f9cc746 + port patches
+#  v080-0007 / v080-0008". Workers: native/edgellm_voice_worker/*.cpp +
+#  addon/cpp/workers/moss_tts_nano_worker.cpp — compiled, NOT in this patch chain.)
+#
+# The shipped TTS worker is the GENERIC qwen3_tts_worker on Qwen3OmniTTSRuntime;
+# ASR is one-shot (stream_mode=accumulate). The fork-port streaming-worker stack,
+# the slot-pool, and all v080-NNNN ASR-streaming / TTS-batch / N>1 experiments are
+# NOT part of the serving build and are DROPPED here (see PATCH-STATE-v080.md §4).
 echo "==> applying patches"
 apply_one() {
   local p="$1"
@@ -75,25 +85,20 @@ apply_one() {
   git -C "${WORKDIR}" apply --check "${p}"
   git -C "${WORKDIR}" apply "${p}"
 }
-# 1) legacy clean-on-v080 theme patches (explicit allow-list, NOT a glob)
-for n in 0001-orin-tegra-build-compat; do
+# Authoritative serving chain — explicit ordered allow-list (NOT a glob).
+# Verified: full chain git-apply --check CLEAN on f9cc746 + addon/ (C2b).
+for n in \
+    0001-orin-tegra-build-compat \
+    v080-0007-customvoice-language-conditioning \
+    v080-0008-tts-cutedsl-wrap \
+; do
   apply_one "${HERE}/patches/${n}.patch"
 done
-# 2) fork-port TTS-runtime stack (canonical) — verified clean-applies as a stack
-for p in "${HERE}"/patches/v080-port-[0-9][0-9][0-9][0-9]-*.patch; do
-  apply_one "${p}"
-done
-# 3) legacy 0008 example-registration:
-#    omni-CMakeLists hunk now DUPLICATES the fork-port streaming-worker target
-#    registration (v080-port-0001) -> conflicts. Pending hunk-split (drop omni
-#    hunk, keep .gitignore + examples/llm/CMakeLists.txt). NOT applied until
-#    rebased. See PATCH-STATE-v080.md.
-# for n in 0008-build-misc-example-registration; do apply_one "${HERE}/patches/${n}.patch"; done
-# 4) v080-NNNN ASR/MOSS/CV/TTS-batch feat patches — PENDING REBASE, NOT applied:
-# for p in "${HERE}"/patches/v080-[0-9][0-9][0-9][0-9]-*.patch; do apply_one "${p}"; done
 echo "==> patched source tree ready at ${WORKDIR}"
-echo "    NOTE: legacy 0008 + v080-NNNN feat patches are PENDING REBASE (C2a)."
-echo "          See patches/PATCH-STATE-v080.md before the next build."
+echo "    Authoritative serving chain applied (0001 + v080-0007 + v080-0008)."
+echo "    MOSS delivered via addon/. Fork-port stack, legacy 0002-0008, and"
+echo "    v080-NNNN streaming/batch experiments are intentionally NOT applied —"
+echo "    they were not in the serve-gated build. See patches/PATCH-STATE-v080.md."
 
 if [ "${APPLY_ONLY}" -eq 1 ]; then
   echo "==> --apply-only: stopping before compile (no CUDA/TRT needed)."
