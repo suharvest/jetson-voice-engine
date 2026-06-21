@@ -1,5 +1,25 @@
-f9cc74623d95d7acf1addab6026b9d410ba81f52
-# = NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD
-#   "Merge pull request #101 from JCalafato/dev-release/0.8.0"
-# upstream: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-# fork port branch (6 commit / 9 files on this base): port/qwen3-tts-base-v080
+a3612217d167772744aacac8be8df8ecd226dc1c
+# = fork integration branch HEAD: suharvest/port/qwen3-tts-base-v080-n1n2
+#   "feat(tts): D2-1 shared-engine ctor for slot-pool (share read-only engine weights)"
+#
+# This pin is the SINGLE SOURCE for the Base TTS N>1 serving stack. It is
+# NVIDIA release/0.8.0 (f9cc746) + 6 fork-port commits + the D2-1 shared-engine
+# ctor, in one branch:
+#   f9cc746  NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD (PR #101)
+#   10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
+#   ba9ecdb  backport Base speaker-encoder (external-embedding) path onto v0.8.0
+#   867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
+#   26a4a69  cuBLAS-free tiled FP16 GEMM fallback for talker MLP/linear (sm_87)
+#   50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
+#   873ca22  fp8 text_embedding (native kernel path)
+#   a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
+#
+# Because these are now IN the pinned branch, the old engine-overlay/patches/
+# v080-port-0001..0006 are REDUNDANT and are NO LONGER in the build.sh apply
+# chain (kept on disk for archival only). See patches/PATCH-STATE-v080.md §4.
+#
+# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+# fork remote (suharvest): branch suharvest/port/qwen3-tts-base-v080-n1n2
+#
+# NOTE: build.sh fetches this SHA. The fork ref must be reachable from the
+# configured upstream.remote (set it to the suharvest fork for reproduction).

@@ -1,5 +1,88 @@
-# Patch state — v0.8.0 authoritative serving chain (C2b)
+# Patch state — v0.8.0 Base TTS N>1 serving chain (C2-repin)
 
+> **CURRENT AUTHORITATIVE STATE = §C2-repin below (this section).**
+> Produced by **C2-repin** (Mac, git/source only — no engine build, no deploy).
+> Finalizes the overlay to reproduce the **Base Qwen3-TTS N>1** stack (streaming
+> worker + slot-pool + shared-engine ctor, NO CustomVoice) by repinning to the
+> fork integration branch that single-sources it.
+>
+> The historical C2a / C2b sections (§0–§9 below) are kept for provenance but are
+> **superseded** by C2-repin on three points: (1) the pin is now the fork
+> integration branch a361221, not NVIDIA `f9cc746`; (2) the canonical TTS path is
+> the fork-port **streaming worker** (N>1), not the generic `qwen3_tts_worker`;
+> (3) the apply chain is **0001 only** — `v080-0007`/`v080-0008` move to the
+> CustomVoice variant. Read §C2-repin and §10 first.
+
+---
+
+## §C2-repin — Base TTS N>1 (CURRENT, 2026-06-21)
+
+### Decision (user, 2026-06-21)
+Ship **Base N>1** now; **CustomVoice becomes an independent first-class variant**
+(later, see §10). Reason: the CustomVoice 9-row langId patch (`v080-0007`)
+conflicts with the fork's Base speaker-encoder kernel in talker prefill (8-row vs
+9-row — cannot coexist in one binary). The verified N>1 path uses the **Base**
+talker. → Base and CV are **two build variants**; this overlay builds **Base only**.
+
+### Pin (supersedes §1)
+`UPSTREAM_PIN = a3612217d167772744aacac8be8df8ecd226dc1c`
+= fork integration branch **`suharvest/port/qwen3-tts-base-v080-n1n2`** HEAD.
+This branch IS the single source for Base N>1:
+```
+f9cc746  NVIDIA release/0.8.0 HEAD (PR #101)
+10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
+ba9ecdb  backport Base speaker-encoder (external-embedding) path onto v0.8.0
+867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
+26a4a69  cuBLAS-free tiled FP16 GEMM fallback (talker MLP/linear, sm_87)
+50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
+873ca22  fp8 text_embedding (native kernel path)
+a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)   ← HEAD
+```
+`upstream.remote` repointed to the suharvest fork (NVIDIA HEAD is not reachable
+to a fork-only SHA).
+
+### Apply chain (supersedes §2 / §9.4)
+On top of the pinned branch + `addon/`, build.sh applies **exactly ONE** patch:
+
+| # | patch | disposition on a361221 | reason |
+|---|---|---|---|
+| 1 | `0001-orin-tegra-build-compat` | **KEEP** — git-apply --check CLEAN | NOT in the fork branch. Orin/Tegra CUDA-12.6 build-host compat: `CMakeLists.txt` + `cmake/CuteDsl.cmake` (static-lib PUBLIC/INTERFACE shim + `--wrap=_cudaLaunchKernelEx` propagation) + `cpp/CMakeLists.txt`. The fork's `cute_dsl_setup` foreach region is unchanged from f9cc746, so 0001's pre-image still matches. |
+
+Removed / re-homed (NOT in the Base apply chain):
+
+| patch(es) | disposition | reason (vs the pinned fork branch) |
+|---|---|---|
+| `v080-port-0001..0006` | **REMOVED — redundant** | These six patches ARE the six fork-port commits (10b338d…873ca22), now IN the pinned branch. Symbols confirmed present in checkout: `examples/omni/qwen3_tts_streaming_worker.cpp` (md5 `0d752b42`), `cpp/runtime/slotPool.h`, shared-engine ctor `Qwen3OmniTTSRuntime(ICudaEngine*, ICudaEngine*, …)` + `initializeEngineRunnersShared`, Base speaker-encoder external-embedding at `qwen3OmniTTSRuntime.cpp:949/988`. Forward-apply no-ops; reverse-apply drifts (branch final state ≠ intermediate-patch state). Kept on disk for archival. |
+| `v080-0007-customvoice-language-conditioning` | **MOVED → CV variant (§10)** | CustomVoice 9-row langId conditioning. Conflicts with Base 8-row speaker-encoder talker prefill. NOT applied to Base. |
+| `v080-0008-tts-cutedsl-wrap` | **REMOVED — superseded + CV-coupled** | Built on top of v080-0007's shim block; **FAILS git-apply** on the Base branch (`examples/omni/CMakeLists.txt:17` context drift — the fork's 867b74d rewrote that area). Its `--wrap=_cudaLaunchKernelEx` is already provided for Base by `cmake/CuteDsl.cmake` (CUDA<12.8, applied to LINK_TARGETS incl. the static `edgellmCore`) and hardened by 0001. Belongs to the CV variant. |
+| `v080-NNNN` ASR-streaming / TTS-batch incremental-KV | **DEFERRED (C3)** | Unchanged from §5/§9.1. N>1 ASR is the vendored worker on the vanilla one-shot core + asr-b2 engine, selected via the n2 profile. Needs no engine patch. |
+
+### apply-check verdict (temp worktree @ a361221 + addon/)
+- `0001-orin-tegra-build-compat`: **CHECK CLEAN → APPLY OK** (full ordered chain, 0 conflicts).
+- `v080-0008-tts-cutedsl-wrap`: **FAIL** (`examples/omni/CMakeLists.txt:17` — confirms it is CV-chain-coupled, correctly dropped).
+- `v080-port-0001..0006`: do not forward-apply (content already in branch) → confirmed redundant.
+
+### build.sh (Base N>1)
+- step 4 builds the engine core + plugin **and** the Base N>1 streaming worker
+  (`examples/omni/qwen3_tts_streaming_worker`, via `add_subdirectory(examples)→omni`;
+  explicit `--target qwen3_tts_streaming_worker`). This carries the slot-pool +
+  shared-engine ctor + Base speaker-encoder.
+- step 4b builds the ASR side only (`qwen3_asr_worker` N>1, from
+  `native/edgellm_voice_worker/`). The generic `qwen3_tts_worker` target is no
+  longer the TTS path — the streaming worker is.
+- Base TTS engines = talker + code-predictor + **speaker-encoder** (external
+  embedding); NOT the CustomVoice int4 engine.
+
+### n2 profile — UNCHANGED, retained
+`deploy/docker/jetson-edgellm-v080-n2.json` + `Dockerfile.jetson.v080-edgellm-n2`
+keep the session-gate triplet (`LAZY_TTS=1` + `OVS_TTS_WORKER_CONCURRENCY=2` +
+`OVS_MAX_CONCURRENT_SESSIONS=2`), asr-b2 engine dir, and prefix flags. See §9.3.
+
+---
+
+## (HISTORICAL) Patch state — v0.8.0 authoritative serving chain (C2b)
+
+> **SUPERSEDED by §C2-repin above.** Kept for provenance.
 > Produced by **C2b — apply-chain cleanup** (Mac, no engine build). Reconciles the
 > overlay patch chain to the **authoritative serving build** that actually passed
 > the v0.8.0 real serve gate, then proves it git-apply --check clean from base.
@@ -202,3 +285,36 @@ and `addon/cpp/runtime/slotPool.h` (both belonged to the dropped fork-port path)
 The remaining addon files (MOSS, w8a16 kernels, statefulCode2Wav, spikes, scripts,
 experimental/server) are all **additive new files** — they do not conflict with
 the apply chain and matched the v080-0016 build set.
+
+## 10. CustomVoice variant — DEFINED, NOT BUILT HERE (future first-class variant)
+
+Per the 2026-06-21 decision, **CustomVoice is an independent first-class build
+variant**, parallel to the Base N>1 variant this overlay builds. It is **NOT built
+in this overlay / build.sh run.** Definition for the future variant:
+
+- **Same N>1 machinery** as Base: the slot-pool + shared-engine ctor + streaming
+  worker (`examples/omni/qwen3_tts_streaming_worker`) from the pinned fork branch
+  (a361221). N>1 ASR/TTS concurrency, session-gate triplet, n2-style profile —
+  all reused unchanged.
+- **CustomVoice talker conditioning patch:** `v080-0007-customvoice-language-conditioning`
+  (9-row langId prefill + talkerMLP kernel layout) — **applied for the CV variant
+  only.** It conflicts with the Base 8-row speaker-encoder talker prefill, so the
+  two variants are **separate binaries** (cannot coexist).
+- **Companion toolchain patch:** `v080-0008-tts-cutedsl-wrap` (incremental on
+  v080-0007's shim block) — re-home it to the CV variant too, since it only
+  applies on top of v080-0007 and is unnecessary for Base.
+- **CustomVoice int4 engine** (NOT an export the Base variant uses):
+  `harvestsu/qwen3-tts-0.6b-customvoice-jetson-trtllm-int4fp8` (int4/fp8 talker;
+  the verified CV engine). Base uses talker + code-predictor + speaker-encoder
+  (external embedding) instead.
+- **Separate build:** the CV variant would have its own apply chain
+  (`0001` + `v080-0007` + `v080-0008`) on the pinned branch, its own engine bundle
+  (CV int4), and its own profile/Dockerfile. NOT produced by this build.sh.
+- **Known-good reference:** the CV int4 talker is verified usable end-to-end
+  (ASR confirms intelligible audio) — see project memory
+  `customvoice_talker_int4_eos_fail_2026_06_20.md`. The earlier "garbled/runaway"
+  saga was a wrong-tokenizer test-harness bug, not an int4/engine defect.
+
+This overlay's `UPSTREAM_PIN` + apply chain + build.sh stay **Base-only**. The CV
+variant is a follow-up task (own pin chain may equal a361221 too, just with the
+two CV patches applied + the CV int4 engine bundle).

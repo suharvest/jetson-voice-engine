@@ -57,38 +57,49 @@ echo "==> copying addon/ (new files)"
   done )
 
 # --- 3. apply patches in order -----------------------------------------------
-# AUTHORITATIVE SERVING BUILD CHAIN (v0.8.0, C2b).
+# BASE TTS N>1 SERVING BUILD CHAIN (v0.8.0, C2-repin).
 #
-# Ground truth: the v0.8.0 image that passed the real serve gate
-# (docs/plans/v080-0019 in the feat tree) is a THIN binary overlay. Its 3 worker
-# binaries + edgellm plugin were built from EXACTLY:
+# Ground truth: this overlay reproduces the BASE Qwen3-TTS N>1 stack (streaming
+# worker + slot-pool + shared-engine ctor) WITHOUT CustomVoice. The single source
+# for the N>1 TTS runtime is now the fork integration branch pinned in
+# UPSTREAM_PIN (a361221 = suharvest/port/qwen3-tts-base-v080-n1n2), which is:
 #
 #     f9cc746  (NVIDIA release/0.8.0 HEAD)
+#   + 10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
+#   + ba9ecdb  backport Base speaker-encoder (external-embedding) path
+#   + 867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
+#   + 26a4a69  cuBLAS-free tiled FP16 GEMM fallback (talker MLP/linear, sm_87)
+#   + 50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
+#   + 873ca22  fp8 text_embedding (native kernel path)
+#   + a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
+#
+# Because the 6 fork-port commits are IN the pinned branch, the old
+# engine-overlay/patches/v080-port-0001..0006 are REDUNDANT and are NOT applied
+# (kept on disk for archival only). See PATCH-STATE-v080.md §4.
+#
+# APPLY CHAIN (Base) = exactly ONE patch on top of the pinned branch + addon/:
 #   + addon/   (new files: MOSS runtime+worker, w8a16 kernels, statefulCode2Wav,
 #               spikes, scripts — all additive; copied in step 2 above)
-#   + 0001-orin-tegra-build-compat   (Orin/Tegra CUDA-12.6 build-host compat)
-#   + v080-0007-customvoice-language-conditioning (Qwen3OmniTTSRuntime struct port)
-#   + v080-0008-tts-cutedsl-wrap     (CuTe-DSL --wrap shim, load-bearing toolchain)
+#   + 0001-orin-tegra-build-compat  (Orin/Tegra CUDA-12.6 build-host compat;
+#               static-lib PUBLIC/INTERFACE shim + --wrap=_cudaLaunchKernelEx
+#               propagation. NOT in the fork branch — verified git-apply CLEAN.)
 #
-# (HF MANIFEST v080-0017 §header: "edgellm base: f9cc746 + port patches
-#  v080-0007 / v080-0008". Workers: native/edgellm_voice_worker/*.cpp +
-#  addon/cpp/workers/moss_tts_nano_worker.cpp — compiled, NOT in this patch chain.)
-#
-# N>1 ASR (verified path, v080-0021/0022/0023): delivered NOT by any engine-source
-# patch but by (a) the vendored worker native/edgellm_voice_worker/qwen3_asr_worker.cpp
-# (lane-reservation pool + per-hop cumulative re-decode on the PROVEN vanilla
-# rt::LLMInferenceRuntime one-shot core — md5 ab09b992 → binary 5ebd436b) and
-# (b) the maxBatch=2 ASR llm engine (asr-b2, md5 4122dfcc — an EXPORT artifact, not a
-# patch) selected via the n2 profile. The worker calls runOneShotCore on the SAME
-# vanilla runtime this minimal chain produces — it needs NONE of the v080-0001..0006
-# engine patches (those are the DEFERRED incremental-KV spike track → C3 backlog;
-# 0003/0004/0005 also FAIL git-apply on f9cc746, see PATCH-STATE-v080.md §4/§9).
-#
-# The shipped TTS worker is the GENERIC qwen3_tts_worker on Qwen3OmniTTSRuntime;
-# ASR one-shot is stream_mode=accumulate, N>1+streaming is stream_mode=worker (n2
-# profile). The fork-port streaming-worker stack, the slot-pool, and all v080-NNNN
-# ASR-streaming / TTS-batch incremental-KV experiments are NOT part of the serving
-# build and are DROPPED here (see PATCH-STATE-v080.md §4).
+# DROPPED from the Base chain (see PATCH-STATE-v080.md §4):
+#   - v080-port-0001..0006  : redundant, now in the pinned branch.
+#   - v080-0007-customvoice-language-conditioning : CustomVoice 9-row langId.
+#       Conflicts with the Base 8-row speaker-encoder talker prefill — the two
+#       cannot live in one binary. Moved to the CUSTOMVOICE VARIANT (not built
+#       here). See PATCH-STATE-v080.md §10 "CustomVoice variant".
+#   - v080-0008-tts-cutedsl-wrap : built on top of v080-0007's shim block, FAILS
+#       git-apply on the Base branch (examples/omni/CMakeLists.txt context drift).
+#       Superseded for Base by the fork's 867b74d cutedsl shim + the
+#       --wrap=_cudaLaunchKernelEx already in cmake/CuteDsl.cmake (CUDA<12.8) and
+#       hardened by 0001. Belongs to the CustomVoice variant.
+#   - v080-NNNN ASR-streaming / TTS-batch incremental-KV experiments : DEFERRED
+#       (C3 backlog). N>1 ASR is delivered by the vendored worker
+#       native/edgellm_voice_worker/qwen3_asr_worker.cpp on the vanilla one-shot
+#       core + the asr-b2 engine (export artifact), selected via the n2 profile —
+#       it needs NONE of these engine patches.
 echo "==> applying patches"
 apply_one() {
   local p="$1"
@@ -96,20 +107,20 @@ apply_one() {
   git -C "${WORKDIR}" apply --check "${p}"
   git -C "${WORKDIR}" apply "${p}"
 }
-# Authoritative serving chain — explicit ordered allow-list (NOT a glob).
-# Verified: full chain git-apply --check CLEAN on f9cc746 + addon/ (C2b).
+# Base N>1 serving chain — explicit ordered allow-list (NOT a glob).
+# Verified: full chain git-apply --check CLEAN on a361221 + addon/ (C2-repin).
 for n in \
     0001-orin-tegra-build-compat \
-    v080-0007-customvoice-language-conditioning \
-    v080-0008-tts-cutedsl-wrap \
 ; do
   apply_one "${HERE}/patches/${n}.patch"
 done
 echo "==> patched source tree ready at ${WORKDIR}"
-echo "    Authoritative serving chain applied (0001 + v080-0007 + v080-0008)."
-echo "    MOSS delivered via addon/. Fork-port stack, legacy 0002-0008, and"
-echo "    v080-NNNN streaming/batch experiments are intentionally NOT applied —"
-echo "    they were not in the serve-gated build. See patches/PATCH-STATE-v080.md."
+echo "    Base N>1 chain applied (pinned branch a361221 + 0001)."
+echo "    Streaming worker + slot-pool + shared-engine ctor + Base speaker-encoder"
+echo "    come from the pinned branch. MOSS delivered via addon/. v080-port-0001..0006"
+echo "    are redundant (in branch), v080-0007/0008 are CustomVoice-variant only, and"
+echo "    v080-NNNN streaming/batch experiments are intentionally NOT applied."
+echo "    See patches/PATCH-STATE-v080.md (§4 Base chain, §10 CustomVoice variant)."
 
 if [ "${APPLY_ONLY}" -eq 1 ]; then
   echo "==> --apply-only: stopping before compile (no CUDA/TRT needed)."
@@ -142,19 +153,27 @@ cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
       -DCUDA_CTK_VERSION="${CUDA_CTK}" \
       -DTRT_PACKAGE_DIR="${TRT_PKG}" \
       -DCMAKE_BUILD_TYPE=Release
-echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so)"
+echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so + Base TTS N>1 streaming worker)"
 cmake --build "${WORKDIR}/build" -j"$(nproc)"
+# Explicitly ensure the Base N>1 streaming worker target is built. It lives in
+# examples/omni/ (add_subdirectory(examples)->omni) and carries the slot-pool +
+# shared-engine ctor (a361221) + Base speaker-encoder (external embedding) path.
+# Output: ${WORKDIR}/build/examples/omni/qwen3_tts_streaming_worker
+echo "==> ensure Base TTS N>1 streaming worker (qwen3_tts_streaming_worker)"
+cmake --build "${WORKDIR}/build" -j"$(nproc)" --target qwen3_tts_streaming_worker
 
-# --- 4b. voice workers (N>1 ASR + generic TTS) — VERIFIED reproducible path -----
-# native/edgellm_voice_worker/ is a SEPARATE CMake project that links the
-# qwen3_asr_worker (N>1 lane-pool + streaming PARTIALs, v080-0023, binary md5
-# 5ebd436b) and qwen3_tts_worker against the libedgellmCore.a just built above.
-# This is the formalization of the previously hand-built worker (v080-0021 "Box
-# build dir ~/project/v080-worker-build"): now reproducible from THIS overlay.
+# --- 4b. ASR voice worker (N>1) — VERIFIED reproducible path -----------------
+# Base TTS N>1 is the streaming worker built in step 4 above (examples/omni/
+# qwen3_tts_streaming_worker — slot-pool + shared-engine ctor). This step builds
+# the ASR side only: native/edgellm_voice_worker/ is a SEPARATE CMake project
+# that links qwen3_asr_worker (N>1 lane-pool + streaming PARTIALs, v080-0023,
+# binary md5 5ebd436b) against the libedgellmCore.a just built above. It is the
+# formalization of the previously hand-built worker (v080-0021 "Box build dir
+# ~/project/v080-worker-build"): now reproducible from THIS overlay.
 # Source of truth = ${HERE}/../native/edgellm_voice_worker (vendored at feat HEAD).
 VOICE_WORKER_SRC="${VOICE_WORKER_SRC:-${HERE}/../native/edgellm_voice_worker}"
 if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
-  echo "==> building voice workers (qwen3_asr_worker N>1 + qwen3_tts_worker)"
+  echo "==> building ASR voice worker (qwen3_asr_worker N>1)"
   echo "    src=${VOICE_WORKER_SRC}  EDGE_LLM_BASE=${WORKDIR}  EDGE_LLM_BUILD=${WORKDIR}/build"
   cmake -S "${VOICE_WORKER_SRC}" -B "${WORKDIR}/build/voice-workers" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -162,9 +181,9 @@ if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
         -DEDGE_LLM_SOURCE_DIR="${WORKDIR}" \
         -DEDGE_LLM_BUILD_DIR="${WORKDIR}/build"
   cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
-        --target qwen3_asr_worker qwen3_tts_worker
+        --target qwen3_asr_worker
 else
-  echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR/TTS workers NOT built." >&2
+  echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR worker NOT built." >&2
 fi
 
 # --- 4c. MOSS worker (own helper) --------------------------------------------
@@ -174,9 +193,12 @@ if [ -x "${WORKDIR}/cpp/workers/build_moss_worker.sh" ]; then
 fi
 echo "==> build done. Artifacts:"
 echo "      ${WORKDIR}/build/                       libNvInfer_edgellm_plugin.so*"
-echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1, 5ebd436b) qwen3_tts_worker"
+echo "      ${WORKDIR}/build/examples/omni/         qwen3_tts_streaming_worker (Base N>1, slot-pool + shared-engine ctor)"
+echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1, 5ebd436b)"
 echo "    Collect worker binaries + plugin .so + .engine, write md5 sidecars,"
 echo "    and reconcile against ${MANIFEST}. Engine build uses build_engine_bundle.py."
+echo "    TTS engines (Base): talker + code-predictor + speaker-encoder (external"
+echo "    embedding) — NOT the CustomVoice int4 engine (that is the CV variant)."
 echo "    N=2 runtime: select profile jetson-edgellm-v080-n2 (stream_mode=worker,"
 echo "    asr-b2 engine 4122dfcc, session-gate triplet LAZY_TTS=1 +"
 echo "    OVS_TTS_WORKER_CONCURRENCY=2 + OVS_MAX_CONCURRENT_SESSIONS=2)."
