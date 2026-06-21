@@ -29,7 +29,7 @@ diff --git a/examples/omni/CMakeLists.txt b/examples/omni/CMakeLists.txt
 index fd2086d..8539a62 100644
 --- a/examples/omni/CMakeLists.txt
 +++ b/examples/omni/CMakeLists.txt
-@@ -17,6 +17,19 @@ add_cross_build_link_options(qwen3_tts_inference)
+@@ -17,6 +17,20 @@ add_cross_build_link_options(qwen3_tts_inference)
  if(TARGET trt_edgellm_cutedsl_cudart_shim)
    target_link_libraries(qwen3_tts_inference PRIVATE
      "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
@@ -48,5 +48,5 @@ index fd2086d..8539a62 100644
 +      "-Wl,--wrap=_cudaLaunchKernelEx")
 +  endif()
  endif()
-
+ 
  # Set output directory
