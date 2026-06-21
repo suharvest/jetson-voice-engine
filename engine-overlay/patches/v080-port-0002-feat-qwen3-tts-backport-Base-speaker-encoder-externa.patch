@@ -1,0 +1,303 @@
+From ba9ecdb51596ef0934bd51acfa09fcb6c09e190e Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 20 Jun 2026 02:30:56 +0800
+Subject: [PATCH 2/6] feat(qwen3-tts): backport Base speaker-encoder
+ (external-embedding) path onto v0.8.0
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Base 0.6B conditions on an external speaker embedding (speaker_encoder /
+reference audio), which v0.8.0 stripped in favor of CustomVoice named-speaker
+tokens. Re-add the embedding path (passthrough milestone: embedding precomputed
+offline and supplied as base64 LE float32; on-device speaker_encoder inference
+is a follow-up):
+
+- export.py: drop the CustomVoice-only export guard (warn instead) so Base
+  Talker/CodePredictor/Code2Wav export via the checkpoint-agnostic pipeline.
+  (speaker_encoder ONNX stage NOT grafted — v0.8 deleted audio_models/; deferred.)
+- TalkerGenerationRequest: add std::vector<float> speakerEmbedding.
+- talkerMLPKernels: assistantPreambleKernel row-6 uses external embedding when
+  present (srcA=embedding, no ttsPad add), else CustomVoice embTable[speakerId].
+  invokeAssistantPreamble gains trailing speakerEmbeddingPtr/hasSpeakerEmbedding
+  (defaulted in header so the batched Thinker->Talker caller is unaffected).
+- runtime: mSpeakerEmbeddingBuffer (fp16); projectToTalkerInput converts the
+  float embedding -> half, uploads, and routes it to the preamble kernel.
+- worker: base64Decode + base64ToFloatVec; parse speaker_embedding_b64 -> request.
+
+Empty embedding = unchanged CustomVoice token path (backward compatible).
+
+diff --git a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
+index 60056ae..033c22f 100644
+--- a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
++++ b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
+@@ -454,7 +454,8 @@ template <int32_t VEC_SIZE = 8>
+ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half const* __restrict__ ttsPadEmbed,
+     half const* __restrict__ ttsBosEmbed, half const* __restrict__ ttsEosEmbed, half const* __restrict__ embTable,
+     int32_t codecNothinkId, int32_t codecThinkBosId, int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId,
+-    int32_t codecBosId, int32_t textLen, int32_t hiddenDim, half* __restrict__ output)
++    int32_t codecBosId, int32_t textLen, half const* __restrict__ speakerEmbedding, bool hasSpeakerEmbedding,
++    int32_t hiddenDim, half* __restrict__ output)
+ {
+     constexpr int32_t kFixedPrefixLen = 8; // rows 0-7
+     int32_t const rowIdx = blockIdx.x;
+@@ -486,8 +487,17 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
+             srcB = embTable + static_cast<int64_t>(codecThinkEosId) * hiddenDim;
+             break;
+         case 6:
+-            srcA = ttsPadEmbed;
+-            srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
++            // BASE PORT: external speaker embedding occupies row 6 directly (the row IS the
++            // embedding vector, no ttsPad add). Else CustomVoice path: ttsPad + embTable[speakerId].
++            if (hasSpeakerEmbedding)
++            {
++                srcA = speakerEmbedding;
++            }
++            else
++            {
++                srcA = ttsPadEmbed;
++                srcB = embTable + static_cast<int64_t>(speakerId) * hiddenDim;
++            }
+             break;
+         default: // rowIdx == 7
+             srcA = ttsBosEmbed;
+@@ -541,7 +551,7 @@ __global__ void assistantPreambleKernel(half const* __restrict__ projected, half
+ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
+     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
+     int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
+-    rt::Tensor& output, cudaStream_t stream)
++    rt::Tensor& output, cudaStream_t stream, half const* speakerEmbeddingPtr, bool hasSpeakerEmbedding)
+ {
+     constexpr int32_t kVecSize = 8;
+ 
+@@ -562,8 +572,8 @@ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsP
+     half* outPtr = static_cast<half*>(output.rawPointer());
+ 
+     assistantPreambleKernel<kVecSize><<<grid, block, 0, stream>>>(projPtr, padPtr, bosPtr, eosPtr, embPtr,
+-        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen, hiddenDim,
+-        outPtr);
++        codecNothinkId, codecThinkBosId, codecThinkEosId, speakerId, codecPadId, codecBosId, textLen,
++        speakerEmbeddingPtr, hasSpeakerEmbedding, hiddenDim, outPtr);
+     CUDA_CHECK(cudaPeekAtLastError());
+ }
+ 
+diff --git a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.h b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.h
+index 08b6cdf..2a33301 100644
+--- a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.h
++++ b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.h
+@@ -119,7 +119,8 @@ void invokeScatter(rt::Tensor const& source, rt::Tensor const& indices, rt::Tens
+ void invokeAssistantPreamble(rt::Tensor const& projected, rt::Tensor const& ttsPadEmbed, rt::Tensor const& ttsBosEmbed,
+     rt::Tensor const& ttsEosEmbed, rt::Tensor const& talkerEmbTable, int32_t codecNothinkId, int32_t codecThinkBosId,
+     int32_t codecThinkEosId, int32_t speakerId, int32_t codecPadId, int32_t codecBosId, int32_t textLen,
+-    rt::Tensor& output, cudaStream_t stream);
++    rt::Tensor& output, cudaStream_t stream, half const* speakerEmbeddingPtr = nullptr,
++    bool hasSpeakerEmbedding = false);
+ 
+ //! \brief Fused residual connection for TTS decode input
+ //!
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 5a72781..044c0a0 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -734,6 +734,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
+ 
+     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+     mTtsPadEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
++    // BASE PORT: device buffer for the optional external speaker embedding (row-6 conditioning).
++    mSpeakerEmbeddingBuffer = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+     mTtsBosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+     mTtsEosEmbed = rt::Tensor({hiddenSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+ 
+@@ -751,7 +753,8 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
+ }
+ 
+ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
+-    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream)
++    rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output, int64_t& outputSeqLen, cudaStream_t stream,
++    std::vector<float> const& speakerEmbedding)
+ {
+     int64_t const seqLen = thinkerEmbed.getShape()[0];
+     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+@@ -770,11 +773,32 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
+     kernel::invokeTalkerMLP(thinkerEmbed, mTextFC1Weight, mTextFC1Bias, mTextFC2Weight, mTextFC2Bias, mProjectedBuffer,
+         mMLPWorkspace, stream);
+ 
++    // BASE PORT: when an external speaker embedding is supplied (Base / speaker_encoder path),
++    // convert it to FP16 + upload; the preamble kernel uses it for row-6 instead of a speaker token.
++    bool const hasSpeakerEmbedding = !speakerEmbedding.empty();
++    if (hasSpeakerEmbedding)
++    {
++        if (static_cast<int64_t>(speakerEmbedding.size()) != hiddenSize)
++        {
++            LOG_ERROR("projectToTalkerInput: speaker embedding size %zu != hidden size %ld",
++                speakerEmbedding.size(), hiddenSize);
++            return false;
++        }
++        std::vector<__half> speakerHalf(speakerEmbedding.size());
++        for (size_t i = 0; i < speakerEmbedding.size(); ++i)
++        {
++            speakerHalf[i] = __float2half(speakerEmbedding[i]);
++        }
++        CUDA_CHECK(cudaMemcpyAsync(mSpeakerEmbeddingBuffer.rawPointer(), speakerHalf.data(),
++            speakerHalf.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
++    }
++
+     // Fused kernel: build complete non-streaming prefill buffer
+     check::check(output.reshape({outputSeqLen, hiddenSize}), "Tensor reshape failed");
+     kernel::invokeAssistantPreamble(mProjectedBuffer, mTtsPadEmbed, mTtsBosEmbed, mTtsEosEmbed, mTalkerEmbeddingTable,
+         mTalkerConfig.codecNothinkId, mTalkerConfig.codecThinkBosId, mTalkerConfig.codecThinkEosId, speakerId,
+-        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream);
++        mTalkerConfig.codecPadId, mTalkerConfig.codecBosId, static_cast<int32_t>(N), output, stream,
++        hasSpeakerEmbedding ? mSpeakerEmbeddingBuffer.dataPointer<__half>() : nullptr, hasSpeakerEmbedding);
+ 
+     return true;
+ }
+@@ -1032,7 +1056,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
+ 
+     // MLP projection: thinker embed → talker input embeds (non-streaming, outputSeqLen = seqLen + 2)
+     int64_t const hiddenSize = mTalkerConfig.talkerHiddenSize;
+-    if (!projectToTalkerInput(mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream))
++    if (!projectToTalkerInput(
++            mThinkerEmbedBuffer, speakerId, mTalkerInputEmbeds, outSeqLen, stream, request.speakerEmbedding))
+     {
+         LOG_ERROR("MLP projection failed");
+         return false;
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index 9e57db4..2b11ac2 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -126,6 +126,10 @@ public:
+         // Speaker selection (optional, defaults to config default)
+         std::string speakerName{""}; //!< Speaker name (e.g., "f245", "m02") - empty means use default
+         int32_t speakerId{-1};       //!< Speaker ID - if >= 0, overrides speakerName
++        //! BASE PORT: optional external speaker embedding [talkerHiddenSize] (from speaker_encoder /
++        //! reference audio). When non-empty, row-6 of the assistant preamble uses this vector directly
++        //! instead of the CustomVoice speakerId embedding-table lookup. Empty = CustomVoice token path.
++        std::vector<float> speakerEmbedding;
+ 
+         // Input: conversation messages for this request (runtime tokenizes internally)
+         std::vector<Message> messages;
+@@ -581,6 +585,7 @@ private:
+     // TTS special token embeddings (initialized from thinker embedding table)
+     // Initialized in constructor from Thinker embedding table
+     rt::Tensor mTtsPadEmbed; //!< TTS pad embedding [talkerHiddenSize] FP16
++    rt::Tensor mSpeakerEmbeddingBuffer; //!< BASE PORT: external speaker embedding [talkerHiddenSize] FP16 (row-6 conditioning)
+     rt::Tensor mTtsBosEmbed; //!< TTS bos embedding [talkerHiddenSize] FP16
+     rt::Tensor mTtsEosEmbed; //!< TTS eos embedding [talkerHiddenSize] FP16
+ 
+@@ -649,7 +654,8 @@ private:
+      * @return True on success, false on failure
+      */
+     bool projectToTalkerInput(rt::Tensor const& thinkerEmbed, int32_t speakerId, rt::Tensor& output,
+-        int64_t& outputSeqLen, cudaStream_t stream);
++        int64_t& outputSeqLen, cudaStream_t stream,
++        std::vector<float> const& speakerEmbedding = {});
+ 
+     //! Embed token IDs, run MLP projection, and reshape buffers ready for Talker prefill.
+     //! Populates mTalkerInputEmbeds and mTalkerHiddenStatesBuffer as side effects.
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index 0cadabb..f6f7ed8 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -174,6 +174,55 @@ bool parseArgs(Args& args, int argc, char** argv)
+ 
+ // ===== base64 + PCM helpers =====
+ 
++// BASE PORT: decode base64 → raw bytes (used for the precomputed speaker embedding).
++std::vector<uint8_t> base64Decode(std::string const& in)
++{
++    auto val = [](char c) -> int {
++        if (c >= 'A' && c <= 'Z') return c - 'A';
++        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
++        if (c >= '0' && c <= '9') return c - '0' + 52;
++        if (c == '+') return 62;
++        if (c == '/') return 63;
++        return -1; // '=' padding or whitespace
++    };
++    std::vector<uint8_t> out;
++    out.reserve((in.size() / 4) * 3);
++    int buf = 0, bits = 0;
++    for (char const c : in)
++    {
++        int const d = val(c);
++        if (d < 0) continue;
++        buf = (buf << 6) | d;
++        bits += 6;
++        if (bits >= 8)
++        {
++            bits -= 8;
++            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xFF));
++        }
++    }
++    return out;
++}
++
++// BASE PORT: decode a base64 little-endian float32 array → float vector (speaker embedding).
++std::vector<float> base64ToFloatVec(std::string const& b64)
++{
++    std::vector<uint8_t> const bytes = base64Decode(b64);
++    size_t const n = bytes.size() / sizeof(float);
++    std::vector<float> out(n);
++    for (size_t i = 0; i < n; ++i)
++    {
++        union
++        {
++            uint32_t u;
++            float f;
++        } conv;
++        conv.u = static_cast<uint32_t>(bytes[i * 4]) | (static_cast<uint32_t>(bytes[i * 4 + 1]) << 8)
++            | (static_cast<uint32_t>(bytes[i * 4 + 2]) << 16) | (static_cast<uint32_t>(bytes[i * 4 + 3]) << 24);
++        out[i] = conv.f;
++    }
++    return out;
++}
++
+ std::string base64Encode(uint8_t const* data, size_t len)
+ {
+     static constexpr char kTable[]
+@@ -298,6 +347,16 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+     // on the v0.8.0 base TalkerGenerationRequest — intentionally dropped. Base uses a fixed speaker.
+     req.speakerName = item.value("speaker", "");
+     req.speakerId = item.value("speaker_id", -1);
++    // BASE PORT: optional precomputed external speaker embedding (base64 LE float32 array). When present,
++    // the runtime uses it as the row-6 conditioning vector instead of a CustomVoice speaker token.
++    // (Embedding-PASSTHROUGH milestone: precomputed offline; on-device speaker_encoder inference is a follow-up.)
++    {
++        std::string const spkB64 = item.value("speaker_embedding_b64", "");
++        if (!spkB64.empty())
++        {
++            req.speakerEmbedding = base64ToFloatVec(spkB64);
++        }
++    }
+ 
+     Message msg;
+     // Qwen3-TTS talker prefill expects the assistant role prefix
+diff --git a/tensorrt_edgellm/scripts/export.py b/tensorrt_edgellm/scripts/export.py
+index 9eb3487..67fbc4e 100644
+--- a/tensorrt_edgellm/scripts/export.py
++++ b/tensorrt_edgellm/scripts/export.py
+@@ -1665,10 +1665,19 @@ def main() -> None:
+     has_mtp_draft = _has_mtp(config)
+     externalize_weights = resolve_externalize_weights(args.externalize_weights)
+ 
++    # BASE PORT: upstream v0.8.0 rejected non-CustomVoice Qwen3-TTS here. We extend
++    # support to the Base checkpoint, which conditions on an external speaker
++    # embedding (speaker_encoder / reference audio) instead of named-speaker tokens.
++    # Talker/CodePredictor/Code2Wav export via the LLM+code2wav pipeline is
++    # checkpoint-agnostic; the speaker_encoder ONNX is produced separately (the v0.8
++    # audio-export infra for it was removed upstream — see docs/specs port note).
+     if (model_type == "qwen3_tts"
+             and config.get("tts_model_type") != "custom_voice"):
+-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
+-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
++        logger.warning(
++            "Qwen3-TTS non-CustomVoice checkpoint (tts_model_type=%r): exporting "
++            "Talker/CodePredictor/Code2Wav for the BASE path. Speaker conditioning "
++            "uses an external embedding supplied at runtime.",
++            config.get("tts_model_type"))
+ 
+     if args.eagle_base and args.mtp:
+         p.error("--eagle-base and --mtp cannot be enabled together")
+-- 
+2.50.1 (Apple Git-155)
+
