@@ -30,7 +30,7 @@ FROM ${BASE_IMAGE}
 
 # ── v0.8.0 serving worker binaries + plugin (baked; engines pulled at runtime) ──
 # md5 (== HF MANIFEST sm87-trt10.3-jp6.2/v0.8.0/):
-#   qwen3_asr_worker            f9bb821dec9f32e53697c7930254b4f3  (v080-0022: #9 N>1 + #10 streaming PARTIALs)
+#   qwen3_asr_worker            5ebd436bb2f322304f97540afea4e893  (v080-0023: #9 N>1 + #10 streaming PARTIALs + pcm_b64→mel fix; src ab09b992 = feat c6bf483)
 #   qwen3_tts_worker            22216e8dc724bd8619d4fca26b0c2d5b
 #   moss_tts_nano_worker        6a03bdf5c7a26b09f60597b95008ebfe
 #   libNvInfer_edgellm_plugin.so 8f004bb4c9ddcce30ae4eecf2f410624
@@ -123,7 +123,7 @@ ENV EDGELLM_V080_ROOT=/opt/edgellm-v080 \
 # regardless of profile resolution order:
 #   * STREAM_MODE=worker → create_stream() routes to _TRTEdgeLLMStreamingASRStream
 #     (begin/chunk/end → {event:partial} → service {type:partial,is_final:false}).
-#     The NEW worker (f9bb821d, #10) implements begin/chunk/end; the old worker
+#     The NEW worker (5ebd436b, #10 + v080-0023 pcm fix) implements begin/chunk/end; the old worker
 #     returned 501 here (hence accumulate in the non-n2 profile).
 #   * MAX_CONCURRENT=2 → backend emits `--max_slots 2` (only when N>1, b1cb1a5)
 #     + WorkerIO Semaphore(2); 3rd concurrent begin → PoolSaturatedError → 4429.
@@ -134,6 +134,27 @@ ENV EDGE_LLM_ASR_STREAM_MODE=worker \
     EDGE_LLM_ASR_MAX_CONCURRENT=2 \
     EDGE_LLM_ASR_MEL_SETTINGS=/opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/whisper_feature_extractor.json \
     EDGE_LLM_ASR_MEL_FILTERS=/opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/mel_filters.bin
+
+# ── v080-0023 session-gate triplet (REQUIRED for N=2 ADMISSION) ───────────────
+# SessionLimiter effective_limit = min(asr.max_concurrent=2, tts.max_concurrent).
+# The generic-runner TTS worker is concurrency=1 by design and ABORTS on
+# --max_slots, so lifting OVS_TTS_WORKER_CONCURRENCY=2 ALONE crashes TTS. The
+# verified (v080-0023 §Session-gate change) fix lifts the gate WITHOUT touching the
+# TTS worker:
+#   * LAZY_TTS=1                    → skip TTS preload; worker never spawned with
+#                                     --max_slots (so it never aborts); TTS loads
+#                                     lazily on first synth.
+#   * OVS_TTS_WORKER_CONCURRENCY=2  → raise the aggregate ceiling to 2.
+#   * OVS_MAX_CONCURRENT_SESSIONS=2 → raise the global session cap to 2.
+# → effective_limit=2 → 2 concurrent /asr/stream admitted; 3rd → 4429. Without this
+# triplet the gate clamps ASR admission to 1 even with the N>1 worker+engine wired.
+# Operator-owned (no EDGE_LLM_/QWEN3_ prefix, but set here as image ENV so they win
+# at runtime and N=2 is OPEN OUT OF THE BOX).
+ENV LAZY_TTS=1 \
+    OVS_TTS_WORKER_CONCURRENCY=2 \
+    OVS_MAX_CONCURRENT_SESSIONS=2 \
+    OVS_ASR_STREAM_PREFIX=1 \
+    OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT=1
 
 ENV OVS_AUTO_DOWNLOAD_ARTIFACTS=0
 

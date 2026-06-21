@@ -1,6 +1,6 @@
 {
   "name": "jetson-edgellm-v080-n2",
-  "description": "v0.8.0 edgellm stack, N>1 + STREAMING variant (v080-0022). Same as jetson-edgellm-v080 but: (1) EDGE_LLM_ASR_STREAM_MODE=worker → create_stream() routes to _TRTEdgeLLMStreamingASRStream which speaks begin/chunk/end to the NEW qwen3_asr_worker (md5 f9bb821d, #9 N>1 + #10 streaming PARTIALs); each cumulative chunk yields a {event:partial} surfaced by the service as {type:partial,is_final:false}. (2) asr_max_slots=2 + EDGE_LLM_ASR_MAX_CONCURRENT=2 → backend emits --max_slots 2, WorkerIO Semaphore(2); 3rd concurrent begin → PoolSaturatedError → 4429. Requires the maxBatch=2 llm engine (EDGE_LLM_ASR_ENGINE_DIR→engines/asr-b2/llm) and the [1,30] minchunk1 audio encoder (min_time_steps=100, already on HF). mel_settings/mel_filters PCM assets at /opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/ satisfy the streaming-worker asset gate. TTS path unchanged (generic-runner, concurrency 1).",
+  "description": "v0.8.0 edgellm stack, N>1 + STREAMING variant (v080-0023, real-machine PASS on orin-nx). N=2 OPEN OUT OF THE BOX. (1) EDGE_LLM_ASR_STREAM_MODE=worker → create_stream() routes to _TRTEdgeLLMStreamingASRStream which speaks begin/chunk/end to the PCM-FIXED qwen3_asr_worker (binary md5 5ebd436b, source ab09b992 = feat c6bf483; #9 N>1 lane pool + #10 streaming PARTIALs + v080-0023 pcm_b64→mel front-end); each cumulative chunk yields a {event:partial} surfaced as {type:partial,is_final:false}. (2) asr_max_slots=2 + EDGE_LLM_ASR_MAX_CONCURRENT=2 → backend emits --max_slots 2, WorkerIO Semaphore(2); 3rd concurrent begin → PoolSaturatedError → 4429. Requires the maxBatch=2 llm engine (EDGE_LLM_ASR_ENGINE_DIR→engines/asr-b2/llm, md5 4122dfcc) and the [1,30] minchunk1 audio encoder (min_time_steps=100). mel_settings/mel_filters PCM assets at /opt/qwen3-edgellm-jetson/deploy/audio_preprocessing/ satisfy the streaming-worker asset gate. (3) SESSION-GATE TRIPLET (v080-0023 §Session-gate change — REQUIRED for N=2 admission): SessionLimiter effective_limit=min(asr,tts); the generic-runner TTS worker is concurrency=1 and CRASHES on --max_slots, so lifting OVS_TTS_WORKER_CONCURRENCY=2 alone aborts TTS. Resolved WITHOUT touching the TTS worker: LAZY_TTS=1 (skips TTS preload so the worker is never spawned with --max_slots) + OVS_TTS_WORKER_CONCURRENCY=2 (lifts aggregate ceiling) + OVS_MAX_CONCURRENT_SESSIONS=2 → effective_limit=2, ASR-only N=2 gate, no TTS crash. (4) OVS_ASR_STREAM_PREFIX=1 → cheap flat-decode rollback partials (computePrefix unfixedTokenNum=5/unfixedChunkNum=2; v080-0026 WORKS). NOTE: with LAZY_TTS=1, TTS is preloaded lazily on first synth — this profile is ASR-N=2-first; for production a future ASR-endpoint-specific gate replaces the triplet.",
   "asr_backend": "jetson.trt_edge_llm",
   "tts_backend": "jetson.trt_edge_llm",
   "execution_policy": {
@@ -17,7 +17,9 @@
     "EDGE_LLM_QWEN3_PROFILE": "highperf",
     "EDGE_LLM_ASR_WORKER": "1",
     "EDGE_LLM_TTS_WORKER": "1",
-    "OVS_TTS_WORKER_CONCURRENCY": "1",
+    "OVS_TTS_WORKER_CONCURRENCY": "2",
+    "LAZY_TTS": "1",
+    "OVS_MAX_CONCURRENT_SESSIONS": "2",
     "EDGE_LLM_TTS_BACKEND": "edgellm_worker",
     "EDGE_LLM_ASR_VOCAB_PRUNED": "0",
     "EDGE_LLM_TTS_VOCAB_PRUNED": "0",
@@ -48,7 +50,10 @@
     "EDGE_LLM_ASR_STREAM_UNFIXED_TOKENS": "5",
     "EDGE_LLM_ASR_MEL_SETTINGS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/whisper_feature_extractor.json",
     "EDGE_LLM_ASR_MEL_FILTERS": "${QWEN3_EDGELLM_JETSON_ROOT}/deploy/audio_preprocessing/mel_filters.bin",
-    "EDGE_LLM_ASR_MAX_CONCURRENT": "2"
+    "EDGE_LLM_ASR_MAX_CONCURRENT": "2",
+    "EDGE_LLM_ASR_ENGINE_DIR": "${EDGELLM_V080_ROOT}/engines/asr-b2/llm",
+    "OVS_ASR_STREAM_PREFIX": "1",
+    "OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT": "1"
   },
   "tts_model_id": "qwen3-tts",
   "asr_max_slots": 2
