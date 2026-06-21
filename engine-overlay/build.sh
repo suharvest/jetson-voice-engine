@@ -57,13 +57,43 @@ echo "==> copying addon/ (new files)"
   done )
 
 # --- 3. apply patches in order -----------------------------------------------
+# Apply ORDER (v0.8.0 re-pin, C2a):
+#   1. legacy 000N theme patches that still clean-apply on v0.8.0 base: 0001, 0008
+#      (0002/0003/0004/0005/0006/0007 are SUPERSEDED on v0.8.0 — see
+#       patches/PATCH-STATE-v080.md; they are NOT applied here)
+#   2. fork-port TTS-runtime stack v080-port-000N (canonical source =
+#      fork port/qwen3-tts-base-v080; streaming worker, Base speaker-encoder,
+#      cutedsl shim, cuBLAS-free GEMM, M=1 GEMV, fp8 text_embedding)
+#   3. v080-NNNN ASR-streaming / MOSS / CustomVoice / TTS-batch feat patches
+#      *** PENDING REBASE — several do NOT clean-apply from base yet ***
+#      (double-source vs addon/, corrupt v080-0008, non-applicable
+#       v080-0024..0027 worker-diff snapshots). See PATCH-STATE-v080.md.
 echo "==> applying patches"
-for p in "${HERE}"/patches/[0-9][0-9][0-9][0-9]-*.patch; do
+apply_one() {
+  local p="$1"
   echo "    - $(basename "${p}")"
   git -C "${WORKDIR}" apply --check "${p}"
   git -C "${WORKDIR}" apply "${p}"
+}
+# 1) legacy clean-on-v080 theme patches (explicit allow-list, NOT a glob)
+for n in 0001-orin-tegra-build-compat; do
+  apply_one "${HERE}/patches/${n}.patch"
 done
+# 2) fork-port TTS-runtime stack (canonical) — verified clean-applies as a stack
+for p in "${HERE}"/patches/v080-port-[0-9][0-9][0-9][0-9]-*.patch; do
+  apply_one "${p}"
+done
+# 3) legacy 0008 example-registration:
+#    omni-CMakeLists hunk now DUPLICATES the fork-port streaming-worker target
+#    registration (v080-port-0001) -> conflicts. Pending hunk-split (drop omni
+#    hunk, keep .gitignore + examples/llm/CMakeLists.txt). NOT applied until
+#    rebased. See PATCH-STATE-v080.md.
+# for n in 0008-build-misc-example-registration; do apply_one "${HERE}/patches/${n}.patch"; done
+# 4) v080-NNNN ASR/MOSS/CV/TTS-batch feat patches — PENDING REBASE, NOT applied:
+# for p in "${HERE}"/patches/v080-[0-9][0-9][0-9][0-9]-*.patch; do apply_one "${p}"; done
 echo "==> patched source tree ready at ${WORKDIR}"
+echo "    NOTE: legacy 0008 + v080-NNNN feat patches are PENDING REBASE (C2a)."
+echo "          See patches/PATCH-STATE-v080.md before the next build."
 
 if [ "${APPLY_ONLY}" -eq 1 ]; then
   echo "==> --apply-only: stopping before compile (no CUDA/TRT needed)."
