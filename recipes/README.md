@@ -40,8 +40,8 @@ Every recipe states:
 | [int4-tts-export.md](int4-tts-export.md) | int4-AWQ Talker + CodePredictor ONNX; fp8 `text_embedding` | fork `wip/native-int4-talker` `ff2318e`, `wip/fp8-embedding` `873ca22` | host w/ CUDA GPU (export); engine on SM 87 Jetson |
 | [asr-int4-export.md](asr-int4-export.md) | int4-AWQ ASR decoder checkpoint/ONNX | fork `wip/asr-int4-decoder` `c80bcc0` | host w/ CUDA GPU |
 | [asr-b2-engine.md](asr-b2-engine.md) | Qwen3-ASR thinker engine, `maxBatchSize=2` (N>1 ASR) | (engine build, no fork driver) | orin-nx (SM 87) |
-| [talker-b2-engine.md](talker-b2-engine.md) | Qwen3-TTS Talker engine, `maxBatchSize=2` (N>1 TTS slot-pool) | (engine build, no fork driver) | orin-nx (SM 87) |
-| [slot-pool-worker.md](slot-pool-worker.md) | `qwen3_tts_streaming_worker` + `qwen3_asr_worker` (N>1) binaries | overlay `UPSTREAM_PIN` `a361221` | SM 87 Jetson |
+| [talker-b2-engine.md](talker-b2-engine.md) | Qwen3-TTS Talker engine, `maxBatchSize=2` (N>1 TTS **batch-lane** — DEFERRED alt, `v080-0010`; NOT the production slot-pool path) | (engine build, no fork driver) | orin-nx (SM 87) |
+| [slot-pool-worker.md](slot-pool-worker.md) | `qwen3_tts_streaming_worker` + `qwen3_asr_worker` (N>1) binaries — **production N>1 path** (slot-pool + shared-engine ctor) | overlay `UPSTREAM_PIN` `a361221` | SM 87 Jetson |
 
 See also: [`../docs/asr-thinker-engine-build-recipe.md`](../docs/asr-thinker-engine-build-recipe.md)
 (canonical maxBatch=1 ASR thinker + `--fp8_embedding`), and
