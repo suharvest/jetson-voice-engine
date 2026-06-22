@@ -351,6 +351,14 @@ the apply chain and matched the v080-0016 build set.
 
 ## 10. CustomVoice variant — DEFINED, NOT BUILT HERE (future first-class variant)
 
+> **⚠️ SUPERSEDED 2026-06-22 by §12.** This section described a *separate-binary*
+> CV variant (own apply chain `0001` + `v080-0007` + `v080-0008`, a CV-only binary
+> that could not coexist with Base). That plan is **obsolete.** CustomVoice is now
+> folded INTO the pinned branch (`c48c0de`) as a **runtime-if on `langId`** — ONE
+> binary handles BOTH Base (langId<0, 8-row) and CV (langId>=0, 9-row). The old CV
+> patches (`v080-0007` / `0005` / `v080-0008`) are archival-only and NOT applied.
+> Read §12 for the current state; the text below is retained for history only.
+
 Per the 2026-06-21 decision, **CustomVoice is an independent first-class build
 variant**, parallel to the Base N>1 variant this overlay builds. It is **NOT built
 in this overlay / build.sh run.** Definition for the future variant:
@@ -433,3 +441,67 @@ The production N>1 image is built from `deploy/docker/Dockerfile.jetson.v080-edg
 + `jetson-edgellm-v080-n2.json` (see §9.3) on the **vanilla one-shot** ASR worker
 + asr-b2 engine artifact — no incremental-prefix runtime. Do not promote a
 `prefix-multiturn` build to production.
+
+---
+
+## 12. CustomVoice re-pin — ONE binary via runtime-if on langId (CURRENT, 2026-06-22)
+
+**Supersedes §10's "separate-binary CV variant" plan.** CustomVoice is no longer a
+separate binary with its own apply chain — it is **folded into the pinned branch**
+and selected at runtime by `langId`.
+
+### Pin (supersedes §C2-repin §27 pin too)
+```
+UPSTREAM_PIN = c48c0de505f769e8779035ba912764c3a399b7c2
+             = suharvest/wip/cv-9row-v080-n1n2 (fork integration branch HEAD)
+```
+Re-pinned **7142a30 → c48c0de** (Option A — full re-pin so `build.sh` reproduces the
+CustomVoice worker FROM SOURCE). The branch is the previous Base N>1 chain
+(`…a361221…7142a30`) **plus 2 CV commits folded in:**
+
+| sha | what |
+|---|---|
+| `12ee383` | port 9-row CustomVoice language conditioning onto v0.8.0 N>1 — adds the 9-row CV talker prefill behind a **RUNTIME-IF on `langId`**. ONE binary now handles BOTH: `langId < 0` → Base 8-row speaker-encoder prefill (UNCHANGED); `langId >= 0` → CustomVoice 9-row langId prefill. |
+| `c48c0de` | wire per-request `language` into the streaming worker `buildRequest` (per-request langId reaches the runtime-if path). ← branch HEAD |
+
+### Apply chain — UNCHANGED (still ONE patch)
+Because the 2 CV commits are now **IN** the pinned branch, the `build.sh` apply
+chain stays exactly:
+```
+0001-orin-tegra-build-compat        (Tegra/Orin sm_87 build compat)
+```
+No CV patch is applied. The runtime-if comes from the branch, not a patch.
+
+### Superseded → archival-only (NOT in any apply chain; files kept on disk)
+The old pre-runtime-if CV patches are **superseded** by the in-branch runtime-if
+(`12ee383`/`c48c0de`) and are intentionally **NOT applied**:
+- `patches/v080-0007-customvoice-language-conditioning.patch`
+- `patches/0005-customvoice-language-conditioning.patch`
+- `patches/v080-0008-tts-cutedsl-wrap.patch` (companion shim that only sat on top of v080-0007)
+
+They forced a SEPARATE CV-only binary that could not coexist with Base — exactly
+the limitation the runtime-if removes. Kept on disk for archival/history only.
+
+### Rebuild + gate verification (2026-06-22, orin-nx build → orin-nano gate)
+- **Built on orin-nx** via `engine-overlay/build.sh manifests/qwen3-tts-highperf-sm87.toml`
+  (fetched pin `c48c0de` from the suharvest TensorRT-Edge-LLM fork, applied `0001`,
+  compiled sm_87 / CUDA 12.6 / TRT 10.3, Release). Built worker
+  `examples/omni/qwen3_tts_streaming_worker` md5 `50d586de5b869192230f6a31ca72ac77`
+  (plugin `libNvInfer_edgellm_plugin.so.1.0` md5 `e723ffc7186bf8f62ec68b2fb20fbafa`).
+  A fresh orin-nx build legitimately has a **different md5** than the orin-nano
+  reference (`6784031688289953699c3e89f324dd71`) — **functional equivalence**, not
+  md5, is the criterion (c2-repin-spec §5).
+- **Gated on orin-nano** (faster-whisper `small`, `cv_drive.py` JSONL driver):
+
+  | request | worker log | audio frames | faster-whisper transcript |
+  |---|---|---|---|
+  | CV zh (`language=chinese`) | `langId=2055`, `prefixRows=9` | 46 (exit: EOS), ok=true | "你好,很高兴见到你,今天天气怎么样?" (lang zh 0.996) |
+  | CV en (`language=english`) | `langId=2050`, `prefixRows=9` | 67 (exit: EOS), ok=true | "Hello, nice to meet you. How is the weather today?" (lang en 0.779) |
+  | Base (no language) | `langId=-1`, `prefixRows=8` | 55 (exit: EOS), ok=true | intelligible zh (0.995) |
+
+  Base 55-frame + CV-en 67-frame outputs match the validated reference exactly →
+  ONE binary correctly routes Base (8-row) and CV (9-row) by langId, with no Base
+  regression. CV gate **PASSED.**
+
+This pin + the runtime-if is the SINGLE SOURCE for the v0.8.0 N>1 stack — Base AND
+CustomVoice in ONE binary. See `UPSTREAM_PIN` header for the full commit ladder.
