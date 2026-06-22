@@ -1,20 +1,31 @@
-7142a30e7d3b7fa68919b605c6c51b480f77b3ff
-# = fork integration branch HEAD: suharvest/port/qwen3-tts-base-v080-n1n2
-#   "feat(asr): expose maxSessionBatchSize() on LLMInferenceRuntime for N>1 worker"
+c48c0de505f769e8779035ba912764c3a399b7c2
+# = fork integration branch HEAD: suharvest/wip/cv-9row-v080-n1n2
+#   "feat(omni-tts): wire per-request language into streaming worker buildRequest"
 #
-# Repinned from a361221 -> 7142a30 (C2b hardening) so the SINGLE branch can
-# build the FULL v0.8.0 N>1 stack (TTS streaming worker + ASR voice worker).
-# Three commits were added on top of the previous a361221 pin:
-#   8de933f  C3 N<=0 prefill guard (defensive early-return; N>0 paths unchanged)
-#   a099544  add minimal SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp})
-#            — the ASR voice worker's #include target. ONLY the lane allocator
-#            (no deferred AsrStreamingSessionRuntime streaming wrapper).
-#   7142a30  expose LLMInferenceRuntime::maxSessionBatchSize() (trivial accessor;
-#            sizes the worker's lane manager to the engine's physical batch).
+# Repinned from 7142a30 -> c48c0de (CV formalization, Option A — full re-pin so
+# build.sh reproduces the CustomVoice worker FROM SOURCE). Two commits were added
+# on top of the previous 7142a30 (Base N>1) pin, both folded INTO this branch:
+#   12ee383  port 9-row CustomVoice language conditioning onto v0.8.0 N>1
+#            — adds the 9-row CV talker prefill behind a RUNTIME-IF on langId.
+#            One binary now handles BOTH:
+#              * langId <  0  -> Base 8-row speaker-encoder prefill (UNCHANGED)
+#              * langId >= 0  -> CustomVoice 9-row langId prefill
+#            This supersedes the old pre-runtime-if CV patches
+#            (patches/v080-0007-customvoice-language-conditioning.patch and
+#             patches/0005-customvoice-language-conditioning.patch), which forced
+#            a SEPARATE CV-only binary that could not coexist with Base. Those
+#            patches are now ARCHIVAL ONLY (not in the build.sh apply chain).
+#   c48c0de  wire per-request language into the streaming worker buildRequest
+#            (per-request langId reaches the runtime-if path).   ← HEAD
 #
-# This pin is the SINGLE SOURCE for the Base TTS N>1 serving stack. It is
-# NVIDIA release/0.8.0 (f9cc746) + 6 fork-port commits + the D2-1 shared-engine
-# ctor, in one branch:
+# Because the 2 CV commits are now IN the pinned branch, the apply chain is
+# UNCHANGED: still exactly ONE patch (0001-orin-tegra-build-compat) on top of the
+# branch + addon/. NO CV patch is applied (the runtime-if is in the branch).
+#
+# This pin is the SINGLE SOURCE for the v0.8.0 N>1 stack — Base AND CustomVoice
+# in ONE binary (runtime-if on langId). It is NVIDIA release/0.8.0 (f9cc746) +
+# 6 fork-port commits + the D2-1 shared-engine ctor + the C2b ASR self-build
+# commits + the 2 CV runtime-if commits, in one branch:
 #   f9cc746  NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD (PR #101)
 #   10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
 #   ba9ecdb  backport Base speaker-encoder (external-embedding) path onto v0.8.0
@@ -23,13 +34,21 @@
 #   50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
 #   873ca22  fp8 text_embedding (native kernel path)
 #   a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
+#   8de933f  C3 N<=0 prefill guard (defensive early-return; N>0 paths unchanged)
+#   a099544  add minimal SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp})
+#   7142a30  expose LLMInferenceRuntime::maxSessionBatchSize() for N>1 worker
+#   12ee383  port 9-row CustomVoice language conditioning (runtime-if on langId)
+#   c48c0de  wire per-request language into streaming worker buildRequest
 #
 # Because these are now IN the pinned branch, the old engine-overlay/patches/
-# v080-port-0001..0006 are REDUNDANT and are NO LONGER in the build.sh apply
-# chain (kept on disk for archival only). See patches/PATCH-STATE-v080.md §4.
+# v080-port-0001..0006 (fork-port) AND v080-0007 / 0005 (CV pre-runtime-if) are
+# REDUNDANT/SUPERSEDED and are NOT in the build.sh apply chain (kept on disk for
+# archival only). See patches/PATCH-STATE-v080.md §4 and §10/§12.
 #
 # upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-# fork remote (suharvest): branch suharvest/port/qwen3-tts-base-v080-n1n2
+# fork remote (suharvest): branch suharvest/wip/cv-9row-v080-n1n2
 #
 # NOTE: build.sh fetches this SHA. The fork ref must be reachable from the
 # configured upstream.remote (set it to the suharvest fork for reproduction).
+# Verified reachable on suharvest: refs/heads/wip/cv-9row-v080-n1n2 = c48c0de
+# (also fetch-by-SHA OK — the exact path build.sh uses).

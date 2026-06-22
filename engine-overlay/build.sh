@@ -66,13 +66,15 @@ echo "==> copying addon/ (new files)"
   done )
 
 # --- 3. apply patches in order -----------------------------------------------
-# BASE TTS N>1 SERVING BUILD CHAIN (v0.8.0, C2-repin).
+# BASE + CUSTOMVOICE N>1 SERVING BUILD CHAIN (v0.8.0, CV re-pin / Option A).
 #
-# Ground truth: this overlay reproduces the BASE Qwen3-TTS N>1 stack (streaming
-# worker + slot-pool + shared-engine ctor) WITHOUT CustomVoice. The single source
-# for the FULL N>1 stack (TTS streaming worker + ASR voice worker) is now the fork
-# integration branch pinned in UPSTREAM_PIN
-# (7142a30 = suharvest/port/qwen3-tts-base-v080-n1n2), which is:
+# Ground truth: this overlay reproduces the Qwen3-TTS N>1 stack (streaming
+# worker + slot-pool + shared-engine ctor) with BOTH Base AND CustomVoice in ONE
+# binary via a RUNTIME-IF on langId (langId<0 => Base 8-row speaker-encoder
+# prefill, UNCHANGED; langId>=0 => CustomVoice 9-row langId prefill). The single
+# source for the FULL N>1 stack (TTS streaming worker + ASR voice worker + CV
+# runtime-if) is the fork integration branch pinned in UPSTREAM_PIN
+# (c48c0de = suharvest/wip/cv-9row-v080-n1n2), which is:
 #
 #     f9cc746  (NVIDIA release/0.8.0 HEAD)
 #   + 10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
@@ -83,32 +85,39 @@ echo "==> copying addon/ (new files)"
 #   + 873ca22  fp8 text_embedding (native kernel path)
 #   + a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
 #   + 8de933f  C3 N<=0 prefill guard (defensive; N>0 paths unchanged)
-#   + 7142a30  SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp}) —
+#   + a099544  add minimal SessionLaneManager (lane allocator)
+#   + 7142a30  SessionLaneManager accessor maxSessionBatchSize() —
 #              the ASR voice worker's #include target (lane allocator ONLY, no
 #              deferred streaming wrapper). Makes step 4b self-contained.
+#   + 12ee383  port 9-row CustomVoice language conditioning onto v0.8.0 N>1
+#              (RUNTIME-IF on langId; Base path unchanged when langId<0)
+#   + c48c0de  wire per-request language into streaming worker buildRequest  <- HEAD
 #
-# Because the 6 fork-port commits are IN the pinned branch, the old
-# engine-overlay/patches/v080-port-0001..0006 are REDUNDANT and are NOT applied
-# (kept on disk for archival only). See PATCH-STATE-v080.md §4.
+# Because all of these commits are IN the pinned branch, the old
+# engine-overlay/patches/v080-port-0001..0006 (fork-port) are REDUNDANT and are
+# NOT applied (kept on disk for archival only). See PATCH-STATE-v080.md §4 / §12.
 #
-# APPLY CHAIN (Base) = exactly ONE patch on top of the pinned branch + addon/:
+# APPLY CHAIN = exactly ONE patch on top of the pinned branch + addon/:
 #   + addon/   (new files: MOSS runtime+worker, w8a16 kernels, statefulCode2Wav,
 #               spikes, scripts — all additive; copied in step 2 above)
 #   + 0001-orin-tegra-build-compat  (Orin/Tegra CUDA-12.6 build-host compat;
 #               static-lib PUBLIC/INTERFACE shim + --wrap=_cudaLaunchKernelEx
 #               propagation. NOT in the fork branch — verified git-apply CLEAN.)
 #
-# DROPPED from the Base chain (see PATCH-STATE-v080.md §4):
+# DROPPED / SUPERSEDED — NOT applied (see PATCH-STATE-v080.md §4 / §10 / §12):
 #   - v080-port-0001..0006  : redundant, now in the pinned branch.
-#   - v080-0007-customvoice-language-conditioning : CustomVoice 9-row langId.
-#       Conflicts with the Base 8-row speaker-encoder talker prefill — the two
-#       cannot live in one binary. Moved to the CUSTOMVOICE VARIANT (not built
-#       here). See PATCH-STATE-v080.md §10 "CustomVoice variant".
+#   - v080-0007-customvoice-language-conditioning  AND
+#     0005-customvoice-language-conditioning : the OLD pre-runtime-if CV patches.
+#       They forced a SEPARATE CV-only binary whose 9-row prefill could not
+#       coexist with the Base 8-row path. SUPERSEDED by fork commit 12ee383,
+#       which puts the 9-row CV prefill behind a RUNTIME-IF on langId so ONE
+#       binary serves both Base (langId<0) and CV (langId>=0). These two patches
+#       are now ARCHIVAL ONLY (kept on disk, never applied).
 #   - v080-0008-tts-cutedsl-wrap : built on top of v080-0007's shim block, FAILS
-#       git-apply on the Base branch (examples/omni/CMakeLists.txt context drift).
-#       Superseded for Base by the fork's 867b74d cutedsl shim + the
+#       git-apply on this branch (examples/omni/CMakeLists.txt context drift).
+#       Superseded by the fork's 867b74d cutedsl shim + the
 #       --wrap=_cudaLaunchKernelEx already in cmake/CuteDsl.cmake (CUDA<12.8) and
-#       hardened by 0001. Belongs to the CustomVoice variant.
+#       hardened by 0001. Archival only.
 #   - v080-NNNN ASR-streaming / TTS-batch incremental-KV experiments : DEFERRED
 #       (C3 backlog). N>1 ASR is delivered by the vendored worker
 #       native/edgellm_voice_worker/qwen3_asr_worker.cpp on the vanilla one-shot
@@ -121,20 +130,22 @@ apply_one() {
   git -C "${WORKDIR}" apply --check "${p}"
   git -C "${WORKDIR}" apply "${p}"
 }
-# Base N>1 serving chain — explicit ordered allow-list (NOT a glob).
-# Verified: full chain git-apply --check CLEAN on a361221 + addon/ (C2-repin).
+# Base+CV N>1 serving chain — explicit ordered allow-list (NOT a glob).
+# Verified: full chain git-apply --check CLEAN on the pinned branch + addon/.
 for n in \
     0001-orin-tegra-build-compat \
 ; do
   apply_one "${HERE}/patches/${n}.patch"
 done
 echo "==> patched source tree ready at ${WORKDIR}"
-echo "    Base N>1 chain applied (pinned branch a361221 + 0001)."
+echo "    Base+CustomVoice N>1 chain applied (pinned branch c48c0de + 0001)."
 echo "    Streaming worker + slot-pool + shared-engine ctor + Base speaker-encoder"
-echo "    come from the pinned branch. MOSS delivered via addon/. v080-port-0001..0006"
-echo "    are redundant (in branch), v080-0007/0008 are CustomVoice-variant only, and"
-echo "    v080-NNNN streaming/batch experiments are intentionally NOT applied."
-echo "    See patches/PATCH-STATE-v080.md (§4 Base chain, §10 CustomVoice variant)."
+echo "    + 9-row CV runtime-if (langId) come from the pinned branch. MOSS via addon/."
+echo "    v080-port-0001..0006 are redundant (in branch); the OLD CV patches"
+echo "    (v080-0007 / 0005 / v080-0008) are SUPERSEDED by the in-branch runtime-if"
+echo "    (12ee383/c48c0de) and intentionally NOT applied; v080-NNNN streaming/batch"
+echo "    experiments are NOT applied either."
+echo "    See patches/PATCH-STATE-v080.md (§4 chain, §10/§12 CustomVoice runtime-if)."
 
 if [ "${APPLY_ONLY}" -eq 1 ]; then
   echo "==> --apply-only: stopping before compile (no CUDA/TRT needed)."
@@ -236,8 +247,11 @@ echo "      ${WORKDIR}/build/examples/omni/         qwen3_tts_streaming_worker (
 echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1, 5ebd436b)"
 echo "    Collect worker binaries + plugin .so + .engine, write md5 sidecars,"
 echo "    and reconcile against ${MANIFEST}. Engine build uses build_engine_bundle.py."
-echo "    TTS engines (Base): talker + code-predictor + speaker-encoder (external"
-echo "    embedding) — NOT the CustomVoice int4 engine (that is the CV variant)."
+echo "    ONE worker handles BOTH via runtime-if on langId:"
+echo "      langId<0  -> Base: talker + code-predictor + speaker-encoder (external emb)"
+echo "      langId>=0 -> CustomVoice: int4/fp8 CV talker engine"
+echo "        (harvestsu/qwen3-tts-0.6b-customvoice-jetson-trtllm-int4fp8)."
+echo "    The engine BUNDLE selected at runtime decides which path runs."
 echo "    N=2 runtime: select profile jetson-edgellm-v080-n2 (stream_mode=worker,"
 echo "    asr-b2 engine 4122dfcc, session-gate triplet LAZY_TTS=1 +"
 echo "    OVS_TTS_WORKER_CONCURRENCY=2 + OVS_MAX_CONCURRENT_SESSIONS=2)."
