@@ -223,9 +223,14 @@ else
 fi
 
 # --- 4c. MOSS worker (own helper) --------------------------------------------
+# Pin EDGELLM_SRC to THIS overlay's freshly-built clone (WORKDIR). Without it the
+# helper defaults EDGELLM_SRC=/home/harvest/TensorRT-Edge-LLM — a stale per-dev
+# checkout — so on a clean build the edgellmCore .o files it links are MISSING and
+# the MOSS worker fails (BUILD_EXIT=1) even though TTS+ASR built fine from WORKDIR.
+# (ORT_ROOT/SP_ROOT/CUDA_ROOT remain build-host env per the helper's defaults.)
 if [ -x "${WORKDIR}/cpp/workers/build_moss_worker.sh" ]; then
   echo "==> building MOSS worker"
-  ( cd "${WORKDIR}/cpp/workers" && bash build_moss_worker.sh )
+  ( cd "${WORKDIR}/cpp/workers" && EDGELLM_SRC="${WORKDIR}" bash build_moss_worker.sh )
 fi
 # --- 4d. plugin unversioned symlink -----------------------------------------
 # The plugin builds as libNvInfer_edgellm_plugin.so.1.0 (VERSION 1.0/SOVERSION 1).
