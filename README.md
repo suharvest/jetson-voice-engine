@@ -1,25 +1,33 @@
 # jetson-voice-engine
 
-The **build-time engine repo** for the Jetson voice stack. It produces *all*
-TensorRT engines and runtime artifacts that the `seeed-local-voice` product
-service deploys on Jetson Orin — across every supported model — and publishes
-the large outputs to Hugging Face.
+<p align="center">
+  <img src="https://img.shields.io/badge/Platform-Jetson%20Orin%20Nano%20%7C%20Orin%20NX-76b900.svg" alt="Platform">
+  <img src="https://img.shields.io/badge/ASR-Qwen3--ASR%20int4%20%7C%20Paraformer-2f80ed.svg" alt="ASR">
+  <img src="https://img.shields.io/badge/TTS-Qwen3--TTS%20%7C%20Matcha%20TRT%20%7C%20Kokoro-f97316.svg" alt="TTS">
+  <img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License">
+</p>
+
+<p align="center">
+  Qwen3-TTS · Matcha TRT · Qwen3-ASR on Jetson Orin — <strong>RTF 0.63 · 28ms TTFA · 55ms ASR · no cloud</strong>
+</p>
+
+The **Jetson speech engine** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It produces all TensorRT-EdgeLLM engines and runtime artifacts that OpenVoiceStream deploys on Jetson Orin (Nano / NX) — across every supported model — and publishes the large outputs to Hugging Face.
 
 > **Repo name note:** the GitHub remote is still
 > `suharvest/qwen3-edgellm-jetson` (rename to `jetson-voice-engine` pending).
 > The directory is consumed as the `third_party/qwen3-edgellm-jetson`
-> submodule of `seeed-local-voice`.
+> submodule of OpenVoiceStream.
 
 Post-restructure, this repo was merged from two former sources:
 
 1. the **voxedge-engine overlay** of the NVIDIA TensorRT-Edge-LLM fork
    (`engine-overlay/`), and
-2. the **seeed Jetson engine-build scripts** for every model
+2. the **Jetson engine-build scripts** for every model
    (`models/<model>/`).
 
-The deployable product service (API, frontend/backend selection, Docker,
-device deployment) lives in `seeed-local-voice`; this repo owns export, engine
-build, runtime overlay, validation gates, and lessons learned.
+The deployable product service (API, Docker, device deployment) lives in
+[OpenVoiceStream](https://github.com/suharvest/openvoicestream); this repo owns
+export, engine build, runtime overlay, validation gates, and lessons learned.
 
 ## Repository layout
 
@@ -44,7 +52,7 @@ build, runtime overlay, validation gates, and lessons learned.
 | `AGENTS.md` | Concise operating guide for coding agents in this repo. |
 
 For the end-to-end picture across product + engine + artifacts, see the
-seeed `docs/REPRODUCE.md` in the parent `seeed-local-voice` repo.
+OpenVoiceStream's `docs/REPRODUCE.md`.
 
 ## engine-overlay/ — TRT-Edge-LLM fork overlay
 
