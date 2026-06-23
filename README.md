@@ -239,3 +239,188 @@ exact-match ASR on three Chinese prompts via the slim docker container on Orin
 NX. Performance numbers in
 `docs/performance/qwen3-orin-profiles-2026-05-10.md` (V2V `EOS → first audio`
 611–637 ms).
+
+## Performance
+
+Measured 2026-06-22. JetPack 6, TensorRT 10. All RTF = synthesis time / audio duration
+(lower is better; < 1.0 means faster than real-time). TTFA = time to first audio chunk
+via HTTP `/tts/stream` (true streaming, measured with `bench/bench_http_tts_stream.py`).
+Direct-backend latency (no service) measured with `bench/bench_*.py`, 3 trials after 1 warmup.
+
+**Devices**:
+- **Nano** — Jetson Orin Nano Super 8 GB, SM87
+- **NX** — Jetson Orin NX 16 GB, SM87
+
+### TTS — all backends
+
+| Backend | Languages | Nano TTFA | Nano RTF | NX TTFA | NX RTF |
+|---------|-----------|:---------:|:--------:|:-------:|:------:|
+| **Matcha + Vocos TRT** | zh, en | ❌ no vocos TRT | — | **28–75 ms** | **0.015–0.021** |
+| **Kokoro TRT** (hybrid) | en | — | 0.54–0.55 | ❌ no artifact | — |
+| **Qwen3-TTS FP16** (v0.8.0) | zh, en, 52 lang | ~1.1 s¹ | 0.73 | ~1.2 s¹ | 0.70–0.71 |
+| **Qwen3-TTS int4-AWQ** (v0.8.0) | zh, en, 52 lang | ~0.7 s¹ | **0.65** | ~0.65 s¹ | **0.63** |
+
+> ¹ Qwen3-TTS TTFA is estimated from IPC worker total-synthesis time ÷ first-chunk fraction.
+> True HTTP streaming TTFA for Qwen3-TTS is not yet measured (service not currently deployed
+> with Qwen3-TTS backend; Matcha is active on NX). int4-AWQ is **~10–11% faster** than FP16.
+> fp8 text embedding is blocked (missing scale tensors in export).
+
+> **Matcha** — NX: full-ORT acoustic + TRT vocos, 16 kHz, preload 2.9 s. Nano: ❌ missing
+> `vocos_fp16.engine` (build: `trtexec --onnx=vocos-16khz-univ.onnx --fp16 --saveEngine=...`).
+
+> **Kokoro** — Nano: hybrid prefix TRT + ORT suffix, 24 kHz, preload ~3.2 s, speaker 52.
+> NX: ❌ no vocos TRT engine and no Kokoro hybrid artifact set.
+
+> **Qwen3-TTS** — v0.8.0 worker (`voxedge explicit-KV` confirmed via `strings`).
+> FP16: Nano preload 7.5 s, NX preload 6.1 s. int4-AWQ: talker 235 MB vs 526 MB FP16;
+> Nano preload 35.6 s (first load; engine smaller but JIT slower). 24 kHz output.
+
+#### Matcha TRT — NX HTTP streaming detail (`/tts/stream`, seeed-voice service)
+
+| Text | TTFA mean | TTFA min | Total mean | RTF |
+|------|:---------:|:--------:|:----------:|:---:|
+| "你好，世界！" | 32 ms | 28 ms | 36 ms | 0.020 |
+| "今天天气怎么样？" | 32 ms | 29 ms | 37 ms | 0.019 |
+| "请告诉我最近的新闻。" | 44 ms | 43 ms | 49 ms | 0.021 |
+| "Hello, how are you today?" | 38 ms | 34 ms | 44 ms | 0.017 |
+| "欢迎使用语音合成服务，希望您有一个愉快的体验。" | 56 ms | 42 ms | 70 ms | 0.015 |
+| "TensorRT accelerates deep learning…" | 75 ms | 52 ms | 88 ms | 0.015 |
+
+#### Qwen3-TTS — direct backend detail (IPC worker, total synthesis time)
+
+| Text | Nano FP16 | Nano int4 | NX FP16 | NX int4 |
+|------|:---------:|:---------:|:-------:|:-------:|
+| "你好，世界！" | 1065 ms / RTF 0.74 | 1311 ms / RTF 0.655 | 1197 ms / RTF 0.713 | 1259 ms / RTF 0.629 |
+| "今天天气怎么样？" | 1064 ms / 0.739 | 1257 ms / 0.655 | 1137 ms / 0.711 | 1259 ms / 0.630 |
+| "请告诉我最近的新闻。" | 1527 ms / 0.734 | 1413 ms / 0.655 | 1531 ms / 0.709 | 1407 ms / 0.628 |
+| "Hello, how are you today?" | 1816 ms / 0.732 | 1672 ms / 0.653 | 1979 ms / 0.707 | 1209 ms / 0.630 |
+| "欢迎使用语音合成服务…" | 3149 ms / 0.729 | 2968 ms / 0.651 | 2926 ms / 0.704 | 1358 ms / 0.629 |
+| "TensorRT accelerates…" | 3555 ms / 0.729 | 4884 ms / 0.650 | 4099 ms / 0.702 | 3303 ms / 0.626 |
+
+### ASR — all backends
+
+| Backend | Languages | Nano latency | NX latency |
+|---------|-----------|:------------:|:----------:|
+| **Qwen3-ASR int4** (v0.8.0 worker) | 52 | ~60 ms¹ | ~55 ms¹ |
+| **Qwen3-ASR FP16** (v0.8.0 worker) | 52 | ~60 ms¹ | ❌ hangs |
+| **Paraformer TRT** | zh, en, ja, ko | ❌ no engine | ❌ no decoder engine |
+
+> ¹ Synthetic 2 s WAV (440 Hz tone, 16 kHz). Empty transcript (no real speech); latency
+> = worker roundtrip overhead only. Real-speech latency scales with audio length.
+
+> **Qwen3-ASR int4** — Nano: worker v0.8.0 (`be7bee91`), int4 engines
+> (`qwen3-asr-0.6b-int4-v080-deploy/`), preload 7.96 s. NX: same v0.8.0 worker,
+> int4 engines (`~/qwen3-asr-int4-engines/`, LLM 526 MB + audio encoder 364 MB).
+> NX FP16 hangs silently on all inference calls — device-specific TRT runtime issue;
+> int4 confirmed stable on both.
+
+## Benchmarking
+
+The `bench/` directory has two kinds of scripts:
+
+- **Direct-backend** (`bench_kokoro`, `bench_matcha`, `bench_qwen3_tts`, `bench_qwen3_asr`,
+  `bench_paraformer`) — load voxedge in-process, no HTTP service needed. Measure total
+  synthesis time and RTF; TTFA cannot be measured here (IPC worker batches all audio).
+- **HTTP streaming** (`bench_http_tts_stream`) — hits a running seeed-voice service via
+  `/tts/stream`, measures true streaming TTFA (first PCM chunk) and RTF via chunked HTTP.
+
+### Prerequisites
+
+```bash
+# Direct-backend: set PYTHONPATH to the voxedge checkout
+export PYTHONPATH=~/voxedge-test
+
+# HTTP streaming: start seeed-voice service first (port 8621 by default)
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+### `bench/bench_http_tts_stream.py` — HTTP streaming TTFA
+
+```bash
+python3 bench/bench_http_tts_stream.py \
+    --url http://localhost:8621 \
+    --repeat 3
+```
+
+Measures true TTFA via `/tts/stream` (chunked PCM). Requires a running service.
+`--api-key` if the service has authentication enabled. `--output-jsonl` to save results.
+
+### `bench/bench_kokoro.py` — Kokoro TRT TTS
+
+```bash
+python3 bench/bench_kokoro.py \
+    --model-base ~/ovs-models/kokoro-multi-lang-v1_0 \
+    --hybrid-dir ~/ovs-models/kokoro-multi-lang-v1_0/hybrid2 \
+    --runtime-mode hybrid \
+    --repeat 3
+```
+
+Key args: `--runtime-mode` (hybrid/split_generator/engine/ort_cpu),
+`--speaker-id`, `--text`, `--output-jsonl`.
+
+### `bench/bench_qwen3_tts.py` — Qwen3-TTS worker TTS
+
+```bash
+python3 bench/bench_qwen3_tts.py \
+    --worker-build ~/path/to/jetson-workers \
+    --plugin-path ~/path/to/libNvInfer_edgellm_plugin.so \
+    --talker-dir ~/path/to/engines/talker \
+    --cp-dir ~/path/to/engines/code_predictor \
+    --tokenizer-dir ~/path/to/engines/talker \
+    --code2wav-dir ~/path/to/engines/code2wav \
+    --repeat 3
+```
+
+Key args: `--qwen3-profile` (highperf/official), `--text`, `--output-jsonl`.
+Worker binary must be compiled against the same runtime version as the engines
+(check the `[version.cpp] Model version X does not match runtime version Y`
+warning).
+
+### `bench/bench_matcha.py` — Matcha TRT TTS
+
+```bash
+python3 bench/bench_matcha.py \
+    --model-base ~/voice_test/models/matcha-icefall-zh-en \
+    --split-encoder-onnx ~/matcha_split/onnx/matcha_encoder_trt.onnx \
+    --split-estimator-engine ~/matcha_split/engines/matcha_estimator_step0_bf16.engine \
+    --acoustic-ep SPLIT_TRT \
+    --skip-if-no-vocos \
+    --repeat 3
+```
+
+Key args: `--acoustic-ep` (SPLIT_TRT or empty for full-ORT),
+`--vocos-engine` (TRT engine path), `--skip-if-no-vocos` (exit 0 instead of
+error when vocos TRT engine missing), `--text`, `--output-jsonl`.
+
+### `bench/bench_qwen3_asr.py` — Qwen3-ASR worker
+
+```bash
+python3 bench/bench_qwen3_asr.py \
+    --worker-build ~/path/to/jetson-workers \
+    --plugin-path ~/path/to/libNvInfer_edgellm_plugin.so \
+    --engine-dir ~/path/to/engines/asr_thinker_full_fp8embed \
+    --audio-enc-dir ~/path/to/engines \
+    --audio test.wav \
+    --repeat 3
+```
+
+`--audio-enc-dir` must be the **parent** of the `audio/` subdirectory (i.e., the
+directory containing `audio/config.json` and `audio/audio_encoder.engine`).
+If `--audio` is omitted, a synthetic 2 s 440 Hz tone at 16 kHz is used.
+Key args: `--worker-bin` (auto-detected as `qwen3_asr_worker` in `--worker-build`),
+`--warmup`, `--skip-warmup`, `--output-jsonl`.
+
+### `bench/bench_paraformer.py` — Paraformer TRT ASR
+
+```bash
+python3 bench/bench_paraformer.py \
+    --model-dir ~/path/to/paraformer_build \
+    --decoder-engine ~/path/to/paraformer_decoder.plan \
+    --audio test.wav \
+    --repeat 3
+```
+
+Requires a decoder TRT engine (`--decoder-engine`). Encoder falls back to ORT
+CUDA EP if TRT encoder produces NaN (auto-detected). `--encoder-engine` and
+`--encoder-onnx` are both optional; if neither is given the backend uses ORT ONNX.
+Key args: `--tokens` (tokens.txt path), `--output-jsonl`.
