@@ -8,26 +8,141 @@
 </p>
 
 <p align="center">
-  Qwen3-TTS · Matcha TRT · Qwen3-ASR on Jetson Orin — <strong>RTF 0.63 · 28ms TTFA · 55ms ASR · no cloud</strong>
+  Qwen3-TTS · Matcha TRT · Qwen3-ASR on Jetson Orin Nano/NX — <strong>RTF 0.63 · 28ms TTFA · voice clone · no cloud</strong>
 </p>
 
-The **Jetson speech engine** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It produces all TensorRT-EdgeLLM engines and runtime artifacts that OpenVoiceStream deploys on Jetson Orin (Nano / NX) — across every supported model — and publishes the large outputs to Hugging Face.
+<!-- TODO: Add demo GIF — record a ~15s terminal session showing:
+     1. bash scripts/reproduce_qwen3_highperf.sh running (one command)
+     2. verify_reproduction.sh output: "All checks passed"
+     3. curl /tts/stream → PCM output (28ms TTFA)
+     Suggested tool: asciinema + agg -->
 
-> **Repo name note:** the GitHub remote is still
-> `suharvest/qwen3-edgellm-jetson` (rename to `jetson-voice-engine` pending).
-> The directory is consumed as the `third_party/qwen3-edgellm-jetson`
-> submodule of OpenVoiceStream.
+## What is this?
 
-Post-restructure, this repo was merged from two former sources:
+jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It takes official Hugging Face model weights (Qwen3-TTS/ASR, Matcha, Kokoro, Paraformer) and produces validated TensorRT engines + runtime artifacts that OpenVoiceStream deploys on Jetson Orin Nano and NX.
 
-1. the **voxedge-engine overlay** of the NVIDIA TensorRT-Edge-LLM fork
-   (`engine-overlay/`), and
-2. the **Jetson engine-build scripts** for every model
-   (`models/<model>/`).
+One script handles the entire chain — ONNX export, engine build, HF artifact download, Docker start, and loopback verification. Exit 0 means the whole stack is working.
 
-The deployable product service (API, Docker, device deployment) lives in
-[OpenVoiceStream](https://github.com/suharvest/openvoicestream); this repo owns
-export, engine build, runtime overlay, validation gates, and lessons learned.
+> **For deployment:** use [OpenVoiceStream](https://github.com/suharvest/openvoicestream)'s `deploy/install.sh --target jetson`. This repo is consumed as its `third_party/qwen3-edgellm-jetson` submodule and is intended for engine contributors and platform engineers.
+
+## Features
+
+- **Qwen3-TTS int4-AWQ** — RTF 0.63 on Orin NX, ~10% faster than FP16; voice clone via pre-extracted speaker embedding; 52-language
+- **Matcha TRT** — 28ms TTFA on Orin NX via `/tts/stream`; RTF 0.015–0.021 (50–70× real-time); TRT vocos vocoder
+- **Qwen3-ASR int4** — ~55ms latency on Orin NX, ~60ms on Orin Nano; 52-language; int4 confirmed stable (FP16 hangs on NX)
+- **Kokoro TRT** — hybrid prefix TRT + ORT suffix; RTF 0.54 on Orin Nano; speaker 52
+- **One-script reproduction** — `reproduce_qwen3_highperf.sh` from HF weights to verified service with SHA-256 gate, symbol check, and TTS→ASR loopback
+- **Thin engine-overlay** — NVIDIA TRT-Edge-LLM pinned at `v0.7.1` + 8 theme patches as a thin overlay, no vendored source tree
+- **JetPack 6 / TensorRT 10 / SM87** — production-validated on Orin Nano Super 8 GB and Orin NX 16 GB
+
+## Quick Start — Qwen3 one-shot on Orin NX
+
+```bash
+git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
+bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh
+# add: --reference path/to/24kHz_mono.wav   to also verify voice clone
+```
+
+`reproduce_qwen3_highperf.sh` is idempotent and handles the whole Qwen3 chain:
+clones repos at validated branches, builds EdgeLLM, downloads + SHA-256-verifies
+HF artifacts, builds the slim Docker image, starts the service, then runs
+`verify_reproduction.sh` which gates on:
+
+1. W8A16 plugin symbol set
+2. Artifact SHA-256 integrity
+3. HTTP TTS→ASR loopback on 3 Chinese prompts (LCS ≥ 0.7, up to 3 retries)
+4. Voice clone via a real reference WAV
+
+Exit 0 = the whole chain is verified. On failure it prints which check failed.
+
+**Prerequisites:** Jetson Orin NX, JetPack 6 (TensorRT 10.3.0.30, CUDA 12.6),
+`docker` + `--runtime nvidia`, ~10 GB free disk for HF artifacts.
+
+See `docs/reproduce-from-zero.md` for the manual step-by-step fallback.
+
+## Table of Contents
+
+- [Performance](#performance)
+- [Repository layout](#repository-layout)
+- [engine-overlay/ — TRT-Edge-LLM fork overlay](#engine-overlay----trt-edge-llm-fork-overlay)
+- [Per-model build scripts](#per-model-build-scripts-models)
+- [ONNX export](#onnx-export)
+- [HF artifact repo](#hf-artifact-repo)
+- [Jetson Voice integration](#jetson-voice-integration)
+- [Qwen3 runtime profiles & EdgeLLM branches](#qwen3-runtime-profiles--edgellm-branches)
+- [Qwen3 voice clone](#qwen3-voice-clone)
+- [Current Qwen3 baseline](#current-qwen3-baseline-2026-05-11)
+- [Benchmarking](#benchmarking)
+- [Contributing](#contributing)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+
+## Performance
+
+Measured 2026-06-22. JetPack 6, TensorRT 10. All RTF = synthesis time / audio duration
+(lower is better; < 1.0 means faster than real-time). TTFA = time to first audio chunk
+via HTTP `/tts/stream` (true streaming, measured with `bench/bench_http_tts_stream.py`).
+Direct-backend latency (no service) measured with `bench/bench_*.py`, 3 trials after 1 warmup.
+
+**Devices**:
+- **Nano** — Jetson Orin Nano Super 8 GB, SM87
+- **NX** — Jetson Orin NX 16 GB, SM87
+
+### TTS — all backends
+
+| Backend | Languages | Nano TTFA | Nano RTF | NX TTFA | NX RTF |
+|---------|-----------|:---------:|:--------:|:-------:|:------:|
+| **Matcha + Vocos TRT** | zh, en | ❌ no vocos TRT | — | **28–75 ms** | **0.015–0.021** |
+| **Kokoro TRT** (hybrid) | en | — | 0.54–0.55 | ❌ no artifact | — |
+| **Qwen3-TTS FP16** (v0.8.0) | zh, en, 52 lang | ~1.1 s¹ | 0.73 | ~1.2 s¹ | 0.70–0.71 |
+| **Qwen3-TTS int4-AWQ** (v0.8.0) | zh, en, 52 lang | ~0.7 s¹ | **0.65** | ~0.65 s¹ | **0.63** |
+
+> ¹ Qwen3-TTS TTFA estimated from IPC worker total-synthesis time ÷ first-chunk fraction.
+> True HTTP streaming TTFA for Qwen3-TTS not yet measured (Matcha is active on NX).
+> int4-AWQ is **~10–11% faster** than FP16. fp8 text embedding blocked (missing scale tensors).
+
+> **Matcha** — NX: full-ORT acoustic + TRT vocos, 16 kHz, preload 2.9 s. Nano: ❌ missing
+> `vocos_fp16.engine` (build: `trtexec --onnx=vocos-16khz-univ.onnx --fp16 --saveEngine=...`).
+
+> **Qwen3-TTS** — v0.8.0 worker (`voxedge explicit-KV` confirmed via `strings`).
+> FP16: Nano preload 7.5 s, NX preload 6.1 s. int4-AWQ: talker 235 MB vs 526 MB FP16.
+
+#### Matcha TRT — NX HTTP streaming detail (`/tts/stream`)
+
+| Text | TTFA mean | TTFA min | Total mean | RTF |
+|------|:---------:|:--------:|:----------:|:---:|
+| "你好，世界！" | 32 ms | 28 ms | 36 ms | 0.020 |
+| "今天天气怎么样？" | 32 ms | 29 ms | 37 ms | 0.019 |
+| "请告诉我最近的新闻。" | 44 ms | 43 ms | 49 ms | 0.021 |
+| "Hello, how are you today?" | 38 ms | 34 ms | 44 ms | 0.017 |
+| "欢迎使用语音合成服务，希望您有一个愉快的体验。" | 56 ms | 42 ms | 70 ms | 0.015 |
+| "TensorRT accelerates deep learning…" | 75 ms | 52 ms | 88 ms | 0.015 |
+
+#### Qwen3-TTS — direct backend detail (IPC worker, total synthesis time)
+
+| Text | Nano FP16 | Nano int4 | NX FP16 | NX int4 |
+|------|:---------:|:---------:|:-------:|:-------:|
+| "你好，世界！" | 1065 ms / RTF 0.74 | 1311 ms / RTF 0.655 | 1197 ms / RTF 0.713 | 1259 ms / RTF 0.629 |
+| "今天天气怎么样？" | 1064 ms / 0.739 | 1257 ms / 0.655 | 1137 ms / 0.711 | 1259 ms / 0.630 |
+| "请告诉我最近的新闻。" | 1527 ms / 0.734 | 1413 ms / 0.655 | 1531 ms / 0.709 | 1407 ms / 0.628 |
+| "Hello, how are you today?" | 1816 ms / 0.732 | 1672 ms / 0.653 | 1979 ms / 0.707 | 1209 ms / 0.630 |
+| "欢迎使用语音合成服务…" | 3149 ms / 0.729 | 2968 ms / 0.651 | 2926 ms / 0.704 | 1358 ms / 0.629 |
+| "TensorRT accelerates…" | 3555 ms / 0.729 | 4884 ms / 0.650 | 4099 ms / 0.702 | 3303 ms / 0.626 |
+
+### ASR — all backends
+
+| Backend | Languages | Nano latency | NX latency |
+|---------|-----------|:------------:|:----------:|
+| **Qwen3-ASR int4** (v0.8.0 worker) | 52 | ~60 ms¹ | ~55 ms¹ |
+| **Qwen3-ASR FP16** (v0.8.0 worker) | 52 | ~60 ms¹ | ❌ hangs |
+| **Paraformer TRT** | zh, en, ja, ko | ❌ no engine | ❌ no decoder engine |
+
+> ¹ Synthetic 2 s WAV (440 Hz tone, 16 kHz). Empty transcript; latency = worker roundtrip overhead.
+> Real-speech latency scales with audio length.
+
+> **Qwen3-ASR int4** — Nano: worker v0.8.0 (`be7bee91`), int4 engines, preload 7.96 s.
+> NX: same worker, int4 engines (LLM 526 MB + audio encoder 364 MB).
+> NX FP16 hangs silently — device-specific TRT runtime issue; int4 confirmed stable on both.
 
 ## Repository layout
 
@@ -47,11 +162,12 @@ export, engine build, runtime overlay, validation gates, and lessons learned.
 | `native/edgellm_voice_worker/` | Resident C++ ASR/TTS worker sources (mel extractor, VAD split, qwen3 ASR/TTS workers, kissfft) used by Jetson Voice. |
 | `scripts/` | Qwen3 orchestration + reproduction entry points (`reproduce_qwen3_highperf.sh`, `verify_reproduction.sh`, artifact packager/downloader, ONNX export, speaker-embedding extraction). |
 | `docs/` | Export guides, reproduction-from-zero, performance records + listenable audio evidence, open issues, plans/negative results. |
+| `bench/` | Benchmark scripts: direct-backend (RTF/latency) and HTTP streaming (TTFA). |
 | `tests/` | `golden_mels/` fixtures for mel parity. |
 | `HF_ARTIFACTS.md` | What belongs in the HF artifact repo + stage/upload commands. |
 | `AGENTS.md` | Concise operating guide for coding agents in this repo. |
 
-For the end-to-end picture across product + engine + artifacts, see the
+For the end-to-end picture across product + engine + artifacts, see
 OpenVoiceStream's `docs/REPRODUCE.md`.
 
 ## engine-overlay/ — TRT-Edge-LLM fork overlay
@@ -88,7 +204,7 @@ cd engine-overlay
 > **Build-verify is DEFERRED** until run on a Jetson CUDA/TensorRT host (Orin,
 > sm_87). `build.sh` refuses to compile on non-aarch64. See
 > `engine-overlay/README.md` and `engine-overlay/DIVERGENCE.md` for details,
-> including the **SSE/client-disconnect fix (in patch `0006`) which is
+> including the **SSE/client-disconnect fix (patch `0006`) which is
 > PR-pending — do NOT auto-submit**.
 
 ## Per-model build scripts (`models/`)
@@ -108,52 +224,6 @@ engines and sidecars the product service loads:
 - `paraformer/` — Paraformer ASR engines + decoder surgery.
 - `common/` — shared ONNX surgery, engine-bundle builder, parity gate, and
   the model downloader.
-
-## Quick start — Qwen3 one-shot on Orin NX
-
-```bash
-git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
-bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh
-# add: --reference path/to/24kHz_mono.wav   to also verify voice clone
-```
-
-`scripts/reproduce_qwen3_highperf.sh` is idempotent and handles the whole
-Qwen3 chain: clones the repos at the validated branches, builds EdgeLLM,
-downloads + SHA-256-verifies the HF artifact set, builds the slim docker
-image, brings the service up, then runs `scripts/verify_reproduction.sh`,
-which gates on (1) W8A16 plugin symbol set, (2) artifact integrity, (3) HTTP
-TTS→ASR loopback on three Chinese prompts (LCS-similarity ≥ 0.7 across up to 3
-retries), and (4) voice clone via a real reference WAV. Exit 0 means the whole
-chain is verified; on failure it prints which check failed and why.
-
-Prerequisites: Jetson Orin NX with JetPack 6 (TensorRT 10.3.0.30, CUDA 12.6),
-docker + `--runtime nvidia`, ~10 GB free disk for HF artifacts.
-
-`scripts/verify_reproduction.sh` is reusable gate-only (symbol set / artifact
-SHA-256 / TTS+ASR loopback / clone) for CI. See
-`docs/reproduce-from-zero.md` for the manual step-by-step fallback.
-
-## Qwen3 runtime profiles & EdgeLLM branches
-
-Two Qwen profiles are maintained:
-
-- `official`: minimal-diff EdgeLLM-compatible path for correctness and upstream review.
-- `highperf`: product path for low-latency Qwen3 ASR + Qwen3 TTS dual residency on Orin.
-
-Jetson Voice consumes these via the JSON profiles under `configs/profiles/` and
-the artifact manifest `deploy/artifacts/qwen3_manifest.json`.
-`multilanguage-qwen-highperf` targets the Nano artifact set;
-`multilanguage-qwen-highperf-nx` targets NX-native engines.
-
-The corresponding TensorRT-Edge-LLM fork branches:
-
-- `official-qwen3-tts-upstream-runtime`: minimal-diff correctness/runtime branch.
-- `qwen3-tts-highperf-runtime-w8a16`: product high-performance branch for the
-  current Orin highperf artifacts (explicit Qwen3-TTS backend, W8A16 plugin/runtime,
-  CP runtime optimizations + GPU CP kernels, stateful Code2Wav runner). These
-  runtime changes are also captured as `engine-overlay/` patches above.
-
-Do not deploy highperf artifacts against EdgeLLM `main`.
 
 ## ONNX export
 
@@ -213,6 +283,28 @@ bash scripts/verify_reproduction.sh \
     [--embedding /tmp/precomputed_speaker_emb.b64]
 ```
 
+## Qwen3 runtime profiles & EdgeLLM branches
+
+Two Qwen profiles are maintained:
+
+- `official`: minimal-diff EdgeLLM-compatible path for correctness and upstream review.
+- `highperf`: product path for low-latency Qwen3 ASR + Qwen3 TTS dual residency on Orin.
+
+Jetson Voice consumes these via the JSON profiles under `configs/profiles/` and
+the artifact manifest `deploy/artifacts/qwen3_manifest.json`.
+`multilanguage-qwen-highperf` targets the Nano artifact set;
+`multilanguage-qwen-highperf-nx` targets NX-native engines.
+
+The corresponding TensorRT-Edge-LLM fork branches:
+
+- `official-qwen3-tts-upstream-runtime`: minimal-diff correctness/runtime branch.
+- `qwen3-tts-highperf-runtime-w8a16`: product high-performance branch for the
+  current Orin highperf artifacts (explicit Qwen3-TTS backend, W8A16 plugin/runtime,
+  CP runtime optimizations + GPU CP kernels, stateful Code2Wav runner). These
+  runtime changes are also captured as `engine-overlay/` patches above.
+
+Do not deploy highperf artifacts against EdgeLLM `main`.
+
 ## Qwen3 voice clone
 
 > **Note:** voice cloning is the **base Qwen3-TTS** path only. **Qwen3-CustomVoice**
@@ -248,80 +340,6 @@ NX. Performance numbers in
 `docs/performance/qwen3-orin-profiles-2026-05-10.md` (V2V `EOS → first audio`
 611–637 ms).
 
-## Performance
-
-Measured 2026-06-22. JetPack 6, TensorRT 10. All RTF = synthesis time / audio duration
-(lower is better; < 1.0 means faster than real-time). TTFA = time to first audio chunk
-via HTTP `/tts/stream` (true streaming, measured with `bench/bench_http_tts_stream.py`).
-Direct-backend latency (no service) measured with `bench/bench_*.py`, 3 trials after 1 warmup.
-
-**Devices**:
-- **Nano** — Jetson Orin Nano Super 8 GB, SM87
-- **NX** — Jetson Orin NX 16 GB, SM87
-
-### TTS — all backends
-
-| Backend | Languages | Nano TTFA | Nano RTF | NX TTFA | NX RTF |
-|---------|-----------|:---------:|:--------:|:-------:|:------:|
-| **Matcha + Vocos TRT** | zh, en | ❌ no vocos TRT | — | **28–75 ms** | **0.015–0.021** |
-| **Kokoro TRT** (hybrid) | en | — | 0.54–0.55 | ❌ no artifact | — |
-| **Qwen3-TTS FP16** (v0.8.0) | zh, en, 52 lang | ~1.1 s¹ | 0.73 | ~1.2 s¹ | 0.70–0.71 |
-| **Qwen3-TTS int4-AWQ** (v0.8.0) | zh, en, 52 lang | ~0.7 s¹ | **0.65** | ~0.65 s¹ | **0.63** |
-
-> ¹ Qwen3-TTS TTFA is estimated from IPC worker total-synthesis time ÷ first-chunk fraction.
-> True HTTP streaming TTFA for Qwen3-TTS is not yet measured (service not currently deployed
-> with Qwen3-TTS backend; Matcha is active on NX). int4-AWQ is **~10–11% faster** than FP16.
-> fp8 text embedding is blocked (missing scale tensors in export).
-
-> **Matcha** — NX: full-ORT acoustic + TRT vocos, 16 kHz, preload 2.9 s. Nano: ❌ missing
-> `vocos_fp16.engine` (build: `trtexec --onnx=vocos-16khz-univ.onnx --fp16 --saveEngine=...`).
-
-> **Kokoro** — Nano: hybrid prefix TRT + ORT suffix, 24 kHz, preload ~3.2 s, speaker 52.
-> NX: ❌ no vocos TRT engine and no Kokoro hybrid artifact set.
-
-> **Qwen3-TTS** — v0.8.0 worker (`voxedge explicit-KV` confirmed via `strings`).
-> FP16: Nano preload 7.5 s, NX preload 6.1 s. int4-AWQ: talker 235 MB vs 526 MB FP16;
-> Nano preload 35.6 s (first load; engine smaller but JIT slower). 24 kHz output.
-
-#### Matcha TRT — NX HTTP streaming detail (`/tts/stream`, seeed-voice service)
-
-| Text | TTFA mean | TTFA min | Total mean | RTF |
-|------|:---------:|:--------:|:----------:|:---:|
-| "你好，世界！" | 32 ms | 28 ms | 36 ms | 0.020 |
-| "今天天气怎么样？" | 32 ms | 29 ms | 37 ms | 0.019 |
-| "请告诉我最近的新闻。" | 44 ms | 43 ms | 49 ms | 0.021 |
-| "Hello, how are you today?" | 38 ms | 34 ms | 44 ms | 0.017 |
-| "欢迎使用语音合成服务，希望您有一个愉快的体验。" | 56 ms | 42 ms | 70 ms | 0.015 |
-| "TensorRT accelerates deep learning…" | 75 ms | 52 ms | 88 ms | 0.015 |
-
-#### Qwen3-TTS — direct backend detail (IPC worker, total synthesis time)
-
-| Text | Nano FP16 | Nano int4 | NX FP16 | NX int4 |
-|------|:---------:|:---------:|:-------:|:-------:|
-| "你好，世界！" | 1065 ms / RTF 0.74 | 1311 ms / RTF 0.655 | 1197 ms / RTF 0.713 | 1259 ms / RTF 0.629 |
-| "今天天气怎么样？" | 1064 ms / 0.739 | 1257 ms / 0.655 | 1137 ms / 0.711 | 1259 ms / 0.630 |
-| "请告诉我最近的新闻。" | 1527 ms / 0.734 | 1413 ms / 0.655 | 1531 ms / 0.709 | 1407 ms / 0.628 |
-| "Hello, how are you today?" | 1816 ms / 0.732 | 1672 ms / 0.653 | 1979 ms / 0.707 | 1209 ms / 0.630 |
-| "欢迎使用语音合成服务…" | 3149 ms / 0.729 | 2968 ms / 0.651 | 2926 ms / 0.704 | 1358 ms / 0.629 |
-| "TensorRT accelerates…" | 3555 ms / 0.729 | 4884 ms / 0.650 | 4099 ms / 0.702 | 3303 ms / 0.626 |
-
-### ASR — all backends
-
-| Backend | Languages | Nano latency | NX latency |
-|---------|-----------|:------------:|:----------:|
-| **Qwen3-ASR int4** (v0.8.0 worker) | 52 | ~60 ms¹ | ~55 ms¹ |
-| **Qwen3-ASR FP16** (v0.8.0 worker) | 52 | ~60 ms¹ | ❌ hangs |
-| **Paraformer TRT** | zh, en, ja, ko | ❌ no engine | ❌ no decoder engine |
-
-> ¹ Synthetic 2 s WAV (440 Hz tone, 16 kHz). Empty transcript (no real speech); latency
-> = worker roundtrip overhead only. Real-speech latency scales with audio length.
-
-> **Qwen3-ASR int4** — Nano: worker v0.8.0 (`be7bee91`), int4 engines
-> (`qwen3-asr-0.6b-int4-v080-deploy/`), preload 7.96 s. NX: same v0.8.0 worker,
-> int4 engines (`~/qwen3-asr-int4-engines/`, LLM 526 MB + audio encoder 364 MB).
-> NX FP16 hangs silently on all inference calls — device-specific TRT runtime issue;
-> int4 confirmed stable on both.
-
 ## Benchmarking
 
 The `bench/` directory has two kinds of scripts:
@@ -338,7 +356,7 @@ The `bench/` directory has two kinds of scripts:
 # Direct-backend: set PYTHONPATH to the voxedge checkout
 export PYTHONPATH=~/voxedge-test
 
-# HTTP streaming: start seeed-voice service first (port 8621 by default)
+# HTTP streaming: start the service first (port 8621 by default)
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
@@ -381,8 +399,7 @@ python3 bench/bench_qwen3_tts.py \
 
 Key args: `--qwen3-profile` (highperf/official), `--text`, `--output-jsonl`.
 Worker binary must be compiled against the same runtime version as the engines
-(check the `[version.cpp] Model version X does not match runtime version Y`
-warning).
+(check the `[version.cpp] Model version X does not match runtime version Y` warning).
 
 ### `bench/bench_matcha.py` — Matcha TRT TTS
 
@@ -397,8 +414,7 @@ python3 bench/bench_matcha.py \
 ```
 
 Key args: `--acoustic-ep` (SPLIT_TRT or empty for full-ORT),
-`--vocos-engine` (TRT engine path), `--skip-if-no-vocos` (exit 0 instead of
-error when vocos TRT engine missing), `--text`, `--output-jsonl`.
+`--vocos-engine` (TRT engine path), `--skip-if-no-vocos`, `--text`, `--output-jsonl`.
 
 ### `bench/bench_qwen3_asr.py` — Qwen3-ASR worker
 
@@ -415,8 +431,6 @@ python3 bench/bench_qwen3_asr.py \
 `--audio-enc-dir` must be the **parent** of the `audio/` subdirectory (i.e., the
 directory containing `audio/config.json` and `audio/audio_encoder.engine`).
 If `--audio` is omitted, a synthetic 2 s 440 Hz tone at 16 kHz is used.
-Key args: `--worker-bin` (auto-detected as `qwen3_asr_worker` in `--worker-build`),
-`--warmup`, `--skip-warmup`, `--output-jsonl`.
 
 ### `bench/bench_paraformer.py` — Paraformer TRT ASR
 
@@ -430,5 +444,25 @@ python3 bench/bench_paraformer.py \
 
 Requires a decoder TRT engine (`--decoder-engine`). Encoder falls back to ORT
 CUDA EP if TRT encoder produces NaN (auto-detected). `--encoder-engine` and
-`--encoder-onnx` are both optional; if neither is given the backend uses ORT ONNX.
-Key args: `--tokens` (tokens.txt path), `--output-jsonl`.
+`--encoder-onnx` are both optional.
+
+## Contributing
+
+This repo is the Jetson engine build component of [OpenVoiceStream](https://github.com/suharvest/openvoicestream). Bug reports and pull requests are welcome.
+
+- **Engine bugs / build failures** — open an issue here
+- **Product / Docker / deployment issues** — open an issue in [openvoicestream](https://github.com/suharvest/openvoicestream)
+- **Agent operating guide** — see `AGENTS.md` for coding agent conventions in this repo
+- **Patch / overlay changes** — read `engine-overlay/DIVERGENCE.md` before modifying; some patches are PR-pending upstream and must not be force-submitted
+
+## Acknowledgements
+
+- [NVIDIA TensorRT-Edge-LLM](https://github.com/NVIDIA/TensorRT-Edge-LLM) — the upstream engine framework this repo forks and extends
+- [Qwen3-TTS / Qwen3-ASR](https://github.com/QwenLM/Qwen3-TTS) — Alibaba Qwen3 speech models
+- [Matcha-TTS](https://github.com/shivammehta25/Matcha-TTS) — non-autoregressive TTS acoustic model
+- [Kokoro](https://github.com/thewh1teagle/kokoro-onnx) — lightweight neural TTS
+- [MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS) — compact TTS with paged-KV support
+
+## License
+
+[Apache-2.0](LICENSE)
