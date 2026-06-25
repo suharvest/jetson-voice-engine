@@ -2,26 +2,38 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 Seeed / jetson-voice-engine. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * SparkTTS controllable-TTS resident C++ worker (S1: non-streaming, N=1, per-slot
- * resource structure in place for N>1).
+ * SparkTTS controllable-TTS resident C++ worker.
  *
- * Pipeline (all TRT, no Python round-trip — see spec docs/specs/sparktts-streaming-worker.md §4):
- *   stdin JSON-line  {id,text,gender,pitch,speed, temperature/top_k/top_p, max_tokens, ...}
- *     → controllable prompt  <|task_controllable_tts|><|start_content|>TEXT<|end_content|>
- *                            <|start_style_label|><|gender_G|><|pitch_label_P|><|speed_label_S|><|end_style_label|>
- *     → LLMInferenceRuntime greedy decode (batch path) → outputText
- *     → regex parse 32 bicodec_global_*  +  T bicodec_semantic_*
- *     → speaker_decoder engine: global[1,1,32] int64 → d_vector[1,1024] f32
- *     → BiCodec vocoder engine: semantic[1,T] int64 + d_vector[1,1024] → wav[1,1,L] f32 @16kHz
- *     → stdout JSON-line  event=done {output_file/audio_b64, samples, ...}
+ * S1: non-streaming N=1, per-slot resource structure.
+ * S2: LLM decode driven by edge-llm StreamChannel (incremental per-token consumption),
+ *     d_vector triggered the moment 32 bicodec_global tokens are collected, mid-stream
+ *     cancel via {"type":"cancel","id":...}, and a hard max-token cap as a runaway safety
+ *     valve (the mixed-precision LLM can fail to emit EOS on some ZH inputs). S2 does NOT
+ *     yet chunk the vocoder (that is S3): semantic tokens are collected incrementally and
+ *     vocoded as one segment once decode terminates.
  *
- * Concurrency (§5): SlotPool<SparkTTSSlot>. N=1 for S1, but every per-request mutable
- * resource (speaker_decoder + BiCodec IExecutionContext, CUDA stream, I/O device buffers,
- * d_vector buffer) is owned PER-SLOT, never as a singleton/class-level mutable — this is the
- * hard requirement that avoids the StatefulCode2WavRunner concurrent-reset class of bug
- * (memory MEMORY: tts_n2_throughput_investigation). The TRT engines themselves are SHARED
- * read-only; only execution contexts are per-slot. The LLM runtime is a single shared object
- * for S1/N=1; S2/S4 will give each slot its own LLM execution context (documented below).
+ * Pipeline (all TRT, no Python round-trip — spec docs/specs/sparktts-streaming-worker.md §4):
+ *   stdin JSONL {id,text,gender,pitch,speed, top_k/temperature/top_p, max_tokens, ...}
+ *     → controllable prompt (raw, no chat template)
+ *     → [decode thread] LLMInferenceRuntime.handleRequest with an attached StreamChannel
+ *     → [consumer] drain StreamChannel per iteration → parse delta tokenIds by id range:
+ *         global  id∈[151665,155760] → index = id-151665   (collect 32 → trigger d_vector)
+ *         semantic id∈[155761,163952] → index = id-155761
+ *     → speaker_decoder engine (global[1,1,32]→d_vector[1,1024]) the moment 32 global arrive
+ *     → BiCodec engine (semantic[1,T]+d_vector[1,1024]→16kHz wav) after decode finishes
+ *     → stdout JSONL: token-progress chunks + done {output_file/audio_b64,...} | cancelled | error
+ *
+ * Concurrency (§5.3): SlotPool<SparkTTSSlot>. N=1 for S1/S2, but every per-request mutable
+ * resource (LLM runtime, speaker_decoder + BiCodec IExecutionContext, CUDA stream, I/O
+ * device buffers, d_vector buffer, StreamChannel) is owned PER-SLOT — shared engines are
+ * read-only. No singleton/class-level mutable state (avoids the StatefulCode2WavRunner
+ * concurrent-reset class of bug, MEMORY tts_n2_throughput_investigation). N>1 (S4) reuses
+ * this structure unchanged; the StreamChannel consumer is already per-slot.
+ *
+ * Cancel: the plain LLMInferenceRuntime observes cancellation through the StreamChannel
+ * (channel->cancel() → applyCancellationToFinishStates at the top of each decode iteration,
+ * llmInferenceRuntime.cpp:709,729). cancelMap routes {"type":"cancel","id":X} to the slot's
+ * in-flight channel. StreamChannelFinalizer guarantees the consumer always unblocks.
  */
 
 #include "common/checkMacros.h"
@@ -30,22 +42,28 @@
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
 #include "runtime/slotPool.h"
+#include "runtime/streaming.h"
 
 #include <NvInfer.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace trt_edgellm;
@@ -59,10 +77,10 @@ namespace
 // --------------------------------------------------------------------------- args
 struct Args
 {
-    std::string llmEngineDir;            //!< mixed-precision SparkTTS LLM engine dir
-    std::string speakerDecoderEngine;    //!< sparktts_speaker_decoder.fp32.engine (global ids -> d_vector)
-    std::string bicodecEngine;           //!< bicodec_decoder_dynT.fp16.engine (semantic + d_vector -> wav)
-    int32_t maxSlots{1};                 //!< per-slot concurrency (S1: 1; N>1 reserved)
+    std::string llmEngineDir;
+    std::string speakerDecoderEngine;
+    std::string bicodecEngine;
+    int32_t maxSlots{1};
     int32_t sampleRate{16000};
     bool debug{false};
 };
@@ -84,9 +102,9 @@ void printUsage(char const* prog)
               << " --llmEngineDir=<dir> --speakerDecoderEngine=<file.engine> --bicodecEngine=<file.engine>"
               << " [--maxSlots=N] [--sampleRate=16000] [--debug]\n\n"
               << "Reads JSON lines from stdin:\n"
-              << "  {\"id\":\"1\",\"text\":\"你好。\",\"gender\":\"female\",\"pitch\":\"moderate\",\"speed\":\"moderate\","
-                 "\"output_file\":\"/tmp/out.wav\"}\n"
-              << "Writes JSON lines to stdout (event=ready|done|chunk|error).\n";
+              << "  {\"id\":\"1\",\"text\":\"你好。\",\"gender\":\"female\",\"pitch\":\"moderate\",\"speed\":\"moderate\"}\n"
+              << "  {\"type\":\"cancel\",\"id\":\"1\"}\n"
+              << "Writes JSON lines to stdout (event=ready|token_progress|done|cancelled|error).\n";
 }
 
 bool parseArgs(Args& a, int argc, char** argv)
@@ -114,11 +132,10 @@ bool parseArgs(Args& a, int argc, char** argv)
 }
 
 // --------------------------------------------------------------------------- controllable prompt
-// Matches spike make_llm_input.py / single_in.py exactly (raw prompt, NO chat template).
 int genderId(std::string const& g)
 {
     if (g == "male" || g == "1") return 1;
-    return 0; // female default
+    return 0;
 }
 int levelId(std::string const& l)
 {
@@ -129,8 +146,8 @@ int levelId(std::string const& l)
     if (l == "very_high" || l == "4") return 4;
     return 2;
 }
-std::string buildControllablePrompt(std::string const& text, std::string const& gender, std::string const& pitch,
-    std::string const& speed)
+std::string buildControllablePrompt(
+    std::string const& text, std::string const& gender, std::string const& pitch, std::string const& speed)
 {
     std::string attr = "<|gender_" + std::to_string(genderId(gender)) + "|><|pitch_label_"
         + std::to_string(levelId(pitch)) + "|><|speed_label_" + std::to_string(levelId(speed)) + "|>";
@@ -138,38 +155,17 @@ std::string buildControllablePrompt(std::string const& text, std::string const& 
         + "<|end_style_label|>";
 }
 
-// --------------------------------------------------------------------------- token parse
-// SparkTTS bicodec tokens are `normalized` non-special added tokens, so the C++ tokenizer's
-// decode() does NOT render `<|bicodec_global_N|>` back into the output text — text-regex on
-// outputText parses 0. We therefore parse directly from outputIds by token-id range, which is
-// the robust contract (mirrors spike extract_mixed_tokens.py id->content map):
-//   global  : id in [151665, 155760] -> index = id - 151665   (4096 codebook)
-//   semantic: id in [155761, 163952] -> index = id - 155761   (8192 codebook)
-// Ranges are taken from sparktts_llm_mixed_engine/tokenizer.json added_tokens.
+// --------------------------------------------------------------------------- bicodec token id ranges
+// SparkTTS bicodec tokens are `normalized` non-special added tokens -> tokenizer decode()
+// drops them, so we parse from token IDs (sparktts_llm_mixed_engine/tokenizer.json):
+//   global  : id [151665, 155760] -> index = id - 151665   (4096 codebook)
+//   semantic: id [155761, 163952] -> index = id - 155761   (8192 codebook)
 constexpr int32_t kGlobalIdBase = 151665;
 constexpr int32_t kGlobalIdEnd = 155760;
 constexpr int32_t kSemanticIdBase = 155761;
 constexpr int32_t kSemanticIdEnd = 163952;
 
-struct ParsedTokens
-{
-    std::vector<int32_t> global;   // expect 32
-    std::vector<int32_t> semantic; // T
-};
-ParsedTokens parseTokensFromIds(std::vector<int32_t> const& ids)
-{
-    ParsedTokens p;
-    for (int32_t id : ids)
-    {
-        if (id >= kGlobalIdBase && id <= kGlobalIdEnd)
-            p.global.push_back(id - kGlobalIdBase);
-        else if (id >= kSemanticIdBase && id <= kSemanticIdEnd)
-            p.semantic.push_back(id - kSemanticIdBase);
-    }
-    return p;
-}
-
-// --------------------------------------------------------------------------- raw TRT engine (shared, read-only)
+// --------------------------------------------------------------------------- raw TRT helpers
 nvinfer1::ICudaEngine* deserializeEngine(nvinfer1::IRuntime* runtime, std::string const& path)
 {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -198,46 +194,6 @@ std::string tensorName(nvinfer1::ICudaEngine* e, nvinfer1::TensorIOMode mode, in
     throw std::runtime_error("IO tensor not found");
 }
 
-// --------------------------------------------------------------------------- PER-SLOT state (§5.3 hard requirement)
-// Everything mutable per request lives here. For N>1 the SlotPool holds N of these; each slot
-// runs end-to-end on its own CUDA stream + own execution contexts + own d_vector buffer. No
-// singleton / class-level mutable state is permitted (avoids the StatefulCode2WavRunner
-// concurrent-reset illegal-memory-access bug, MEMORY tts_n2_throughput_investigation).
-struct SparkTTSSlot
-{
-    int32_t slotId{0};
-    std::atomic<bool> inUse{false};
-
-    cudaStream_t stream{nullptr};
-
-    // Per-slot execution contexts over the SHARED engines (engines are read-only).
-    nvinfer1::IExecutionContext* spkCtx{nullptr};      // speaker_decoder
-    nvinfer1::IExecutionContext* bicodecCtx{nullptr};  // BiCodec vocoder
-
-    // Per-slot reusable d_vector host buffer (computed each request from this slot's globals).
-    std::vector<float> dVector; // [1024]
-
-    SparkTTSSlot() = default;
-    SparkTTSSlot(SparkTTSSlot const&) = delete;
-    SparkTTSSlot& operator=(SparkTTSSlot const&) = delete;
-
-    void init(nvinfer1::ICudaEngine* spkEngine, nvinfer1::ICudaEngine* bicodecEngine)
-    {
-        CUDA_CHECK(cudaStreamCreate(&stream));
-        spkCtx = spkEngine->createExecutionContext();
-        bicodecCtx = bicodecEngine->createExecutionContext();
-        if (!spkCtx || !bicodecCtx) throw std::runtime_error("createExecutionContext failed");
-        dVector.assign(1024, 0.0f);
-    }
-    ~SparkTTSSlot()
-    {
-        if (spkCtx) delete spkCtx;
-        if (bicodecCtx) delete bicodecCtx;
-        if (stream) cudaStreamDestroy(stream);
-    }
-};
-
-// --------------------------------------------------------------------------- GPU device-buffer RAII helper
 struct DevBuf
 {
     void* ptr{nullptr};
@@ -257,65 +213,129 @@ struct DevBuf
     }
 };
 
-// speaker_decoder: global int64[1,1,32] -> d_vector f32[1024] (into slot.dVector)
+// --------------------------------------------------------------------------- PER-SLOT state (§5.3)
+struct SparkTTSSlot
+{
+    int32_t slotId{0};
+    std::atomic<bool> inUse{false};
+    std::atomic<bool> shutdown{false};
+
+    // Per-slot LLM runtime (S1/S2 N=1: each slot owns one; for N>1 (S4) slots 1..N-1 share
+    // slot 0's engine weights via the shared-engine ctor — structure already per-slot).
+    std::unique_ptr<LLMInferenceRuntime> llm;
+    cudaStream_t llmStream{nullptr};
+
+    // Per-slot execution contexts over the SHARED read-only vocoder engines.
+    cudaStream_t vocStream{nullptr};
+    nvinfer1::IExecutionContext* spkCtx{nullptr};
+    nvinfer1::IExecutionContext* bicodecCtx{nullptr};
+    std::vector<float> dVector; // [1024]
+
+    // Single-slot handoff queue (stdin reader -> this slot's worker thread).
+    std::mutex queueMu;
+    std::condition_variable queueCv;
+    std::deque<Json> queue;
+    std::thread worker;
+
+    // The StreamChannel of the in-flight request (for cancel routing). Guarded by chanMu.
+    std::mutex chanMu;
+    std::shared_ptr<StreamChannel> activeChannel;
+
+    SparkTTSSlot() = default;
+    SparkTTSSlot(SparkTTSSlot const&) = delete;
+    SparkTTSSlot& operator=(SparkTTSSlot const&) = delete;
+    ~SparkTTSSlot()
+    {
+        if (spkCtx) delete spkCtx;
+        if (bicodecCtx) delete bicodecCtx;
+        if (vocStream) cudaStreamDestroy(vocStream);
+        if (llmStream) cudaStreamDestroy(llmStream);
+    }
+};
+
+// --------------------------------------------------------------------------- stdout serialization
+std::mutex gCoutMutex;
+void emitEvent(Json payload)
+{
+    std::string const line = payload.dump();
+    std::lock_guard<std::mutex> lk(gCoutMutex);
+    std::cout << line << std::endl;
+}
+
+// --------------------------------------------------------------------------- cancel routing (id -> slot's channel)
+std::mutex gCancelMu;
+std::unordered_map<std::string, SparkTTSSlot*> gCancelMap;
+void registerCancel(std::string const& id, SparkTTSSlot* slot)
+{
+    std::lock_guard<std::mutex> lk(gCancelMu);
+    gCancelMap[id] = slot;
+}
+void unregisterCancel(std::string const& id)
+{
+    std::lock_guard<std::mutex> lk(gCancelMu);
+    gCancelMap.erase(id);
+}
+bool tripCancel(std::string const& id)
+{
+    std::shared_ptr<StreamChannel> chan;
+    {
+        std::lock_guard<std::mutex> lk(gCancelMu);
+        auto it = gCancelMap.find(id);
+        if (it == gCancelMap.end()) return false;
+        SparkTTSSlot* slot = it->second;
+        std::lock_guard<std::mutex> clk(slot->chanMu);
+        chan = slot->activeChannel;
+    }
+    if (!chan) return false;
+    chan->cancel(); // observed by the decode loop next iteration; wakes the blocked consumer
+    return true;
+}
+
+// --------------------------------------------------------------------------- vocoder engine runs (per-slot ctx)
 void runSpeakerDecoder(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng, std::vector<int32_t> const& global32)
 {
-    if (global32.size() != 32) throw std::runtime_error("speaker_decoder expects 32 global tokens, got "
-        + std::to_string(global32.size()));
+    if (global32.size() != 32)
+        throw std::runtime_error("speaker_decoder expects 32 global tokens, got " + std::to_string(global32.size()));
     std::string const inName = tensorName(eng, nvinfer1::TensorIOMode::kINPUT);
     std::string const outName = tensorName(eng, nvinfer1::TensorIOMode::kOUTPUT);
-
-    std::vector<int64_t> idx(global32.begin(), global32.end()); // [32] int64
+    std::vector<int64_t> idx(global32.begin(), global32.end());
     slot.spkCtx->setInputShape(inName.c_str(), nvinfer1::Dims3{1, 1, 32});
-
     DevBuf dIn, dOut;
     dIn.alloc(idx.size() * sizeof(int64_t));
     dOut.alloc(1024 * sizeof(float));
-    CUDA_CHECK(cudaMemcpyAsync(dIn.ptr, idx.data(), idx.size() * sizeof(int64_t), cudaMemcpyHostToDevice, slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(dIn.ptr, idx.data(), idx.size() * sizeof(int64_t), cudaMemcpyHostToDevice, slot.vocStream));
     slot.spkCtx->setTensorAddress(inName.c_str(), dIn.ptr);
     slot.spkCtx->setTensorAddress(outName.c_str(), dOut.ptr);
-    if (!slot.spkCtx->enqueueV3(slot.stream)) throw std::runtime_error("speaker_decoder enqueueV3 failed");
-    CUDA_CHECK(cudaMemcpyAsync(slot.dVector.data(), dOut.ptr, 1024 * sizeof(float), cudaMemcpyDeviceToHost, slot.stream));
-    CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+    if (!slot.spkCtx->enqueueV3(slot.vocStream)) throw std::runtime_error("speaker_decoder enqueueV3 failed");
+    CUDA_CHECK(cudaMemcpyAsync(slot.dVector.data(), dOut.ptr, 1024 * sizeof(float), cudaMemcpyDeviceToHost, slot.vocStream));
+    CUDA_CHECK(cudaStreamSynchronize(slot.vocStream));
 }
 
-// BiCodec: semantic int64[1,T] + d_vector f32[1,1024] -> wav f32[1,1,L]; returns samples
 std::vector<float> runBicodec(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng, std::vector<int32_t> const& semantic)
 {
-    std::string const semName = tensorName(eng, nvinfer1::TensorIOMode::kINPUT, 0);
-    std::string const dvName = tensorName(eng, nvinfer1::TensorIOMode::kINPUT, 1);
+    std::string const semTensor = "semantic_tokens";
+    std::string const dvTensor = "d_vector";
     std::string const outName = tensorName(eng, nvinfer1::TensorIOMode::kOUTPUT, 0);
-    // Engine IO order: input0=semantic_tokens, input1=d_vector (verified). Be name-robust:
-    std::string semTensor = semName, dvTensor = dvName;
-    if (semName == "d_vector" || dvName == "semantic_tokens")
-    {
-        semTensor = "semantic_tokens";
-        dvTensor = "d_vector";
-    }
-
     int64_t const T = static_cast<int64_t>(semantic.size());
     std::vector<int64_t> sem64(semantic.begin(), semantic.end());
     slot.bicodecCtx->setInputShape(semTensor.c_str(), nvinfer1::Dims2{1, T});
     slot.bicodecCtx->setInputShape(dvTensor.c_str(), nvinfer1::Dims2{1, 1024});
-
     DevBuf dSem, dDv, dOut;
     dSem.alloc(sem64.size() * sizeof(int64_t));
     dDv.alloc(1024 * sizeof(float));
-    // Output shape resolved after input shapes are set.
     nvinfer1::Dims const outDims = slot.bicodecCtx->getTensorShape(outName.c_str());
     int64_t L = 1;
     for (int d = 0; d < outDims.nbDims; ++d) L *= outDims.d[d];
     dOut.alloc(static_cast<size_t>(L) * sizeof(float));
-
-    CUDA_CHECK(cudaMemcpyAsync(dSem.ptr, sem64.data(), sem64.size() * sizeof(int64_t), cudaMemcpyHostToDevice, slot.stream));
-    CUDA_CHECK(cudaMemcpyAsync(dDv.ptr, slot.dVector.data(), 1024 * sizeof(float), cudaMemcpyHostToDevice, slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(dSem.ptr, sem64.data(), sem64.size() * sizeof(int64_t), cudaMemcpyHostToDevice, slot.vocStream));
+    CUDA_CHECK(cudaMemcpyAsync(dDv.ptr, slot.dVector.data(), 1024 * sizeof(float), cudaMemcpyHostToDevice, slot.vocStream));
     slot.bicodecCtx->setTensorAddress(semTensor.c_str(), dSem.ptr);
     slot.bicodecCtx->setTensorAddress(dvTensor.c_str(), dDv.ptr);
     slot.bicodecCtx->setTensorAddress(outName.c_str(), dOut.ptr);
-    if (!slot.bicodecCtx->enqueueV3(slot.stream)) throw std::runtime_error("BiCodec enqueueV3 failed");
+    if (!slot.bicodecCtx->enqueueV3(slot.vocStream)) throw std::runtime_error("BiCodec enqueueV3 failed");
     std::vector<float> wav(static_cast<size_t>(L));
-    CUDA_CHECK(cudaMemcpyAsync(wav.data(), dOut.ptr, static_cast<size_t>(L) * sizeof(float), cudaMemcpyDeviceToHost, slot.stream));
-    CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(wav.data(), dOut.ptr, static_cast<size_t>(L) * sizeof(float), cudaMemcpyDeviceToHost, slot.vocStream));
+    CUDA_CHECK(cudaStreamSynchronize(slot.vocStream));
     return wav;
 }
 
@@ -330,7 +350,6 @@ std::vector<int16_t> floatToPcm16(std::vector<float> const& s)
     }
     return p;
 }
-
 bool saveWav16(std::string const& path, std::vector<float> const& samples, int32_t sr)
 {
     auto pcm = floatToPcm16(samples);
@@ -349,7 +368,6 @@ bool saveWav16(std::string const& path, std::vector<float> const& samples, int32
     f.write(reinterpret_cast<char const*>(pcm.data()), dataBytes);
     return static_cast<bool>(f);
 }
-
 std::string base64(uint8_t const* d, size_t n)
 {
     static constexpr char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -367,6 +385,215 @@ std::string base64(uint8_t const* d, size_t n)
     return o;
 }
 
+// --------------------------------------------------------------------------- shared engines (read-only)
+nvinfer1::ICudaEngine* gSpkEngine{nullptr};
+nvinfer1::ICudaEngine* gBicodecEngine{nullptr};
+int32_t gSampleRate{16000};
+
+// --------------------------------------------------------------------------- process ONE request (S2 streaming)
+void processRequest(SparkTTSSlot& slot, Json const& item)
+{
+    std::string const id = item.value("id", "");
+    auto const reqStart = std::chrono::steady_clock::now();
+
+    auto channel = StreamChannel::create();
+    channel->setSkipSpecialTokens(false); // we parse from tokenIds, not text
+    {
+        std::lock_guard<std::mutex> clk(slot.chanMu);
+        slot.activeChannel = channel;
+    }
+    if (!id.empty()) registerCancel(id, &slot);
+
+    std::thread decodeThread;
+    try
+    {
+        std::string const text = item.value("text", "");
+        std::string const gender = item.value("gender", "female");
+        std::string const pitch = item.value("pitch", "moderate");
+        std::string const speed = item.value("speed", "moderate");
+        std::string const chunkTransport = item.value("chunk_transport", "file");
+        bool const emitTokenProgress = item.value("emit_token_progress", true);
+        int32_t const maxSemantic = item.value("max_semantic", 600); // BiCodec dynamic-T profile cap
+        std::string outputFile = item.value("output_file", "");
+        if (outputFile.empty()) outputFile = "/tmp/spark_tts_worker_" + id + ".wav";
+        if (text.empty()) throw std::runtime_error("empty text");
+
+        LLMGenerationRequest req;
+        LLMGenerationRequest::Request r;
+        Message msg;
+        msg.role = "user";
+        Message::MessageContent c;
+        c.type = "text";
+        c.content = buildControllablePrompt(text, gender, pitch, speed);
+        msg.contents.push_back(std::move(c));
+        r.messages.push_back(std::move(msg));
+        req.requests.push_back(std::move(r));
+        req.temperature = item.value("temperature", 1.0f);
+        req.topP = item.value("top_p", 1.0f);
+        req.topK = item.value("top_k", 1);
+        // Hard runaway cap: the mixed-precision LLM can fail to emit EOS on some ZH inputs.
+        // maxGenerateLength bounds decode regardless; the runtime also clamps to KV capacity
+        // ("Reduce max generation length"). 32 global + ~700 semantic covers a clean utterance.
+        req.maxGenerateLength = item.value("max_tokens", 800);
+        req.applyChatTemplate = item.value("apply_chat_template", false);
+        req.addGenerationPrompt = item.value("add_generation_prompt", false);
+        req.enableThinking = false;
+        req.streamChannels = {channel};
+
+        std::string decodeErr;
+        decodeThread = std::thread([&]() {
+            try
+            {
+                LLMGenerationResponse resp;
+                slot.llm->handleRequest(req, resp, slot.llmStream);
+            }
+            catch (std::exception const& e)
+            {
+                decodeErr = e.what();
+            }
+        });
+
+        // ---- Consumer: drain StreamChannel, parse tokens incrementally ----
+        std::vector<int32_t> global;
+        std::vector<int32_t> semantic;
+        bool dVectorReady = false;
+        int32_t emittedTokens = 0;
+        std::chrono::steady_clock::time_point dVectorAt{};
+        bool semanticTruncated = false;
+        FinishReason finalReason = FinishReason::kNotFinished;
+        bool finished = false;
+
+        while (!finished)
+        {
+            std::optional<StreamChunk> chunk = channel->waitPop(std::chrono::milliseconds{100});
+            if (chunk.has_value())
+            {
+                for (int32_t tid : chunk->tokenIds)
+                {
+                    if (tid >= kGlobalIdBase && tid <= kGlobalIdEnd)
+                    {
+                        if (global.size() < 32) global.push_back(tid - kGlobalIdBase);
+                    }
+                    else if (tid >= kSemanticIdBase && tid <= kSemanticIdEnd)
+                    {
+                        if (static_cast<int32_t>(semantic.size()) < maxSemantic)
+                            semantic.push_back(tid - kSemanticIdBase);
+                        else
+                            semanticTruncated = true;
+                    }
+                    ++emittedTokens;
+                }
+
+                // Trigger d_vector the instant 32 global tokens are collected (S2 goal 2).
+                if (!dVectorReady && global.size() == 32)
+                {
+                    runSpeakerDecoder(slot, gSpkEngine, global);
+                    dVectorReady = true;
+                    dVectorAt = std::chrono::steady_clock::now();
+                    if (emitTokenProgress)
+                        emitEvent(Json{{"id", id}, {"event", "token_progress"}, {"ok", true},
+                            {"stage", "d_vector_ready"}, {"n_global", 32}, {"n_semantic", semantic.size()},
+                            {"elapsed_ms", std::chrono::duration<double, std::milli>(dVectorAt - reqStart).count()}});
+                }
+                else if (emitTokenProgress && !semantic.empty() && semantic.size() % 50 == 0)
+                {
+                    emitEvent(Json{{"id", id}, {"event", "token_progress"}, {"ok", true}, {"stage", "semantic"},
+                        {"n_global", global.size()}, {"n_semantic", semantic.size()}});
+                }
+
+                if (chunk->finished)
+                {
+                    finalReason = chunk->reason;
+                    finished = true;
+                }
+            }
+            else if (channel->isFinished() || channel->isCancelled())
+            {
+                finalReason = channel->getReason();
+                finished = true;
+            }
+        }
+
+        if (decodeThread.joinable()) decodeThread.join();
+
+        // ---- Cancelled: terminal cancelled event, no audio ----
+        if (finalReason == FinishReason::kCancelled || channel->isCancelled())
+        {
+            emitEvent(Json{{"id", id}, {"event", "cancelled"}, {"ok", true}, {"reason", "cancelled"},
+                {"n_global", global.size()}, {"n_semantic", semantic.size()}, {"tokens_decoded", emittedTokens},
+                {"total_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - reqStart).count()}});
+        }
+        else
+        {
+            if (!decodeErr.empty()) throw std::runtime_error("LLM decode failed: " + decodeErr);
+            if (global.size() != 32)
+                throw std::runtime_error("expected 32 global tokens, parsed " + std::to_string(global.size()));
+            if (semantic.empty()) throw std::runtime_error("no semantic tokens parsed");
+            if (!dVectorReady) runSpeakerDecoder(slot, gSpkEngine, global);
+
+            // ---- Vocode (S2: one segment after decode; S3 will chunk this) ----
+            auto const vocStart = std::chrono::steady_clock::now();
+            std::vector<float> wav = runBicodec(slot, gBicodecEngine, semantic);
+            auto const vocEnd = std::chrono::steady_clock::now();
+
+            double rms = 0.0;
+            for (float v : wav) rms += static_cast<double>(v) * v;
+            rms = wav.empty() ? 0.0 : std::sqrt(rms / wav.size());
+            double const audioS = static_cast<double>(wav.size()) / gSampleRate;
+
+            Json done = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"frames", semantic.size()},
+                {"n_global", global.size()}, {"tokens_decoded", emittedTokens},
+                {"semantic_truncated", semanticTruncated}, {"finish_reason", finishReasonName(finalReason)},
+                {"samples", wav.size()}, {"sample_rate", gSampleRate}, {"audio_s", audioS}, {"rms", rms},
+                {"d_vector_ms", dVectorReady ? std::chrono::duration<double, std::milli>(dVectorAt - reqStart).count() : 0.0},
+                {"vocoder_ms", std::chrono::duration<double, std::milli>(vocEnd - vocStart).count()},
+                {"total_ms", std::chrono::duration<double, std::milli>(vocEnd - reqStart).count()}};
+            if (chunkTransport == "base64")
+            {
+                auto pcm = floatToPcm16(wav);
+                done["audio_b64"] = base64(reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
+                done["bytes"] = pcm.size() * sizeof(int16_t);
+            }
+            else
+            {
+                if (!saveWav16(outputFile, wav, gSampleRate)) throw std::runtime_error("failed to save WAV: " + outputFile);
+                done["output_file"] = outputFile;
+            }
+            emitEvent(std::move(done));
+        }
+    }
+    catch (std::exception const& e)
+    {
+        channel->cancel(); // unblock decode loop so the thread can be joined
+        if (decodeThread.joinable()) decodeThread.join();
+        emitEvent(Json{{"id", id}, {"event", "error"}, {"ok", false}, {"error", e.what()}});
+    }
+
+    if (!id.empty()) unregisterCancel(id);
+    {
+        std::lock_guard<std::mutex> clk(slot.chanMu);
+        slot.activeChannel.reset();
+    }
+}
+
+// --------------------------------------------------------------------------- slot worker thread
+void slotWorkerLoop(SparkTTSSlot* slot)
+{
+    while (true)
+    {
+        Json item;
+        {
+            std::unique_lock<std::mutex> lk(slot->queueMu);
+            slot->queueCv.wait(lk, [&] { return !slot->queue.empty() || slot->shutdown.load(); });
+            if (slot->shutdown.load() && slot->queue.empty()) return;
+            item = std::move(slot->queue.front());
+            slot->queue.pop_front();
+        }
+        processRequest(*slot, item);
+        slot->inUse.store(false, std::memory_order_release); // request complete, slot free
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -379,148 +606,92 @@ int main(int argc, char** argv)
     }
     gLogger.setLevel(args.debug ? nvinfer1::ILogger::Severity::kVERBOSE : nvinfer1::ILogger::Severity::kWARNING);
     auto pluginHandles = loadEdgellmPluginLib();
-
-    cudaStream_t llmStream;
-    CUDA_CHECK(cudaStreamCreate(&llmStream));
+    gSampleRate = args.sampleRate;
 
     auto const t0 = std::chrono::steady_clock::now();
 
-    // --- Shared LLM runtime (S1/N=1: single shared object). ---
-    // For N>1 (S2/S4) each slot will hold its own LLM execution context; the engine weights
-    // stay shared. S1 keeps one runtime and serializes LLM decode behind the slot it owns.
-    std::unordered_map<std::string, std::string> loraWeights;
-    auto llmRuntime = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, llmStream);
-    if (!llmRuntime->captureDecodingCUDAGraph(llmStream))
-        LOG_WARNING("CUDA graph capture failed for SparkTTS LLM, proceeding without.");
-
-    // --- Shared read-only TRT engines for vocoder path. ---
     nvinfer1::IRuntime* trtRuntime = nvinfer1::createInferRuntime(gLogger);
-    nvinfer1::ICudaEngine* spkEngine = deserializeEngine(trtRuntime, args.speakerDecoderEngine);
-    nvinfer1::ICudaEngine* bicodecEngine = deserializeEngine(trtRuntime, args.bicodecEngine);
+    gSpkEngine = deserializeEngine(trtRuntime, args.speakerDecoderEngine);
+    gBicodecEngine = deserializeEngine(trtRuntime, args.bicodecEngine);
 
-    // --- SlotPool (§5): N constructed slots, each with its own contexts/stream/state. ---
     SlotPool<SparkTTSSlot> pool(args.maxSlots);
+    std::unordered_map<std::string, std::string> loraWeights;
     for (int32_t s = 0; s < args.maxSlots; ++s)
     {
         auto slot = std::make_unique<SparkTTSSlot>();
         slot->slotId = s;
-        slot->init(spkEngine, bicodecEngine);
+        CUDA_CHECK(cudaStreamCreate(&slot->llmStream));
+        CUDA_CHECK(cudaStreamCreate(&slot->vocStream));
+        slot->llm = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, slot->llmStream);
+        if (!slot->llm->captureDecodingCUDAGraph(slot->llmStream))
+            LOG_WARNING("CUDA graph capture failed for SparkTTS LLM slot %d, proceeding without.", s);
+        slot->spkCtx = gSpkEngine->createExecutionContext();
+        slot->bicodecCtx = gBicodecEngine->createExecutionContext();
+        if (!slot->spkCtx || !slot->bicodecCtx) throw std::runtime_error("createExecutionContext failed");
+        slot->dVector.assign(1024, 0.0f);
         pool.slots().push_back(std::move(slot));
     }
+    for (auto& slotPtr : pool.slots())
+        slotPtr->worker = std::thread(slotWorkerLoop, slotPtr.get());
 
     double const initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    std::cout << Json{{"event", "ready"}, {"init_ms", initMs}, {"max_slots", args.maxSlots}}.dump() << std::endl;
+    emitEvent(Json{{"event", "ready"}, {"init_ms", initMs}, {"max_slots", args.maxSlots}, {"streaming", true}});
 
     std::string line;
     while (std::getline(std::cin, line))
     {
         if (line.empty()) continue;
-        Json response;
-        auto const reqStart = std::chrono::steady_clock::now();
+        Json item;
         try
         {
-            Json item = Json::parse(line);
-            std::string const id = item.value("id", "");
-            std::string const text = item.value("text", "");
-            std::string const gender = item.value("gender", "female");
-            std::string const pitch = item.value("pitch", "moderate");
-            std::string const speed = item.value("speed", "moderate");
-            std::string const chunkTransport = item.value("chunk_transport", "file");
-            std::string outputFile = item.value("output_file", "");
-            if (outputFile.empty()) outputFile = "/tmp/spark_tts_worker_" + id + ".wav";
-            if (text.empty()) throw std::runtime_error("empty text");
-
-            // S1/N=1: always slot 0 (pool sized 1). N>1 will acquire a free slot here.
-            SparkTTSSlot& slot = *pool.slots()[0];
-
-            // ---- 1. LLM controllable decode (greedy, raw prompt) ----
-            LLMGenerationRequest req;
-            LLMGenerationRequest::Request r;
-            Message msg;
-            msg.role = "user"; // raw concat (applyChatTemplate=false): role label not emitted
-            Message::MessageContent c;
-            c.type = "text";
-            c.content = buildControllablePrompt(text, gender, pitch, speed);
-            msg.contents.push_back(std::move(c));
-            r.messages.push_back(std::move(msg));
-            req.requests.push_back(std::move(r));
-            req.temperature = item.value("temperature", 1.0f);
-            req.topP = item.value("top_p", 1.0f);
-            req.topK = item.value("top_k", 1); // greedy default (matches spike)
-            req.maxGenerateLength = item.value("max_tokens", 3000);
-            req.applyChatTemplate = item.value("apply_chat_template", false);
-            req.addGenerationPrompt = item.value("add_generation_prompt", false);
-            req.enableThinking = false;
-
-            auto const genStart = std::chrono::steady_clock::now();
-            LLMGenerationResponse llmResp;
-            if (!llmRuntime->handleRequest(req, llmResp, llmStream) || llmResp.outputIds.empty())
-                throw std::runtime_error("LLM generation failed");
-            auto const genEnd = std::chrono::steady_clock::now();
-
-            // ---- 2. parse 32 global + T semantic (from output token ids) ----
-            ParsedTokens tk = parseTokensFromIds(llmResp.outputIds[0]);
-            if (tk.global.size() != 32)
-                throw std::runtime_error("expected 32 global tokens, parsed " + std::to_string(tk.global.size()));
-            if (tk.semantic.empty()) throw std::runtime_error("no semantic tokens parsed");
-
-            // BiCodec engine dynamic-T profile is [8..600]. The mixed-precision LLM can run
-            // away on some inputs (e.g. ZH greedy), producing >600 semantic tokens; the spike
-            // CLI e2e (vocode_mixed.py) clamps to 600. Mirror that to (a) stay within the
-            // vocoder profile and (b) align byte-for-byte with the CLI e2e reference. A clean
-            // EOS-terminated decode stays well under 600 and is unaffected.
-            int32_t const maxSemantic = item.value("max_semantic", 600);
-            bool const semanticTruncated = static_cast<int32_t>(tk.semantic.size()) > maxSemantic;
-            if (semanticTruncated) tk.semantic.resize(static_cast<size_t>(maxSemantic));
-
-            // ---- 3. global -> d_vector (speaker_decoder engine, per-slot ctx) ----
-            runSpeakerDecoder(slot, spkEngine, tk.global);
-
-            // ---- 4. d_vector + semantic -> wav (BiCodec engine, per-slot ctx) ----
-            auto const vocStart = std::chrono::steady_clock::now();
-            std::vector<float> wav = runBicodec(slot, bicodecEngine, tk.semantic);
-            auto const vocEnd = std::chrono::steady_clock::now();
-
-            // ---- 5. emit ----
-            double rms = 0.0;
-            for (float v : wav) rms += static_cast<double>(v) * v;
-            rms = wav.empty() ? 0.0 : std::sqrt(rms / wav.size());
-            double const audioS = static_cast<double>(wav.size()) / args.sampleRate;
-
-            response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"frames", tk.semantic.size()},
-                {"n_global", tk.global.size()}, {"semantic_truncated", semanticTruncated},
-                {"samples", wav.size()}, {"sample_rate", args.sampleRate}, {"audio_s", audioS}, {"rms", rms},
-                {"generation_ms", std::chrono::duration<double, std::milli>(genEnd - genStart).count()},
-                {"vocoder_ms", std::chrono::duration<double, std::milli>(vocEnd - vocStart).count()},
-                {"total_ms", std::chrono::duration<double, std::milli>(vocEnd - reqStart).count()}};
-
-            if (chunkTransport == "base64")
-            {
-                auto pcm = floatToPcm16(wav);
-                response["audio_b64"] = base64(reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
-                response["bytes"] = pcm.size() * sizeof(int16_t);
-            }
-            else
-            {
-                if (!saveWav16(outputFile, wav, args.sampleRate))
-                    throw std::runtime_error("failed to save WAV: " + outputFile);
-                response["output_file"] = outputFile;
-            }
+            item = Json::parse(line);
         }
         catch (std::exception const& e)
         {
-            response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}};
+            emitEvent(Json{{"event", "error"}, {"ok", false}, {"error", std::string("invalid JSON: ") + e.what()}});
+            continue;
         }
-        std::cout << response.dump() << std::endl;
+
+        if (item.is_object() && item.value("type", "") == "cancel")
+        {
+            std::string const cid = item.value("id", "");
+            bool const tripped = tripCancel(cid);
+            emitEvent(Json{{"event", "cancel_ack"}, {"id", cid}, {"tripped", tripped}});
+            continue;
+        }
+
+        std::string const id = item.value("id", "");
+        int32_t const slotId = pool.acquireFree();
+        if (slotId < 0)
+        {
+            Json ev = {{"event", "error"}, {"ok", false}, {"error", "pool_saturated"}, {"status", 4429},
+                {"max_slots", args.maxSlots}};
+            if (!id.empty()) ev["id"] = id;
+            emitEvent(std::move(ev));
+            continue;
+        }
+        if (!id.empty()) pool.bind(id, slotId);
+        SparkTTSSlot& slot = *pool.get(slotId);
+        {
+            std::lock_guard<std::mutex> lk(slot.queueMu);
+            slot.queue.push_back(std::move(item));
+        }
+        slot.queueCv.notify_one();
     }
 
-    // Destroy per-slot execution contexts BEFORE the engines that created them (TRT requires
-    // context lifetime < engine lifetime, else API Usage Error 3).
+    // EOF: shutdown workers, join, free GPU (contexts before engines).
+    for (auto& slotPtr : pool.slots())
+    {
+        slotPtr->shutdown.store(true);
+        slotPtr->queueCv.notify_all();
+    }
+    for (auto& slotPtr : pool.slots())
+        if (slotPtr->worker.joinable()) slotPtr->worker.join();
+    for (auto& slotPtr : pool.slots())
+        slotPtr->llm.reset();
     pool.slots().clear();
-    // shared engines / runtime cleanup
-    if (bicodecEngine) delete bicodecEngine;
-    if (spkEngine) delete spkEngine;
+    if (gBicodecEngine) delete gBicodecEngine;
+    if (gSpkEngine) delete gSpkEngine;
     if (trtRuntime) delete trtRuntime;
-    CUDA_CHECK(cudaStreamDestroy(llmStream));
     return EXIT_SUCCESS;
 }
