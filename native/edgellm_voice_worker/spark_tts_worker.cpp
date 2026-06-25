@@ -760,13 +760,29 @@ int main(int argc, char** argv)
 
     SlotPool<SparkTTSSlot> pool(args.maxSlots);
     std::unordered_map<std::string, std::string> loraWeights;
+    // Shared-engine slot pool: slot 0 OWNS the deserialized base LLM engine weights; slots 1..N-1
+    // BORROW those read-only weights via the shared-engine ctor, so the (large) base engine is loaded
+    // once instead of N times. Every slot still allocates its own execution context, KV cache,
+    // PipelineIO tensors, CUDA-graph cache, and CUDA streams — no mutable state is shared. Slot 0 must
+    // outlive every borrower (enforced by reverse-order teardown below).
+    nvinfer1::ICudaEngine* sharedBaseEngine = nullptr;
     for (int32_t s = 0; s < args.maxSlots; ++s)
     {
         auto slot = std::make_unique<SparkTTSSlot>();
         slot->slotId = s;
         CUDA_CHECK(cudaStreamCreate(&slot->llmStream));
         CUDA_CHECK(cudaStreamCreate(&slot->vocStream));
-        slot->llm = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, slot->llmStream);
+        if (s == 0)
+        {
+            slot->llm = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, slot->llmStream);
+            sharedBaseEngine = slot->llm->getBaseEngine();
+            if (!sharedBaseEngine) throw std::runtime_error("slot 0 base engine pointer is null");
+        }
+        else
+        {
+            slot->llm = std::make_unique<LLMInferenceRuntime>(
+                sharedBaseEngine, args.llmEngineDir, "", loraWeights, slot->llmStream);
+        }
         if (!slot->llm->captureDecodingCUDAGraph(slot->llmStream))
             LOG_WARNING("CUDA graph capture failed for SparkTTS LLM slot %d, proceeding without.", s);
         slot->spkCtx = gSpkEngine->createExecutionContext();
@@ -831,8 +847,14 @@ int main(int argc, char** argv)
     }
     for (auto& slotPtr : pool.slots())
         if (slotPtr->worker.joinable()) slotPtr->worker.join();
-    for (auto& slotPtr : pool.slots())
-        slotPtr->llm.reset();
+    // Lifetime guard: slots 1..N-1 BORROW slot 0's base engine. Tear them down in REVERSE order so
+    // every borrower is destroyed before slot 0 (the owner) releases the shared engine — destroying
+    // slot 0 first would leave borrowers with a dangling engine pointer.
+    {
+        auto& slots = pool.slots();
+        for (auto it = slots.rbegin(); it != slots.rend(); ++it)
+            (*it)->llm.reset();
+    }
     pool.slots().clear();
     if (gBicodecEngine) delete gBicodecEngine;
     if (gSpkEngine) delete gSpkEngine;
