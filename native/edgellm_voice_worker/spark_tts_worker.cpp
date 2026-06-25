@@ -311,13 +311,23 @@ void runSpeakerDecoder(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng, std::vect
     CUDA_CHECK(cudaStreamSynchronize(slot.vocStream));
 }
 
+// BiCodec engine dynamic-T profile minimum (bicodec_decoder_dynT: [1,8]..[1,600]). Windows
+// shorter than this (small first_chunk_tokens, tiny final chunk) must be right-padded to the
+// floor and the extra samples discarded — otherwise setInputShape fails the profile check.
+constexpr int32_t kBicodecMinT = 8;
+constexpr int32_t kUpsamplePerToken = 320; // 16kHz / 50Hz token rate (bicodec_decoder config)
+
 std::vector<float> runBicodec(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng, std::vector<int32_t> const& semantic)
 {
     std::string const semTensor = "semantic_tokens";
     std::string const dvTensor = "d_vector";
     std::string const outName = tensorName(eng, nvinfer1::TensorIOMode::kOUTPUT, 0);
-    int64_t const T = static_cast<int64_t>(semantic.size());
+    int64_t const realT = static_cast<int64_t>(semantic.size());
+    // Pad up to the engine's min profile T by repeating the last token; trim padded samples after.
     std::vector<int64_t> sem64(semantic.begin(), semantic.end());
+    int64_t const padTo = std::max<int64_t>(realT, kBicodecMinT);
+    while (static_cast<int64_t>(sem64.size()) < padTo) sem64.push_back(sem64.empty() ? 0 : sem64.back());
+    int64_t const T = static_cast<int64_t>(sem64.size());
     slot.bicodecCtx->setInputShape(semTensor.c_str(), nvinfer1::Dims2{1, T});
     slot.bicodecCtx->setInputShape(dvTensor.c_str(), nvinfer1::Dims2{1, 1024});
     DevBuf dSem, dDv, dOut;
@@ -336,6 +346,13 @@ std::vector<float> runBicodec(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng, st
     std::vector<float> wav(static_cast<size_t>(L));
     CUDA_CHECK(cudaMemcpyAsync(wav.data(), dOut.ptr, static_cast<size_t>(L) * sizeof(float), cudaMemcpyDeviceToHost, slot.vocStream));
     CUDA_CHECK(cudaStreamSynchronize(slot.vocStream));
+    // Trim samples produced by the min-T padding (keep only the real tokens' audio).
+    if (realT < T)
+    {
+        int64_t const realSamples = realT * kUpsamplePerToken;
+        if (realSamples >= 0 && realSamples <= static_cast<int64_t>(wav.size()))
+            wav.resize(static_cast<size_t>(realSamples));
+    }
     return wav;
 }
 
@@ -401,7 +418,6 @@ struct ChunkStreamState
     std::vector<float> crossfadeTail;  //!< last kFadeSamples of previously emitted audio (for crossfade)
 };
 
-constexpr int32_t kUpsamplePerToken = 320; // 16kHz / 50Hz token rate (bicodec_decoder config)
 constexpr int32_t kFadeSamples = 160;      // 10ms @16k crossfade at chunk seams
 
 // Vocode semantic[windowStart .. end) with the slot's d_vector, discard the left-overlap output,
