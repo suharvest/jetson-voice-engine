@@ -385,6 +385,81 @@ std::string base64(uint8_t const* d, size_t n)
     return o;
 }
 
+// --------------------------------------------------------------------------- S3 overlap-chunk streaming vocoder
+// Option A overlap-chunk (spec §3): the BiCodec decoder has no I/O state (causal conv-upsample
+// [8,5,4,2], 320 samples/token, raw TRT — no left-context tensor). To vocode incrementally
+// without boundary glitches we re-vocode each chunk WITH a left overlap of already-emitted
+// tokens, discard the overlap region's audio, and crossfade the first few ms into the tail of
+// the previously emitted audio to mask the seam. All per-request streaming state (emittedTokens,
+// tail buffer) lives in this struct on the stack of processRequest → strictly per-slot
+// (§5.3): no shared mutable vocoder state, avoids the StatefulCode2WavRunner concurrent-reset bug.
+struct ChunkStreamState
+{
+    int32_t emittedTokens{0};          //!< semantic tokens already turned into emitted audio
+    int32_t chunkIndex{0};
+    int64_t emittedSamples{0};
+    std::vector<float> crossfadeTail;  //!< last kFadeSamples of previously emitted audio (for crossfade)
+};
+
+constexpr int32_t kUpsamplePerToken = 320; // 16kHz / 50Hz token rate (bicodec_decoder config)
+constexpr int32_t kFadeSamples = 160;      // 10ms @16k crossfade at chunk seams
+
+// Vocode semantic[windowStart .. end) with the slot's d_vector, discard the left-overlap output,
+// crossfade the seam, and return the samples to emit for this chunk.
+std::vector<float> vocodeChunkWindow(SparkTTSSlot& slot, nvinfer1::ICudaEngine* eng,
+    std::vector<int32_t> const& semantic, ChunkStreamState& st, int32_t leftOverlap, int32_t endToken)
+{
+    int32_t const windowStart = std::max(0, st.emittedTokens - leftOverlap);
+    int32_t const skipTokens = st.emittedTokens - windowStart; // overlap tokens to discard
+    std::vector<int32_t> window(semantic.begin() + windowStart, semantic.begin() + endToken);
+    std::vector<float> full = runBicodec(slot, eng, window); // [skipTokens+new]*320 samples
+    int64_t const skipSamples = static_cast<int64_t>(skipTokens) * kUpsamplePerToken;
+    if (skipSamples >= static_cast<int64_t>(full.size())) return {};
+    std::vector<float> out(full.begin() + skipSamples, full.end());
+
+    // Crossfade the seam: blend the first kFadeSamples of `out` with the saved tail of the
+    // previous chunk (equal-power-ish linear fade) to suppress residual boundary clicks.
+    if (!st.crossfadeTail.empty() && out.size() >= static_cast<size_t>(kFadeSamples))
+    {
+        int32_t const n = std::min<int32_t>(kFadeSamples, static_cast<int32_t>(st.crossfadeTail.size()));
+        for (int32_t i = 0; i < n; ++i)
+        {
+            float const a = static_cast<float>(i) / n; // 0→1 ramp for new chunk
+            out[i] = a * out[i] + (1.0f - a) * st.crossfadeTail[i];
+        }
+    }
+    // Save new tail for the next seam.
+    if (out.size() >= static_cast<size_t>(kFadeSamples))
+        st.crossfadeTail.assign(out.end() - kFadeSamples, out.end());
+    else
+        st.crossfadeTail = out;
+
+    st.emittedTokens = endToken;
+    return out;
+}
+
+void emitAudioChunk(std::string const& id, ChunkStreamState& st, std::vector<float> const& samples,
+    bool isFinal, std::string const& chunkTransport, std::chrono::steady_clock::time_point reqStart)
+{
+    if (samples.empty() && !isFinal) return;
+    Json ev = Json{{"id", id}, {"event", "chunk"}, {"ok", true}, {"chunk_index", st.chunkIndex},
+        {"samples", samples.size()}, {"sample_rate", 16000}, {"is_final", isFinal},
+        {"elapsed_ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - reqStart).count()}};
+    auto pcm = floatToPcm16(samples);
+    if (chunkTransport == "base64")
+    {
+        ev["audio_b64"] = base64(reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
+        ev["bytes"] = pcm.size() * sizeof(int16_t);
+    }
+    else
+    {
+        ev["bytes"] = pcm.size() * sizeof(int16_t); // file/none transport: caller assembles from done WAV
+    }
+    emitEvent(std::move(ev));
+    st.emittedSamples += static_cast<int64_t>(samples.size());
+    ++st.chunkIndex;
+}
+
 // --------------------------------------------------------------------------- shared engines (read-only)
 nvinfer1::ICudaEngine* gSpkEngine{nullptr};
 nvinfer1::ICudaEngine* gBicodecEngine{nullptr};
@@ -414,6 +489,12 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
         std::string const chunkTransport = item.value("chunk_transport", "file");
         bool const emitTokenProgress = item.value("emit_token_progress", true);
         int32_t const maxSemantic = item.value("max_semantic", 600); // BiCodec dynamic-T profile cap
+        // S3 streaming vocoder (Option A overlap-chunk). Defaults on; set stream_audio=false for
+        // single-segment (S2) behavior. firstChunkTokens kept small for low TTFA.
+        bool const streamAudio = item.value("stream_audio", true);
+        int32_t const firstChunkTokens = std::max(1, item.value("first_chunk_tokens", 12));
+        int32_t const chunkTokens = std::max(1, item.value("chunk_tokens", 16));
+        int32_t const leftOverlap = std::max(0, item.value("left_overlap_tokens", 12));
         std::string outputFile = item.value("output_file", "");
         if (outputFile.empty()) outputFile = "/tmp/spark_tts_worker_" + id + ".wav";
         if (text.empty()) throw std::runtime_error("empty text");
@@ -459,9 +540,25 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
         bool dVectorReady = false;
         int32_t emittedTokens = 0;
         std::chrono::steady_clock::time_point dVectorAt{};
+        std::chrono::steady_clock::time_point firstAudioAt{}; // S3 TTFA marker
         bool semanticTruncated = false;
         FinishReason finalReason = FinishReason::kNotFinished;
         bool finished = false;
+
+        // S3 streaming-vocode state — strictly per-request, on this slot's stack (§5.3).
+        ChunkStreamState chunkState;
+        std::vector<float> wavAccum; // assembled audio = concatenation of every emitted chunk
+
+        // Vocode + emit ONE overlap-chunk [emittedTokens, endToken); append to wavAccum. isFinal
+        // marks the terminal chunk. Returns true if a chunk was emitted.
+        auto emitOneChunk = [&](int32_t endToken, bool isFinal) -> bool {
+            if (endToken <= chunkState.emittedTokens) return false;
+            std::vector<float> cs = vocodeChunkWindow(slot, gBicodecEngine, semantic, chunkState, leftOverlap, endToken);
+            if (firstAudioAt.time_since_epoch().count() == 0) firstAudioAt = std::chrono::steady_clock::now();
+            wavAccum.insert(wavAccum.end(), cs.begin(), cs.end());
+            emitAudioChunk(id, chunkState, cs, isFinal, chunkTransport, reqStart);
+            return true;
+        };
 
         while (!finished)
         {
@@ -495,10 +592,15 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
                             {"stage", "d_vector_ready"}, {"n_global", 32}, {"n_semantic", semantic.size()},
                             {"elapsed_ms", std::chrono::duration<double, std::milli>(dVectorAt - reqStart).count()}});
                 }
-                else if (emitTokenProgress && !semantic.empty() && semantic.size() % 50 == 0)
+
+                // S3: as soon as d_vector is ready and a chunk's worth of semantic has arrived,
+                // vocode + emit it (overlap-chunk). This is the TTFA win. Not final here — more
+                // tokens may still arrive; the terminal chunk is emitted in the post-decode flush.
+                if (streamAudio && dVectorReady)
                 {
-                    emitEvent(Json{{"id", id}, {"event", "token_progress"}, {"ok", true}, {"stage", "semantic"},
-                        {"n_global", global.size()}, {"n_semantic", semantic.size()}});
+                    int32_t const want = chunkState.chunkIndex == 0 ? firstChunkTokens : chunkTokens;
+                    if (static_cast<int32_t>(semantic.size()) - chunkState.emittedTokens >= want)
+                        emitOneChunk(chunkState.emittedTokens + want, /*isFinal=*/false);
                 }
 
                 if (chunk->finished)
@@ -531,33 +633,59 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
             if (semantic.empty()) throw std::runtime_error("no semantic tokens parsed");
             if (!dVectorReady) runSpeakerDecoder(slot, gSpkEngine, global);
 
-            // ---- Vocode (S2: one segment after decode; S3 will chunk this) ----
             auto const vocStart = std::chrono::steady_clock::now();
-            std::vector<float> wav = runBicodec(slot, gBicodecEngine, semantic);
+            std::vector<float> wav; // assembled full audio (for file output + validation)
+
+            if (streamAudio)
+            {
+                // S3 streaming path: drain remaining semantic as overlap-chunks; the LAST one is
+                // marked is_final. Live chunks were already emitted during decode into wavAccum.
+                int32_t const total = static_cast<int32_t>(semantic.size());
+                bool lastWasFinal = false;
+                while (chunkState.emittedTokens < total)
+                {
+                    int32_t const want = chunkState.chunkIndex == 0 ? firstChunkTokens : chunkTokens;
+                    int32_t const endToken = std::min(total, chunkState.emittedTokens + want);
+                    bool const isFinal = endToken >= total;
+                    emitOneChunk(endToken, isFinal);
+                    lastWasFinal = isFinal;
+                }
+                // Guarantee a terminal is_final chunk even if live emission already consumed all
+                // tokens (exact-multiple edge): emit an empty final marker so consumers terminate.
+                if (!lastWasFinal)
+                    emitAudioChunk(id, chunkState, std::vector<float>{}, /*isFinal=*/true, chunkTransport, reqStart);
+                wav = std::move(wavAccum);
+            }
+            else
+            {
+                wav = runBicodec(slot, gBicodecEngine, semantic); // S2 single-segment
+            }
             auto const vocEnd = std::chrono::steady_clock::now();
 
             double rms = 0.0;
             for (float v : wav) rms += static_cast<double>(v) * v;
             rms = wav.empty() ? 0.0 : std::sqrt(rms / wav.size());
             double const audioS = static_cast<double>(wav.size()) / gSampleRate;
+            double const ttfaMs = firstAudioAt.time_since_epoch().count() != 0
+                ? std::chrono::duration<double, std::milli>(firstAudioAt - reqStart).count()
+                : 0.0;
 
             Json done = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"frames", semantic.size()},
-                {"n_global", global.size()}, {"tokens_decoded", emittedTokens},
+                {"n_global", global.size()}, {"tokens_decoded", emittedTokens}, {"streamed", streamAudio},
+                {"chunk_count", chunkState.chunkIndex}, {"ttfa_ms", ttfaMs},
                 {"semantic_truncated", semanticTruncated}, {"finish_reason", finishReasonName(finalReason)},
                 {"samples", wav.size()}, {"sample_rate", gSampleRate}, {"audio_s", audioS}, {"rms", rms},
                 {"d_vector_ms", dVectorReady ? std::chrono::duration<double, std::milli>(dVectorAt - reqStart).count() : 0.0},
                 {"vocoder_ms", std::chrono::duration<double, std::milli>(vocEnd - vocStart).count()},
                 {"total_ms", std::chrono::duration<double, std::milli>(vocEnd - reqStart).count()}};
-            if (chunkTransport == "base64")
+            // Always write the assembled WAV (used for ASR/parity validation + non-stream callers).
+            if (!saveWav16(outputFile, wav, gSampleRate)) throw std::runtime_error("failed to save WAV: " + outputFile);
+            done["output_file"] = outputFile;
+            if (chunkTransport == "base64" && !streamAudio)
             {
                 auto pcm = floatToPcm16(wav);
                 done["audio_b64"] = base64(reinterpret_cast<uint8_t const*>(pcm.data()), pcm.size() * sizeof(int16_t));
                 done["bytes"] = pcm.size() * sizeof(int16_t);
-            }
-            else
-            {
-                if (!saveWav16(outputFile, wav, gSampleRate)) throw std::runtime_error("failed to save WAV: " + outputFile);
-                done["output_file"] = outputFile;
             }
             emitEvent(std::move(done));
         }
