@@ -204,6 +204,24 @@ set_target_properties(qwen3_asr_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                   LINKER_LANGUAGE CUDA
                                                   CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
+# -----------------------------------------------------------------------------
+# spark_tts_worker — SparkTTS controllable-TTS resident worker (S1).
+# LLM mixed engine (LLMInferenceRuntime) -> regex split 32 global + T semantic ->
+# speaker_decoder engine (global->d_vector) -> BiCodec engine (semantic+d_vector->wav).
+# Vocoder engines run via raw TRT (per-slot IExecutionContext over shared engines).
+# -----------------------------------------------------------------------------
+add_executable(spark_tts_worker spark_tts_worker.cpp)
+target_include_directories(
+  spark_tts_worker PRIVATE ${COMMON_INCLUDE_DIRS}
+                           ${EDGE_LLM_SOURCE_DIR}/examples/utils)
+target_link_libraries(spark_tts_worker PRIVATE voiceWorkerUtils edgellmCore
+                                               commonLibraryExt)
+add_cross_build_link_options(spark_tts_worker)
+set_target_properties(spark_tts_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                  ${VOICE_WORKER_OUTPUT_DIR}
+                                                  LINKER_LANGUAGE CUDA
+                                                  CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 # Standalone CPU-only test binary for MelExtractor parity vs golden tensors.
 add_executable(test_mel_extractor
                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mel_extractor.cpp")
@@ -289,3 +307,4 @@ endfunction()
 
 link_edgellm_cutedsl_if_enabled(qwen3_tts_worker)
 link_edgellm_cutedsl_if_enabled(qwen3_asr_worker)
+link_edgellm_cutedsl_if_enabled(spark_tts_worker)
