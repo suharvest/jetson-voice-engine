@@ -2,7 +2,14 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 Seeed / jetson-voice-engine. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * SparkTTS controllable-TTS resident C++ worker.
+ * SparkTTS resident C++ worker — controllable-TTS + zero-shot voice-clone.
+ *
+ * mode (stdin JSON, default "controllable"):
+ *   "controllable" → LLM generates 32 global + semantic from gender/pitch/speed style tokens.
+ *   "clone"        → 32 global come from a host-enrolled VoiceProfile (spec §10); LLM generates
+ *                    only semantic conditioned on the global prefix. d_vector is computed from the
+ *                    VoiceProfile global immediately (no waiting on the LLM) → lower TTFA. Strategy
+ *                    A (global-only) or B (ref_text + ref_semantic prefix) per SparkTTS.py:53.
  *
  * S1: non-streaming N=1, per-slot resource structure.
  * S2: LLM decode driven by edge-llm StreamChannel (incremental per-token consumption),
@@ -102,7 +109,9 @@ void printUsage(char const* prog)
               << " --llmEngineDir=<dir> --speakerDecoderEngine=<file.engine> --bicodecEngine=<file.engine>"
               << " [--maxSlots=N] [--sampleRate=16000] [--debug]\n\n"
               << "Reads JSON lines from stdin:\n"
-              << "  {\"id\":\"1\",\"text\":\"你好。\",\"gender\":\"female\",\"pitch\":\"moderate\",\"speed\":\"moderate\"}\n"
+              << "  controllable: {\"id\":\"1\",\"text\":\"你好。\",\"gender\":\"female\",\"pitch\":\"moderate\",\"speed\":\"moderate\"}\n"
+              << "  clone:        {\"id\":\"1\",\"text\":\"你好。\",\"mode\":\"clone\",\"global_ids\":[..32..],\n"
+              << "                 \"ref_semantic_ids\":[..]|omit,\"ref_text\":\"...\"|omit}\n"
               << "  {\"type\":\"cancel\",\"id\":\"1\"}\n"
               << "Writes JSON lines to stdout (event=ready|token_progress|done|cancelled|error).\n";
 }
@@ -153,6 +162,41 @@ std::string buildControllablePrompt(
         + std::to_string(levelId(pitch)) + "|><|speed_label_" + std::to_string(levelId(speed)) + "|>";
     return "<|task_controllable_tts|><|start_content|>" + text + "<|end_content|><|start_style_label|>" + attr
         + "<|end_style_label|>";
+}
+
+// --------------------------------------------------------------------------- clone prompt
+// Zero-shot voice clone (SparkTTS.py:53 process_prompt). The 32 global tokens come from the
+// reference audio (host enrollment → VoiceProfile, spec §10), NOT from the LLM. The LLM only
+// generates the SEMANTIC tokens for `text`; the global prefix conditions the timbre.
+//
+// Strategy A (refSemantic empty, recommended default, SparkTTS.py:95-104):
+//   <|task_tts|><|start_content|>{text}<|end_content|>
+//   <|start_global_token|>{32 global tokens}<|end_global_token|>
+//
+// Strategy B (refSemantic given, high-fidelity in-context cloning, SparkTTS.py:79-94):
+//   <|task_tts|><|start_content|>{refText}{text}<|end_content|>
+//   <|start_global_token|>{32 global tokens}<|end_global_token|>
+//   <|start_semantic_token|>{ref semantic tokens}        ← no end tag: generation prefix
+//
+// Token text forms (SparkTTS.py:74-82): <|bicodec_global_{i}|>, <|bicodec_semantic_{i}|>.
+std::string buildClonePrompt(std::string const& text, std::vector<int32_t> const& globalIds,
+    std::vector<int32_t> const& refSemantic, std::string const& refText)
+{
+    std::string globalToks;
+    for (int32_t g : globalIds) globalToks += "<|bicodec_global_" + std::to_string(g) + "|>";
+
+    std::string content = (refSemantic.empty() ? text : (refText + text));
+    std::string prompt = "<|task_tts|><|start_content|>" + content + "<|end_content|>"
+        + "<|start_global_token|>" + globalToks + "<|end_global_token|>";
+
+    if (!refSemantic.empty())
+    {
+        std::string semToks;
+        for (int32_t s : refSemantic) semToks += "<|bicodec_semantic_" + std::to_string(s) + "|>";
+        // No <|end_semantic_token|>: the ref-semantic acts as the generation prefix (in-context).
+        prompt += "<|start_semantic_token|>" + semToks;
+    }
+    return prompt;
 }
 
 // --------------------------------------------------------------------------- bicodec token id ranges
@@ -502,6 +546,24 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
         std::string const gender = item.value("gender", "female");
         std::string const pitch = item.value("pitch", "moderate");
         std::string const speed = item.value("speed", "moderate");
+        // Clone mode (spec §4.1): mode="clone" → global comes from the VoiceProfile (32 ids),
+        // LLM only generates semantic. Default "controllable" keeps full backward compat.
+        std::string const mode = item.value("mode", "controllable");
+        bool const isClone = (mode == "clone");
+        std::vector<int32_t> cloneGlobal;     // VoiceProfile global_ids[32] (clone only)
+        std::vector<int32_t> cloneRefSemantic; // VoiceProfile ref_semantic_ids (strategy B; empty=A)
+        std::string cloneRefText;
+        if (isClone)
+        {
+            if (item.contains("global_ids") && item["global_ids"].is_array())
+                for (auto const& v : item["global_ids"]) cloneGlobal.push_back(v.get<int32_t>());
+            if (item.contains("ref_semantic_ids") && item["ref_semantic_ids"].is_array())
+                for (auto const& v : item["ref_semantic_ids"]) cloneRefSemantic.push_back(v.get<int32_t>());
+            cloneRefText = item.value("ref_text", "");
+            if (cloneGlobal.size() != 32)
+                throw std::runtime_error(
+                    "clone mode requires global_ids[32], got " + std::to_string(cloneGlobal.size()));
+        }
         std::string const chunkTransport = item.value("chunk_transport", "file");
         bool const emitTokenProgress = item.value("emit_token_progress", true);
         int32_t const maxSemantic = item.value("max_semantic", 600); // BiCodec dynamic-T profile cap
@@ -521,7 +583,8 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
         msg.role = "user";
         Message::MessageContent c;
         c.type = "text";
-        c.content = buildControllablePrompt(text, gender, pitch, speed);
+        c.content = isClone ? buildClonePrompt(text, cloneGlobal, cloneRefSemantic, cloneRefText)
+                            : buildControllablePrompt(text, gender, pitch, speed);
         msg.contents.push_back(std::move(c));
         r.messages.push_back(std::move(msg));
         req.requests.push_back(std::move(r));
@@ -547,6 +610,12 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
             catch (std::exception const& e)
             {
                 decodeErr = e.what();
+                // If decode fails BEFORE the channel is ever finalized (e.g. prefill setup error:
+                // "max input length exceeds the max supported input length"), the consumer would
+                // block forever on waitPop and the slot would never free (→ every later request
+                // gets pool_saturated). Cancel the channel so the consumer unblocks and the slot
+                // recovers. The consumer reports the error via decodeErr after joining.
+                channel->cancel();
             }
         });
 
@@ -554,6 +623,18 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
         std::vector<int32_t> global;
         std::vector<int32_t> semantic;
         bool dVectorReady = false;
+        // Clone echo handling (spec §4.1.4 / §8): the LLM stream may or may not echo prompt
+        // tokens. For clone we know exactly which tokens are prompt: the 32 global (always) and,
+        // strategy B, the `refSemanticEcho` ref-semantic prefix. We skip echoed prompt tokens so
+        // only NEWLY generated semantic reaches the vocoder (else the reference audio content
+        // would be re-synthesised). Detection is empirical, not assumed:
+        //   - any global-range token in the stream during clone == prompt echo (clone never
+        //     generates global), so we count and discard those.
+        //   - the first `refSemanticEcho` semantic tokens are the echoed ref-semantic prefix.
+        int32_t refSemanticEcho = isClone ? static_cast<int32_t>(cloneRefSemantic.size()) : 0;
+        int32_t echoedGlobal = 0;          // global-range tokens seen in stream (clone echo telemetry)
+        int32_t semanticSkipped = 0;       // ref-semantic prefix tokens skipped (strategy B)
+        std::vector<int32_t> rawHead;      // first stream tokenIds (debug echo probe)
         int32_t emittedTokens = 0;
         std::chrono::steady_clock::time_point dVectorAt{};
         std::chrono::steady_clock::time_point firstAudioAt{}; // S3 TTFA marker
@@ -576,6 +657,22 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
             return true;
         };
 
+        // Clone: d_vector is available immediately from the VoiceProfile global (no waiting on the
+        // LLM to emit 32 global). This is the clone TTFA win — the vocoder can start as soon as the
+        // first generated semantic chunk arrives. (spec §0 "TTFA 优势".)
+        if (isClone)
+        {
+            global = cloneGlobal;
+            runSpeakerDecoder(slot, gSpkEngine, global);
+            dVectorReady = true;
+            dVectorAt = std::chrono::steady_clock::now();
+            if (emitTokenProgress)
+                emitEvent(Json{{"id", id}, {"event", "token_progress"}, {"ok", true},
+                    {"stage", "d_vector_ready"}, {"mode", "clone"}, {"n_global", 32},
+                    {"ref_semantic_echo", refSemanticEcho},
+                    {"elapsed_ms", std::chrono::duration<double, std::milli>(dVectorAt - reqStart).count()}});
+        }
+
         while (!finished)
         {
             std::optional<StreamChunk> chunk = channel->waitPop(std::chrono::milliseconds{100});
@@ -583,21 +680,36 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
             {
                 for (int32_t tid : chunk->tokenIds)
                 {
+                    if (rawHead.size() < 40) rawHead.push_back(tid);
                     if (tid >= kGlobalIdBase && tid <= kGlobalIdEnd)
                     {
-                        if (global.size() < 32) global.push_back(tid - kGlobalIdBase);
+                        if (isClone)
+                            ++echoedGlobal; // clone never generates global; this is prompt echo → discard
+                        else if (global.size() < 32)
+                            global.push_back(tid - kGlobalIdBase);
                     }
                     else if (tid >= kSemanticIdBase && tid <= kSemanticIdEnd)
                     {
-                        if (static_cast<int32_t>(semantic.size()) < maxSemantic)
+                        // Strategy B: skip the echoed ref-semantic prefix so only newly generated
+                        // semantic is vocoded (else the reference content gets re-synthesised).
+                        if (isClone && semanticSkipped < refSemanticEcho)
+                        {
+                            ++semanticSkipped;
+                        }
+                        else if (static_cast<int32_t>(semantic.size()) < maxSemantic)
+                        {
                             semantic.push_back(tid - kSemanticIdBase);
+                        }
                         else
+                        {
                             semanticTruncated = true;
+                        }
                     }
                     ++emittedTokens;
                 }
 
-                // Trigger d_vector the instant 32 global tokens are collected (S2 goal 2).
+                // Trigger d_vector the instant 32 global tokens are collected (controllable S2 goal 2;
+                // clone already triggered it pre-loop from the VoiceProfile global).
                 if (!dVectorReady && global.size() == 32)
                 {
                     runSpeakerDecoder(slot, gSpkEngine, global);
@@ -634,8 +746,23 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
 
         if (decodeThread.joinable()) decodeThread.join();
 
-        // ---- Cancelled: terminal cancelled event, no audio ----
-        if (finalReason == FinishReason::kCancelled || channel->isCancelled())
+        // Echo probe (spec §8): dump the first stream tokenIds so the prompt-token-echo question
+        // can be answered empirically. For clone, global-range ids here == prompt echo.
+        if (item.value("emit_raw_head", false))
+            emitEvent(Json{{"id", id}, {"event", "raw_head"}, {"mode", mode},
+                {"global_base", kGlobalIdBase}, {"semantic_base", kSemanticIdBase},
+                {"echoed_global", echoedGlobal}, {"ref_semantic_echo", refSemanticEcho},
+                {"semantic_skipped", semanticSkipped}, {"token_ids", rawHead}});
+
+        // ---- Decode failed before any output (e.g. prompt exceeds the LLM max_input_len): the
+        // decode thread cancelled the channel to unblock us. Report it as an error, not a cancel. ----
+        if (!decodeErr.empty())
+        {
+            emitEvent(Json{{"id", id}, {"event", "error"}, {"ok", false},
+                {"error", "LLM decode failed: " + decodeErr}});
+        }
+        // ---- Cancelled (genuine user cancel): terminal cancelled event, no audio ----
+        else if (finalReason == FinishReason::kCancelled || channel->isCancelled())
         {
             emitEvent(Json{{"id", id}, {"event", "cancelled"}, {"ok", true}, {"reason", "cancelled"},
                 {"n_global", global.size()}, {"n_semantic", semantic.size()}, {"tokens_decoded", emittedTokens},
@@ -687,6 +814,8 @@ void processRequest(SparkTTSSlot& slot, Json const& item)
                 : 0.0;
 
             Json done = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"frames", semantic.size()},
+                {"mode", mode}, {"echoed_global", echoedGlobal}, {"ref_semantic_echo", refSemanticEcho},
+                {"semantic_skipped", semanticSkipped},
                 {"n_global", global.size()}, {"tokens_decoded", emittedTokens}, {"streamed", streamAudio},
                 {"chunk_count", chunkState.chunkIndex}, {"ttfa_ms", ttfaMs},
                 {"semantic_truncated", semanticTruncated}, {"finish_reason", finishReasonName(finalReason)},
