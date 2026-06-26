@@ -127,8 +127,22 @@ echo "==> applying patches"
 apply_one() {
   local p="$1"
   echo "    - $(basename "${p}")"
-  git -C "${WORKDIR}" apply --check "${p}"
-  git -C "${WORKDIR}" apply "${p}"
+  # Idempotent apply: if the patch already applies cleanly, apply it; if it is
+  # ALREADY PRESENT in the pinned branch (forward --check fails but reverse
+  # --check succeeds), skip it — the integration branch may have folded it in.
+  # This keeps the overlay reproducible across re-pins that absorb a former
+  # patch (e.g. 8437f027 = integration/v080-sparktts already carries
+  # 0001-orin-tegra-build-compat). Only a genuine context conflict (neither
+  # forward nor reverse applies) is fatal.
+  if git -C "${WORKDIR}" apply --check "${p}" 2>/dev/null; then
+    git -C "${WORKDIR}" apply "${p}"
+  elif git -C "${WORKDIR}" apply --reverse --check "${p}" 2>/dev/null; then
+    echo "      (already present in pinned branch — skipping)"
+  else
+    echo "ERROR: patch $(basename "${p}") does not apply and is not already present" >&2
+    git -C "${WORKDIR}" apply --check "${p}"  # re-run to surface the real conflict
+    return 1
+  fi
 }
 # Base+CV N>1 serving chain — explicit ordered allow-list (NOT a glob).
 # Verified: full chain git-apply --check CLEAN on the pinned branch + addon/.
@@ -173,6 +187,23 @@ esac
 #   (empty type ≈ 2x slower runtime).
 CUDA_CTK="${CUDA_CTK_VERSION:-12.6}"
 TRT_PKG="${TRT_PACKAGE_DIR:-/usr}"
+# Ensure nvcc is discoverable. Non-login shells (ssh exec / nohup / CI) often
+# lack /usr/local/cuda-*/bin on PATH, so a CLEAN cmake configure fails with
+# "CMAKE_CUDA_COMPILER-NOTFOUND" even though nvcc is installed. (Incremental
+# rebuilds masked this by reusing a cached compiler path.) Prepend the CTK bin
+# dir and export CUDACXX so the build entry is self-contained.
+CUDA_BIN="/usr/local/cuda-${CUDA_CTK}/bin"
+if ! command -v nvcc >/dev/null 2>&1; then
+  if [ -x "${CUDA_BIN}/nvcc" ]; then
+    export PATH="${CUDA_BIN}:${PATH}"
+    export CUDACXX="${CUDA_BIN}/nvcc"
+    echo "==> nvcc not on PATH; using ${CUDACXX}"
+  else
+    echo "ERROR: nvcc not found on PATH nor at ${CUDA_BIN}/nvcc. Install CUDA ${CUDA_CTK} toolkit or set PATH/CUDACXX." >&2
+    exit 4
+  fi
+fi
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-${CUDA_CTK}}"
 # CUDA target SM. On aarch64/Tegra (Orin) the upstream CMakeLists, hardened by
 # 0001, SKIPS the desktop "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block — so
 # nothing sets the arch and the int4 WOQ GEMM fails to compile with

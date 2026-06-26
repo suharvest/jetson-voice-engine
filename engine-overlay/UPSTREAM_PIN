@@ -19,7 +19,12 @@
 # SparkTTS is a product variant = this baseline + its own worker (jve
 # native/edgellm_voice_worker/spark_tts_worker.cpp) + config — NOT a separate pin.
 #
-# Apply chain UNCHANGED (still 0001-orin-tegra-build-compat only). No SparkTTS
-# engine patch — everything is in the pinned branch.
+# Apply chain: the integration branch 8437f027 ALREADY carries
+# 0001-orin-tegra-build-compat (Tegra auto-detect + AARCH64 arch guard + cublas
+# links + cuteDSL static-lib shim + filter_macos_metadata). build.sh's apply_one
+# is idempotent: it forward-applies a patch if needed, SKIPS it if already
+# present (reverse --check passes), and only fails on a genuine conflict. So on
+# this pin 0001 is skipped (already-present) — net apply chain is effectively
+# EMPTY. No SparkTTS engine patch — everything is in the pinned branch.
 # Fork ref must be reachable on upstream.remote (suharvest): push
 # integration/v080-sparktts so build.sh can fetch SHA 8437f027.
