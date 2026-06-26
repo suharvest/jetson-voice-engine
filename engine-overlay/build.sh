@@ -127,8 +127,22 @@ echo "==> applying patches"
 apply_one() {
   local p="$1"
   echo "    - $(basename "${p}")"
-  git -C "${WORKDIR}" apply --check "${p}"
-  git -C "${WORKDIR}" apply "${p}"
+  # Idempotent apply: if the patch already applies cleanly, apply it; if it is
+  # ALREADY PRESENT in the pinned branch (forward --check fails but reverse
+  # --check succeeds), skip it — the integration branch may have folded it in.
+  # This keeps the overlay reproducible across re-pins that absorb a former
+  # patch (e.g. 8437f027 = integration/v080-sparktts already carries
+  # 0001-orin-tegra-build-compat). Only a genuine context conflict (neither
+  # forward nor reverse applies) is fatal.
+  if git -C "${WORKDIR}" apply --check "${p}" 2>/dev/null; then
+    git -C "${WORKDIR}" apply "${p}"
+  elif git -C "${WORKDIR}" apply --reverse --check "${p}" 2>/dev/null; then
+    echo "      (already present in pinned branch — skipping)"
+  else
+    echo "ERROR: patch $(basename "${p}") does not apply and is not already present" >&2
+    git -C "${WORKDIR}" apply --check "${p}"  # re-run to surface the real conflict
+    return 1
+  fi
 }
 # Base+CV N>1 serving chain — explicit ordered allow-list (NOT a glob).
 # Verified: full chain git-apply --check CLEAN on the pinned branch + addon/.
