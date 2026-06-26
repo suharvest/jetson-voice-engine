@@ -187,6 +187,23 @@ esac
 #   (empty type ≈ 2x slower runtime).
 CUDA_CTK="${CUDA_CTK_VERSION:-12.6}"
 TRT_PKG="${TRT_PACKAGE_DIR:-/usr}"
+# Ensure nvcc is discoverable. Non-login shells (ssh exec / nohup / CI) often
+# lack /usr/local/cuda-*/bin on PATH, so a CLEAN cmake configure fails with
+# "CMAKE_CUDA_COMPILER-NOTFOUND" even though nvcc is installed. (Incremental
+# rebuilds masked this by reusing a cached compiler path.) Prepend the CTK bin
+# dir and export CUDACXX so the build entry is self-contained.
+CUDA_BIN="/usr/local/cuda-${CUDA_CTK}/bin"
+if ! command -v nvcc >/dev/null 2>&1; then
+  if [ -x "${CUDA_BIN}/nvcc" ]; then
+    export PATH="${CUDA_BIN}:${PATH}"
+    export CUDACXX="${CUDA_BIN}/nvcc"
+    echo "==> nvcc not on PATH; using ${CUDACXX}"
+  else
+    echo "ERROR: nvcc not found on PATH nor at ${CUDA_BIN}/nvcc. Install CUDA ${CUDA_CTK} toolkit or set PATH/CUDACXX." >&2
+    exit 4
+  fi
+fi
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-${CUDA_CTK}}"
 # CUDA target SM. On aarch64/Tegra (Orin) the upstream CMakeLists, hardened by
 # 0001, SKIPS the desktop "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block — so
 # nothing sets the arch and the int4 WOQ GEMM fails to compile with
