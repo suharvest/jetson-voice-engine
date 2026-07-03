@@ -1,0 +1,650 @@
+From a3612217d167772744aacac8be8df8ecd226dc1c Mon Sep 17 00:00:00 2001
+From: harvest <harvest@orinnx.localdomain>
+Date: Sun, 21 Jun 2026 07:11:04 -0400
+Subject: [PATCH 07/30] feat(tts): D2-1 shared-engine ctor for slot-pool (share
+ read-only engine weights)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Slots 1..N-1 now reuse slot 0's borrowed (read-only) Talker + CodePredictor
+ICudaEngines instead of re-deserializing, halving per-slot weight memory.
+Per-slot IExecutionContext (kUSER_MANAGED), KV/recurrent cache, RoPE cache,
+workspace, Code2Wav, CUDA stream and worker thread stay private — concurrent
+slots never contend.
+
+- LLMEngineRunner: getEngine() accessor + borrowed-engine ctor; extract
+  initFromEngine() so both ctors share per-instance init (engine via enginePtr()).
+- Qwen3OmniTTSRuntime: getTalkerEngine()/getCodePredictorEngine() accessors +
+  shared-engine ctor + initializeEngineRunnersShared().
+- worker initSlotPool: slot 0 path-ctor, slots 1..N-1 shared-engine ctor;
+  removed the DEFERRED fallback to independent path-ctor instances.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/cpp/runtime/legacy/llmEngineRunner.cpp b/cpp/runtime/legacy/llmEngineRunner.cpp
+index 78b4734..43f7924 100644
+--- a/cpp/runtime/legacy/llmEngineRunner.cpp
++++ b/cpp/runtime/legacy/llmEngineRunner.cpp
+@@ -146,11 +146,62 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(
+         mRuntime->deserializeCudaEngine(mmapReader->getData(), mmapReader->getSize()));
+ 
++    // Engine is now available (owned). Run the shared per-instance initialization.
++    initFromEngine(configPath, loraWeightsMap, stream);
++}
++
++LLMEngineRunner::LLMEngineRunner(nvinfer1::ICudaEngine* borrowedEngine, std::filesystem::path const& configPath,
++    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
++{
++    if (borrowedEngine == nullptr)
++    {
++        LOG_ERROR("Shared-engine LLMEngineRunner constructed with a null borrowed engine");
++        throw std::runtime_error("Shared-engine LLMEngineRunner requires a non-null borrowed engine");
++    }
++
++    LOG_INFO("Loading config file %s (shared-engine ctor)", configPath.string().c_str());
++
++    // Parse configuration from JSON file (same as the path ctor; only the engine source differs).
++    Json configJson;
++    std::ifstream configFileStream(configPath);
++    if (!configFileStream.is_open())
++    {
++        LOG_ERROR("Failed to open config file: %s", configPath.string().c_str());
++        throw std::runtime_error("Failed to open config file: " + configPath.string());
++    }
++    try
++    {
++        configJson = Json::parse(configFileStream);
++        configFileStream.close();
++    }
++    catch (Json::parse_error const& e)
++    {
++        LOG_ERROR("Failed to parse config file with error: %s", e.what());
++        throw std::runtime_error("Failed to parse config file: " + configPath.string());
++    }
++
++    if (!this->initializeConfigFromJson(configJson))
++    {
++        LOG_ERROR("Failed to initialize LLMEngineRunner from config file: %s", configPath.string().c_str());
++        throw std::runtime_error("Failed to initialize LLMEngineRunner from config file: " + configPath.string());
++    }
++
++    // Reuse the borrowed (shared, read-only) engine weights. mRuntime/mEngine stay null:
++    // ownership remains with the slot-0 runner. Everything else (execution context, KV cache,
++    // RoPE cache, workspace) is allocated fresh and per-instance by initFromEngine().
++    mBorrowedEngine = borrowedEngine;
++
++    initFromEngine(configPath, loraWeightsMap, stream);
++}
++
++void LLMEngineRunner::initFromEngine(std::filesystem::path const& configPath,
++    std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream)
++{
+     // Use single executionContext for both prefill and generation.
+     // Context memory is user-managed to enable sharing with other engines.
+     // The caller must provide shared context memory via setContextMemory() before execution.
+     mTRTExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext>(
+-        mEngine->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
++        enginePtr()->createExecutionContext(ExecutionContextAllocationStrategy::kUSER_MANAGED));
+ 
+     if (trt_edgellm::layerProfiler::LayerProfiler::getInstance().isEnabled())
+     {
+@@ -159,10 +210,8 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+ 
+     if (!this->validateConfigFromEngine())
+     {
+-        LOG_ERROR("Failed to match config file %s with engine file: %s", configPath.string().c_str(),
+-            enginePath.string().c_str());
+-        throw std::runtime_error(
+-            "Failed to match config file " + configPath.string() + " with engine file: " + enginePath.string());
++        LOG_ERROR("Failed to match config file %s with the loaded engine", configPath.string().c_str());
++        throw std::runtime_error("Failed to match config file " + configPath.string() + " with the loaded engine");
+     }
+ 
+     RopeConfig const& ropeConfig = mConfig.ropeConfig;
+@@ -365,7 +414,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+     // The dummy buffer is used during CUDA graph capture and vanilla decoding when the caller
+     // doesn't explicitly request hidden states output.
+     {
+-        bool const engineHasHiddenStates = engineHasOutputTensor(mEngine.get(), binding_names::kOutputHiddenStates);
++        bool const engineHasHiddenStates = engineHasOutputTensor(enginePtr(), binding_names::kOutputHiddenStates);
+         if (mConfig.enableEagleSpecDecode || engineHasHiddenStates)
+         {
+             int64_t outputHiddenDim = mConfig.enableEagleSpecDecode ? mConfig.outputHiddenDim : mConfig.hiddenSize;
+@@ -402,9 +451,10 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
+     CUDA_CHECK(cudaStreamSynchronize(stream));
+ }
+ 
++
+ int64_t LLMEngineRunner::getRequiredContextMemorySize() const
+ {
+-    return mEngine->getDeviceMemorySizeV2();
++    return enginePtr()->getDeviceMemorySizeV2();
+ }
+ 
+ bool LLMEngineRunner::setContextMemory(rt::Tensor& sharedContextMemory)
+@@ -425,25 +475,25 @@ nvinfer1::DataType LLMEngineRunner::getKVCacheType() const
+     if (mConfig.useTrtNativeOps)
+     {
+         std::string const trtNativeKVBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
+-        return mEngine->getTensorDataType(trtNativeKVBindingName0.c_str());
++        return enginePtr()->getTensorDataType(trtNativeKVBindingName0.c_str());
+     }
+     else
+     {
+         std::string const pluginKVBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+-        return mEngine->getTensorDataType(pluginKVBindingName0.c_str());
++        return enginePtr()->getTensorDataType(pluginKVBindingName0.c_str());
+     }
+ }
+ 
+ nvinfer1::DataType LLMEngineRunner::getRecurrentStateType() const
+ {
+     std::string const name = binding_names::formatRecurrentStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
+-    return mEngine->getTensorDataType(name.c_str());
++    return enginePtr()->getTensorDataType(name.c_str());
+ }
+ 
+ nvinfer1::DataType LLMEngineRunner::getConvStateType() const
+ {
+     std::string const name = binding_names::formatConvStateName(/*recurrentLayerIdx=*/0, /*isPast=*/true);
+-    return mEngine->getTensorDataType(name.c_str());
++    return enginePtr()->getTensorDataType(name.c_str());
+ }
+ 
+ bool LLMEngineRunner::validateKVCacheType() const
+@@ -453,13 +503,13 @@ bool LLMEngineRunner::validateKVCacheType() const
+     if (mConfig.useTrtNativeOps)
+     {
+         auto kBindingName0 = binding_names::formatKCacheName(/*layerIdx=*/0, /*isPast=*/true);
+-        DataType const kCacheType0 = mEngine->getTensorDataType(kBindingName0.c_str());
++        DataType const kCacheType0 = enginePtr()->getTensorDataType(kBindingName0.c_str());
+         auto vBindingName0 = binding_names::formatVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+         auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+             std::string const kBindingName = binding_names::formatKCacheName(layerIdx, isPast);
+-            DataType const kCacheType = mEngine->getTensorDataType(kBindingName.c_str());
++            DataType const kCacheType = enginePtr()->getTensorDataType(kBindingName.c_str());
+             std::string const vBindingName = binding_names::formatVCacheName(layerIdx, isPast);
+-            DataType const vCacheType = mEngine->getTensorDataType(vBindingName.c_str());
++            DataType const vCacheType = enginePtr()->getTensorDataType(vBindingName.c_str());
+             if (kCacheType != kCacheType0 || vCacheType != kCacheType0)
+             {
+                 LOG_ERROR(
+@@ -482,10 +532,10 @@ bool LLMEngineRunner::validateKVCacheType() const
+     else
+     {
+         auto kvBindingName0 = binding_names::formatKVCacheName(/*layerIdx=*/0, /*isPast=*/true);
+-        DataType const kvCacheType = mEngine->getTensorDataType(kvBindingName0.c_str());
++        DataType const kvCacheType = enginePtr()->getTensorDataType(kvBindingName0.c_str());
+         auto const checkKVCacheDType = [&](int32_t layerIdx, bool isPast) {
+             std::string const kvBindingName = binding_names::formatKVCacheName(layerIdx, isPast);
+-            DataType const dt = mEngine->getTensorDataType(kvBindingName.c_str());
++            DataType const dt = enginePtr()->getTensorDataType(kvBindingName.c_str());
+             if (dt != kvCacheType)
+             {
+                 LOG_ERROR(
+@@ -776,14 +826,14 @@ bool LLMEngineRunner::validateConfigFromEngine()
+         return true;
+     };
+ 
+-    LOG_DEBUG("Prefill profile info: %s", printEngineInfo(mEngine.get(), kPREFILL_PROFILE_INDEX).c_str());
+-    LOG_DEBUG("Generation profile info: %s", printEngineInfo(mEngine.get(), kGENERATION_PROFILE_INDEX).c_str());
++    LOG_DEBUG("Prefill profile info: %s", printEngineInfo(enginePtr(), kPREFILL_PROFILE_INDEX).c_str());
++    LOG_DEBUG("Generation profile info: %s", printEngineInfo(enginePtr(), kGENERATION_PROFILE_INDEX).c_str());
+ 
+     int32_t nbKVCacheInputs{0};
+     int32_t nbTRTNativeKCacheInputs{0};
+     int32_t nbTRTNativeVCacheInputs{0};
+     int32_t nbDeepstackEmbedsInputs{0};
+-    int32_t numIOBindings = mEngine->getNbIOTensors();
++    int32_t numIOBindings = enginePtr()->getNbIOTensors();
+ 
+     // Lambda to validate KV cache dimensions against profile shape.
+     // Uses per-layer config when available (heterogeneous models), falls back to scalar config.
+@@ -806,16 +856,16 @@ bool LLMEngineRunner::validateConfigFromEngine()
+     bool isOk{true};
+     for (int32_t i = 0; i < numIOBindings; ++i)
+     {
+-        std::string const bindingName = mEngine->getIOTensorName(i);
+-        Dims const tensorDim = mEngine->getTensorShape(bindingName.c_str());
++        std::string const bindingName = enginePtr()->getIOTensorName(i);
++        Dims const tensorDim = enginePtr()->getTensorShape(bindingName.c_str());
+ 
+         if (identifyKVCacheBinding(bindingName, tensorDim))
+         {
+             // Get max profile shapes for both prefill and generation profiles
+             Dims const maxKVCacheShapePrefill
+-                = mEngine->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
++                = enginePtr()->getProfileShape(bindingName.c_str(), kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+             Dims const maxKVCacheShapeGen
+-                = mEngine->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
++                = enginePtr()->getProfileShape(bindingName.c_str(), kGENERATION_PROFILE_INDEX, OptProfileSelector::kMAX);
+ 
+             // Validate both profiles (nbKVCacheInputs is the local KV layer index)
+             isOk &= validateKVCacheProfile(maxKVCacheShapePrefill, "prefill", nbKVCacheInputs);
+@@ -907,7 +957,7 @@ bool LLMEngineRunner::validateConfigFromEngine()
+         mConfig.numDeepstackFeatures, nbDeepstackEmbedsInputs, "numDeepstackFeatures");
+ 
+     Dims const maxInputPrefillShape
+-        = mEngine->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
++        = enginePtr()->getProfileShape(binding_names::kInputsEmbeds, kPREFILL_PROFILE_INDEX, OptProfileSelector::kMAX);
+ 
+     // inputs_embeds is 3D: [batch_size, seq_len, hidden_size]
+     isOk &= validate_eq_engine_with_config(
+@@ -920,11 +970,11 @@ bool LLMEngineRunner::validateConfigFromEngine()
+ 
+     // Obtain vocab size from the engine.
+     // Logits shape is [batch_size, num_tokens/num_selected_tokens, vocab_size] for both EAGLE and vanilla models
+-    Dims const logitsDim = mEngine->getTensorShape(binding_names::kLogits);
++    Dims const logitsDim = enginePtr()->getTensorShape(binding_names::kLogits);
+     isOk &= validate_eq_engine_with_config(mConfig.outputVocabSize, logitsDim.d[2], "outputVocabSize");
+ 
+     // Obtain rotary dim from the engine.
+-    Dims const ropeCosSinCacheDim = mEngine->getTensorShape(binding_names::kRopeCosSin);
++    Dims const ropeCosSinCacheDim = enginePtr()->getTensorShape(binding_names::kRopeCosSin);
+     isOk &= validate_eq_engine_with_config(mConfig.rotaryDim, ropeCosSinCacheDim.d[2], "rotaryDim");
+ 
+     if (!isOk)
+@@ -2009,7 +2059,7 @@ bool LLMEngineRunner::resetLoraWeights()
+     for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
+     {
+         nvinfer1::Dims emptyLoraShape
+-            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
++            = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+ 
+         // Use dummy tensor as zero tensor for LoRA weights
+         resetStatus
+@@ -2092,10 +2142,10 @@ std::vector<std::string> LLMEngineRunner::getLoraWeightsTensorNames() const
+ {
+     std::vector<std::string> loraWeightsTensorNames;
+     // Get the number of bindings in the engine
+-    int32_t numBindings = mEngine->getNbIOTensors();
++    int32_t numBindings = enginePtr()->getNbIOTensors();
+     for (int32_t i = 0; i < numBindings; ++i)
+     {
+-        char const* bindingName = mEngine->getIOTensorName(i);
++        char const* bindingName = enginePtr()->getIOTensorName(i);
+         std::string bindingNameStr(bindingName);
+         if (binding_names::isLoraBinding(bindingNameStr))
+         {
+@@ -2156,7 +2206,7 @@ bool LLMEngineRunner::switchLoraWeights(std::string const& loraWeightsName)
+         {
+             // Tensor not found in this LoRA adapter, use dummy tensor as zero tensor with shape kEMPTY_LORA_RANK
+             nvinfer1::Dims shape
+-                = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
++                = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+             if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
+             {
+                 // LoRA A has shape [k, rank], set rank to kEMPTY_LORA_RANK
+@@ -2220,7 +2270,7 @@ int32_t LLMEngineRunner::getMaxLoraWeightsDimension() const
+     for (auto const& loraWeightsTensorName : getLoraWeightsTensorNames())
+     {
+         nvinfer1::Dims maxShape
+-            = mEngine->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
++            = enginePtr()->getProfileShape(loraWeightsTensorName.c_str(), 0, nvinfer1::OptProfileSelector::kMAX);
+ 
+         if (loraWeightsTensorName.find(binding_names::kLoraAPrefix) != std::string::npos)
+         {
+diff --git a/cpp/runtime/legacy/llmEngineRunner.h b/cpp/runtime/legacy/llmEngineRunner.h
+index 6b8a8f0..d513577 100644
+--- a/cpp/runtime/legacy/llmEngineRunner.h
++++ b/cpp/runtime/legacy/llmEngineRunner.h
+@@ -102,9 +102,34 @@ public:
+     LLMEngineRunner(std::filesystem::path const& enginePath, std::filesystem::path const& configPath,
+         std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
+ 
++    /*!
++     * @brief Construct LLM engine runner from a borrowed (shared, read-only) TensorRT engine.
++     *
++     * Reuses an already-deserialized ICudaEngine owned by another LLMEngineRunner instance
++     * (the engine weights are read-only and safe to share across slots). This instance does
++     * NOT take ownership of the engine and must outlive nothing beyond it. Every other
++     * resource — the per-instance IExecutionContext (kUSER_MANAGED), KV/recurrent cache,
++     * RoPE cache, and all workspace tensors — is allocated fresh and is NOT shared, so
++     * concurrent slots never contend.
++     *
++     * @param borrowedEngine Non-owning pointer to a live, deserialized engine to reuse (must not be null)
++     * @param configPath Path to the model configuration file (same engine/config pairing as the owner)
++     * @param loraWeightsMap Map of LoRA weight names to file paths
++     * @param stream CUDA stream for operations
++     * @throws std::runtime_error If configuration parsing or per-instance initialization fails, or a CUDA
++     * operation fails
++     */
++    LLMEngineRunner(nvinfer1::ICudaEngine* borrowedEngine, std::filesystem::path const& configPath,
++        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
++
+     //! @brief Destructor
+     ~LLMEngineRunner() noexcept;
+ 
++    //! @brief Get the borrowed (non-owning) TensorRT engine pointer for sharing across slots.
++    //! @return Raw pointer to the live ICudaEngine (owned by this runner via mEngine, or borrowed).
++    //! @note The returned engine is read-only weights shared state; callers must NOT delete it.
++    nvinfer1::ICudaEngine* getEngine() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
++
+     /*!
+      * @brief Get the required context memory size for this engine
+      * @return Required context memory size in bytes
+@@ -249,6 +274,7 @@ public:
+ private:
+     std::unique_ptr<nvinfer1::IRuntime> mRuntime;                      //!< TensorRT runtime
+     std::unique_ptr<nvinfer1::ICudaEngine> mEngine;                    //!< TensorRT engine
++    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};                  //!< Non-owning engine (shared-engine ctor)
+     std::unique_ptr<nvinfer1::IExecutionContext> mTRTExecutionContext; //!< Prefill and Generation execution context
+ 
+     //! Holds the CUDA graph captured for the decoding step. Each CUDA graph is associated with a unique key value
+@@ -304,6 +330,15 @@ private:
+      * @param configJson JSON configuration object
+      * @return True on success, false on failure
+      */
++    //! @brief Active engine pointer: owned (mEngine) or borrowed (mBorrowedEngine).
++    nvinfer1::ICudaEngine* enginePtr() const noexcept { return mEngine ? mEngine.get() : mBorrowedEngine; }
++
++    //! @brief Shared per-instance initialization after the engine is available (owned or borrowed).
++    //! Creates the kUSER_MANAGED execution context, RoPE cache, KV/recurrent cache, and all workspace
++    //! tensors. Both constructors funnel through this so the two paths stay in lockstep.
++    void initFromEngine(std::filesystem::path const& configPath,
++        std::unordered_map<std::string, std::string> const& loraWeightsMap, cudaStream_t stream);
++
+     bool initializeConfigFromJson(Json const& configJson) noexcept;
+ 
+     /*!
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 65ddf06..ddc3d04 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -234,6 +234,148 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
+     LOG_INFO("Qwen3-Omni TTS runtime initialized successfully");
+ }
+ 
++Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine,
++    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, cudaStream_t stream)
++    : mStream(stream)
++{
++    ELLM_CHECK(talkerEngine != nullptr, "Shared-engine ctor requires a non-null Talker engine");
++    ELLM_CHECK(codePredictorEngine != nullptr, "Shared-engine ctor requires a non-null CodePredictor engine");
++    NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
++    LOG_INFO("Initializing Qwen3-Omni Talker runner (shared-engine ctor)");
++    LOG_INFO("  Talker: %s", talkerEngineDir.c_str());
++    LOG_INFO("  CodePredictor: %s", codePredictorEngineDir.c_str());
++
++    // Load tokenizer
++    std::filesystem::path const tokenizerPath = tokenizerDir.empty()
++        ? std::filesystem::path(talkerEngineDir).parent_path()
++        : std::filesystem::path(tokenizerDir);
++    LOG_INFO("  Tokenizer: %s", tokenizerPath.string().c_str());
++    mTokenizer = std::make_unique<tokenizer::Tokenizer>();
++    bool const tokenizerLoaded = mTokenizer->loadFromHF(tokenizerPath);
++    ELLM_CHECK(tokenizerLoaded, "Failed to load tokenizer from: " + tokenizerPath.string());
++
++    bool const configValid = validateAndFillConfig(talkerEngineDir);
++    ELLM_CHECK(configValid, "Failed to validate and fill config");
++
++    bool const runnersInitialized = initializeEngineRunnersShared(
++        talkerEngine, codePredictorEngine, talkerEngineDir, codePredictorEngineDir);
++    ELLM_CHECK(runnersInitialized, "Failed to initialize engine runners");
++
++    // Setup shared execution context memory for Talker and CodePredictor engines.
++    // LLMEngineRunner uses kUSER_MANAGED allocation and requires setContextMemory() before execution.
++    {
++        int64_t const talkerCtxSize = mTalkerLLMRunner->getRequiredContextMemorySize();
++        int64_t const cpCtxSize = mCodePredictorRunner ? mCodePredictorRunner->getRequiredContextMemorySize() : 0;
++        int64_t const sharedCtxSize = std::max(talkerCtxSize, cpCtxSize);
++        LOG_INFO("Setup shared execution context memory: %zu bytes (talker: %zu, code_predictor: %zu)",
++            static_cast<size_t>(sharedCtxSize), static_cast<size_t>(talkerCtxSize), static_cast<size_t>(cpCtxSize));
++        mSharedExecContextMemory = rt::Tensor({sharedCtxSize}, rt::DeviceType::kGPU, nvinfer1::DataType::kUINT8,
++            "Qwen3OmniTTSRuntime::mSharedExecContextMemory");
++        bool const talkerCtxSet = mTalkerLLMRunner->setContextMemory(mSharedExecContextMemory);
++        ELLM_CHECK(talkerCtxSet, "Failed to set context memory for Talker LLM engine");
++        ELLM_CHECK(!mCodePredictorRunner || mCodePredictorRunner->setContextMemory(mSharedExecContextMemory),
++            "Failed to set context memory for CodePredictor engine");
++    }
++
++    // Determine max batch size from engine configs (use the minimum of Talker and CodePredictor)
++    mMaxBatchSize = std::min(mTalkerLLMConfig.maxSupportedBatchSize, mCodePredictorConfig.maxSupportedBatchSize);
++    check::check(mMaxBatchSize >= 1, "maxBatchSize must be >= 1");
++    LOG_INFO("Max batch size: %d (Talker=%d, CodePredictor=%d)", mMaxBatchSize, mTalkerLLMConfig.maxSupportedBatchSize,
++        mCodePredictorConfig.maxSupportedBatchSize);
++
++    bool const codePredictorWeightsLoaded = loadCodePredictorWeights(codePredictorEngineDir);
++    ELLM_CHECK(codePredictorWeightsLoaded, "Failed to load CodePredictor weights");
++
++#ifdef CUTE_DSL_GEMM_ENABLED
++    bool const cuteDslLoaded = CuteDslGemmRunner::loadKernelModule();
++    ELLM_CHECK(cuteDslLoaded, "Failed to load CuTe DSL GEMM kernel module");
++#endif
++
++    bool const bufferAllocated = allocateBuffer();
++    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
++
++    bool const talkerWeightsLoaded = loadTalkerWeights(talkerEngineDir, stream);
++    ELLM_CHECK(talkerWeightsLoaded, "Failed to load Talker weights");
++
++    // Load text embedding table (thinker vocab).
++    // Used for standalone TTS and for projecting TTS special tokens.
++    // TTS: text_embedding.safetensors in talkerEngineDir (copied by builder).
++    // Omni: use thinker's embedding.safetensors from tokenizerPath instead.
++    {
++        std::filesystem::path const textEmbedPath = mIsOmni
++            ? tokenizerPath / "embedding.safetensors"
++            : std::filesystem::path(talkerEngineDir) / "text_embedding.safetensors";
++        LOG_INFO("Loading text embedding from: %s", textEmbedPath.string().c_str());
++        std::vector<rt::Tensor> textEmbedTensors;
++        bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
++        ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
++        check::check(!textEmbedTensors.empty(), "text embedding file is empty");
++        // The file holds the embedding table (FP16, or FP8 e4m3 for a quantized table) and, for the
++        // FP8 case, a separate FP32 per-group scales tensor. loadSafetensors returns no names, so
++        // classify by dtype: table = FP16/FP8 2D tensor, scales = FP32 2D tensor.
++        int tableIdx = -1, scalesIdx = -1;
++        for (size_t i = 0; i < textEmbedTensors.size(); ++i)
++        {
++            auto const dt = textEmbedTensors[i].getDataType();
++            if (dt == nvinfer1::DataType::kHALF || dt == nvinfer1::DataType::kFP8)
++                tableIdx = static_cast<int>(i);
++            else if (dt == nvinfer1::DataType::kFLOAT)
++                scalesIdx = static_cast<int>(i);
++        }
++        check::check(tableIdx >= 0, "text embedding file has no FP16/FP8 table tensor");
++        check::check(textEmbedTensors[tableIdx].getShape().getNumDims() == 2,
++            "text embedding tensor should be 2D [vocabSize, hiddenSize]");
++        mTextEmbeddingIsFp8 = (textEmbedTensors[tableIdx].getDataType() == nvinfer1::DataType::kFP8);
++        if (mTextEmbeddingIsFp8)
++        {
++            check::check(scalesIdx >= 0, "FP8 text embedding requires an FP32 scales tensor in the same file");
++            check::check(textEmbedTensors[scalesIdx].getShape().getNumDims() == 2,
++                "text embedding scales should be 2D [vocabSize, hiddenSize/blockSize]");
++            check::check(textEmbedTensors[scalesIdx].getShape()[0] == textEmbedTensors[tableIdx].getShape()[0],
++                "scales vocab dim must match table vocab dim");
++            mTextEmbeddingScales = std::move(textEmbedTensors[scalesIdx]);
++        }
++        mTextEmbeddingTable = std::move(textEmbedTensors[tableIdx]);
++        LOG_INFO("Text embedding table loaded: [%lld, %lld] (%s)", mTextEmbeddingTable.getShape()[0],
++            mTextEmbeddingTable.getShape()[1], mTextEmbeddingIsFp8 ? "FP8+scales" : "FP16");
++    }
++
++    // Note: mTalkerEmbeddingTable is loaded by loadTalkerWeights() above.
++
++    // Load CodePredictor embedding tables from codec_embeddings.safetensors
++    // mNumRvqLayers is already set from config.json num_code_groups in validateAndFillConfig()
++    {
++        std::filesystem::path const embedPath
++            = std::filesystem::path(codePredictorEngineDir) / "codec_embeddings.safetensors";
++        std::vector<rt::Tensor> allEmbedTensors;
++        bool const codecEmbedLoaded = safetensors::loadSafetensors(embedPath, allEmbedTensors, stream);
++        ELLM_CHECK(codecEmbedLoaded, "Failed to load codec_embeddings.safetensors from: " + embedPath.string());
++        check::check(static_cast<int32_t>(allEmbedTensors.size()) == mNumRvqLayers,
++            "codec_embeddings.safetensors has " + std::to_string(allEmbedTensors.size()) + " tensors, expected "
++                + std::to_string(mNumRvqLayers) + " (num_code_groups - 1)");
++        mCodePredictorEmbeddingTables.resize(mNumRvqLayers);
++        for (int32_t i = 0; i < mNumRvqLayers; ++i)
++        {
++            std::string const key = "embedding_" + std::to_string(i);
++            auto it = std::find_if(allEmbedTensors.begin(), allEmbedTensors.end(),
++                [&key](rt::Tensor const& t) { return t.getName() == key; });
++            check::check(it != allEmbedTensors.end(), "Missing key '" + key + "' in codec_embeddings.safetensors");
++            check::check(it->getShape().getNumDims() == 2, key + " should be 2D [codebookSize, hiddenSize]");
++            mCodePredictorEmbeddingTables[i] = std::move(*it);
++        }
++    }
++    LOG_INFO("Loaded %d CodePredictor embedding tables (from config num_code_groups=%d)", mNumRvqLayers,
++        mTalkerConfig.numCodeGroups);
++
++    initializeTTSEmbeddings(stream);
++
++    CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaStart, cudaEventDefault));
++    CUDA_CHECK(cudaEventCreateWithFlags(&mTtfaEnd, cudaEventDefault));
++
++    LOG_INFO("Qwen3-Omni TTS runtime initialized successfully");
++}
++
+ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
+ {
+ #ifdef CUTE_DSL_GEMM_ENABLED
+@@ -249,6 +391,52 @@ Qwen3OmniTTSRuntime::~Qwen3OmniTTSRuntime()
+     }
+ }
+ 
++bool Qwen3OmniTTSRuntime::initializeEngineRunnersShared(nvinfer1::ICudaEngine* talkerEngine,
++    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir)
++{
++    // Reuse the borrowed Talker engine; config still read from disk (same dir as the owner).
++    std::filesystem::path talkerConfigPath = std::filesystem::path(talkerEngineDir) / "config.json";
++    LOG_INFO("Reusing shared Talker LLM engine (config: %s)", talkerConfigPath.string().c_str());
++
++    try
++    {
++        std::unordered_map<std::string, std::string> emptyLoraMap;
++        mTalkerLLMRunner = std::make_unique<LLMEngineRunner>(talkerEngine, talkerConfigPath, emptyLoraMap, mStream);
++        mTalkerLLMConfig = mTalkerLLMRunner->getEngineConfig();
++
++        LOG_INFO("Talker LLM engine (shared) ready: vocabSize=%d, hiddenSize=%d", mTalkerLLMConfig.vocabSize,
++            mTalkerLLMConfig.hiddenSize);
++    }
++    catch (std::exception const& e)
++    {
++        LOG_ERROR("Failed to init shared Talker LLM runner: %s", e.what());
++        return false;
++    }
++
++    std::filesystem::path codePredictorConfigPath = std::filesystem::path(codePredictorEngineDir) / "config.json";
++    LOG_INFO("Reusing shared CodePredictor engine (config: %s)", codePredictorConfigPath.string().c_str());
++
++    try
++    {
++        std::unordered_map<std::string, std::string> emptyLoraMap;
++        mCodePredictorRunner
++            = std::make_unique<LLMEngineRunner>(codePredictorEngine, codePredictorConfigPath, emptyLoraMap, mStream);
++        mCodePredictorConfig = mCodePredictorRunner->getEngineConfig();
++        mTalkerConfig.codePredictorHiddenSize = mCodePredictorConfig.hiddenSize;
++
++        LOG_INFO("CodePredictor engine (shared) ready: vocabSize=%d, hiddenSize=%d, numLayers=%d",
++            mCodePredictorConfig.vocabSize, mCodePredictorConfig.hiddenSize, mCodePredictorConfig.numDecoderLayers);
++    }
++    catch (std::exception const& e)
++    {
++        LOG_ERROR("Failed to init shared CodePredictor runner: %s", e.what());
++        return false;
++    }
++
++    return true;
++}
++
+ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+     std::string const& talkerEngineDir, std::string const& codePredictorEngineDir)
+ {
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index 1868300..2c3e01f 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -96,9 +96,39 @@ public:
+     Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
+         std::string const& tokenizerDir, cudaStream_t stream);
+ 
++    /*!
++     * @brief Construct a TTS runtime that SHARES talker/code-predictor engine weights with another runtime.
++     *
++     * Reuses the borrowed (read-only) Talker and CodePredictor ICudaEngines from an existing runtime
++     * (e.g. slot 0) instead of re-deserializing them, which halves per-slot weight memory. Directories
++     * are still required for the non-engine assets (tokenizer, embedding tables, codec embeddings) which
++     * are loaded per-instance. Each runtime still allocates its own execution contexts, KV caches, and
++     * workspace via the borrowed-engine LLMEngineRunner ctor, so concurrent slots never contend.
++     *
++     * @param talkerEngine Non-owning Talker engine to reuse (from getTalkerEngine() of another runtime; must not be null)
++     * @param codePredictorEngine Non-owning CodePredictor engine to reuse (must not be null)
++     * @param talkerEngineDir Directory with talker non-engine assets (config, MLP weights, embedding table)
++     * @param codePredictorEngineDir Directory with code_predictor config + codec embeddings
++     * @param tokenizerDir Directory containing tokenizer files. If empty, defaults to talkerEngineDir/../
++     * @param stream CUDA stream for operations
++     * @throws std::runtime_error on any initialization failure
++     */
++    Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
++        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
++        std::string const& tokenizerDir, cudaStream_t stream);
++
+     //! @brief Destructor
+     ~Qwen3OmniTTSRuntime();
+ 
++    //! @brief Borrowed (non-owning) Talker engine pointer, for sharing across slot-pool instances.
++    nvinfer1::ICudaEngine* getTalkerEngine() const { return mTalkerLLMRunner ? mTalkerLLMRunner->getEngine() : nullptr; }
++
++    //! @brief Borrowed (non-owning) CodePredictor engine pointer, for sharing across slot-pool instances.
++    nvinfer1::ICudaEngine* getCodePredictorEngine() const
++    {
++        return mCodePredictorRunner ? mCodePredictorRunner->getEngine() : nullptr;
++    }
++
+     // ========== Core API ==========
+ 
+     /*!
+@@ -519,6 +549,9 @@ private:
+      * @return True on success, false on failure
+      */
+     bool initializeEngineRunners(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
++    //! @brief Build the Talker + CodePredictor runners from borrowed (shared, read-only) engines.
++    bool initializeEngineRunnersShared(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
++        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir);
+ 
+     /*!
+      * @brief Load CodePredictor lm_head weights and small_to_mtp_projection
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index f6f7ed8..a4afce8 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -759,14 +759,23 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
+             slot->inUse.store(false);
+             CUDA_CHECK(cudaStreamCreate(&slot->stream));
+ 
+-            // BASE PORT (v0.8.0): every slot deserializes its OWN Talker + CodePredictor engines via the
+-            // path-based ctor. The D2-1 shared-engine ctor (slots 1..N-1 sharing slot 0's ICudaEngines to
+-            // halve weight memory) is DEFERRED — it needs LLMEngineRunner::getEngine() + a shared-engine ctor
+-            // that are not on v0.8.0's runtime yet. N=1 is unaffected (single slot, single deserialize). For
+-            // N>1 this means independent instances (more VRAM) — validate the 8GB Orin Nano budget with
+-            // tegrastats before raising --max_slots, and re-introduce the shared-engine ctor as the OOM fix.
+-            slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+-                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
++            // D2-1 shared-engine pool: slot 0 deserializes its OWN Talker + CodePredictor engines via the
++            // path-based ctor; slots 1..N-1 SHARE slot 0's borrowed (read-only) ICudaEngines via the
++            // shared-engine ctor — halving per-slot weight memory. Each slot still gets its own execution
++            // contexts, KV caches, workspace, Code2Wav, CUDA stream and worker thread, so concurrent slots
++            // never contend. N=1 is unaffected (single slot, single deserialize).
++            if (i == 0)
++            {
++                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
++                    args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
++            }
++            else
++            {
++                Qwen3OmniTTSRuntime* owner = slots.front()->runtime.get();
++                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(owner->getTalkerEngine(),
++                    owner->getCodePredictorEngine(), args.talkerEngineDir, args.codePredictorEngineDir,
++                    args.tokenizerDir, slot->stream);
++            }
+ 
+             // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
+             // so concurrent slots never contend (avoids the StatefulCode2WavRunner
+-- 
+2.50.1 (Apple Git-155)
+

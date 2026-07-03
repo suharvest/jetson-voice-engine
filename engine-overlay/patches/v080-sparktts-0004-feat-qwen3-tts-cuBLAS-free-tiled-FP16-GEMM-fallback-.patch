@@ -1,8 +1,8 @@
 From 26a4a693347b4d6f2fa7e167f85dbaa1dde0ab89 Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 04:30:21 +0800
-Subject: [PATCH 4/6] feat(qwen3-tts): cuBLAS-free tiled FP16 GEMM fallback for
- talker MLP/linear (Jetson sm_87)
+Subject: [PATCH 04/30] feat(qwen3-tts): cuBLAS-free tiled FP16 GEMM fallback
+ for talker MLP/linear (Jetson sm_87)
 
 The CuTe-DSL GEMM prebuilt 'Ampere' cubin is not sm_87-runnable (kernel launch ->
 invalid device function), and invokeTalkerMLP/invokeLinearLayer had only a CuTe path

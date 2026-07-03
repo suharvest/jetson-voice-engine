@@ -1,7 +1,7 @@
 From 873ca223a844509f93ec081095d98db2de57c470 Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 11:43:21 +0800
-Subject: [PATCH 6/6] =?UTF-8?q?feat(qwen3-tts):=20fp8=20text=5Fembedding?=
+Subject: [PATCH 06/30] =?UTF-8?q?feat(qwen3-tts):=20fp8=20text=5Fembedding?=
  =?UTF-8?q?=20(native=20kernel=20path)=20=E2=80=94=20~311MB=20VRAM,=20no?=
  =?UTF-8?q?=20perf=20cost?=
 MIME-Version: 1.0

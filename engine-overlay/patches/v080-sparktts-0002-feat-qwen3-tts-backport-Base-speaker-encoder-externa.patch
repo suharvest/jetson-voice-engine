@@ -1,7 +1,7 @@
 From ba9ecdb51596ef0934bd51acfa09fcb6c09e190e Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 02:30:56 +0800
-Subject: [PATCH 2/6] feat(qwen3-tts): backport Base speaker-encoder
+Subject: [PATCH 02/30] feat(qwen3-tts): backport Base speaker-encoder
  (external-embedding) path onto v0.8.0
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

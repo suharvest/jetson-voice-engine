@@ -12,21 +12,25 @@ voxedge-engine/
   UPSTREAM_PIN       # exact NVIDIA commit (= v0.8.0, f9cc746…, release/0.8.0 HEAD)
   upstream.remote    # https://github.com/NVIDIA/TensorRT-Edge-LLM.git
   addon/             # new files (upstream does not have these), original relative paths
-  patches/           # legacy 000N theme patches (v0.7.1 era) + v080-port-000N
-                     #   (fork port/qwen3-tts-base-v080 TTS runtime) + v080-NNNN
-                     #   feat patches. SEE patches/PATCH-STATE-v080.md for which
-                     #   apply on v0.8.0 and which are pending rebase.
+  patches/           # v080-sparktts-0001..0030 (THE apply series — fork
+                     #   integration/v080-sparktts regenerated as format-patches)
+                     #   + 0001 build-compat + archival legacy/v080-NNNN patches.
+                     #   SEE patches/PATCH-STATE-v080.md §13 for dispositions.
   build.sh           # clone upstream@pin → copy addon → apply patches → build (Jetson host)
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a)/(b) classification + upstream-PR / retirement plan
 ```
 
-> **v0.8.0 re-pin (C2a):** pin moved v0.7.1 `364769…` → v0.8.0 `f9cc746…`. The
-> canonical TTS-runtime source is now the fork branch `port/qwen3-tts-base-v080`
-> (6 commits / 9 files), regenerated into `patches/v080-port-000N`. Of the legacy
-> `000N` patches only `0001` clean-applies on v0.8.0; `0002`–`0007` are superseded
-> and `0008` needs a hunk-split. The `v080-NNNN` feat series (ASR/MOSS/CV/TTS-batch)
-> is pending rebase. Full apply-check evidence: `patches/PATCH-STATE-v080.md`.
+> **C2 sparktts re-pin (2026-07-03):** pin = pure NVIDIA v0.8.0 `f9cc7462`;
+> ALL fork content travels as `patches/v080-sparktts-0001..0030`
+> (= `git format-patch f9cc7462..integration/v080-sparktts`, fork HEAD
+> `8437f027`: N>1 streaming worker + CV 9-row runtime-if + SparkTTS
+> bf16/int4/W4A16 mixed-precision + voice-clone shared-engine ctor). Apply
+> chain = addon/ + the 30-patch series + `0001-orin-tegra-build-compat`;
+> dry-run verified — resulting tree == the fork integration branch exactly.
+> Legacy `0002` is rebased as an OPT-IN engine-build memory-budget patch;
+> `0003`/`0004`/`0005`/`v080-port-000N` are deleted (superseded in-series);
+> `0006`/`0007`/`0008` are archival. Details: `patches/PATCH-STATE-v080.md` §13.
 
 The full source tree is **reconstructed at build time**: clone upstream at
 `UPSTREAM_PIN`, copy `addon/` over it, apply `patches/*.patch` in order, build.

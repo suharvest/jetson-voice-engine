@@ -1,0 +1,39 @@
+From c48c0de505f769e8779035ba912764c3a399b7c2 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Mon, 22 Jun 2026 05:59:32 +0800
+Subject: [PATCH 12/30] feat(omni-tts): wire per-request language into
+ streaming worker buildRequest
+
+The streaming worker's buildRequest() previously dropped the per-request
+`language` field, so req.language was always empty -> langId=-1 -> the 8-row
+Base prefix, making the 9-row CustomVoice language-conditioning path
+(already implemented in the runtime) unreachable from N>1 serving.
+
+Pass `language` through from the JSON item to TalkerGenerationRequest,
+mirroring the one-shot path (qwen3_tts_inference.cpp:390). Empty/omitted
+language => langId=-1 => 8-row Base path, so Base behavior is unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index a4afce8..41b6b93 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -343,8 +343,12 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+     req.talkerTopK = item.value("talker_top_k", 50);
+     req.talkerTopP = item.value("talker_top_p", 1.0f);
+     req.repetitionPenalty = item.value("repetition_penalty", 1.05f);
+-    // NOTE (base port): codec_eos_logit_offset / predictor_* / language are CustomVoice-only fields not present
+-    // on the v0.8.0 base TalkerGenerationRequest — intentionally dropped. Base uses a fixed speaker.
++    // NOTE (base port): codec_eos_logit_offset / predictor_* are CustomVoice-only fields not present
++    // on the v0.8.0 base TalkerGenerationRequest — still dropped. Base uses a fixed speaker.
++    // CustomVoice language conditioning: pass per-request language through to the runtime, which maps
++    // it to a codec language id and selects the 9-row prefix. Empty string => langId=-1 => 8-row Base
++    // path (unchanged), so omitting "language" keeps the Base behavior intact.
++    req.language = item.value("language", "");
+     req.speakerName = item.value("speaker", "");
+     req.speakerId = item.value("speaker_id", -1);
+     // BASE PORT: optional precomputed external speaker embedding (base64 LE float32 array). When present,
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,7 @@
 From 10b338ddfc55dd22090ff2993cb9fa49c292057b Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Fri, 19 Jun 2026 23:16:12 +0800
-Subject: [PATCH 1/6] feat(qwen3-tts): port streaming worker (base, N>1
+Subject: [PATCH 01/30] feat(qwen3-tts): port streaming worker (base, N>1
  slot-pool) onto v0.8.0
 
 Bring the standalone Qwen3-TTS streaming worker from v071/customvoice-product

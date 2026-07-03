@@ -1,54 +1,32 @@
-c48c0de505f769e8779035ba912764c3a399b7c2
-# = fork integration branch HEAD: suharvest/wip/cv-9row-v080-n1n2
-#   "feat(omni-tts): wire per-request language into streaming worker buildRequest"
+f9cc74623d95d7acf1addab6026b9d410ba81f52
+# = NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD ("Merge #101 from
+#   JCalafato/dev-release/0.8.0"). PURE NVIDIA commit — no fork content.
 #
-# Repinned from 7142a30 -> c48c0de (CV formalization, Option A — full re-pin so
-# build.sh reproduces the CustomVoice worker FROM SOURCE). Two commits were added
-# on top of the previous 7142a30 (Base N>1) pin, both folded INTO this branch:
-#   12ee383  port 9-row CustomVoice language conditioning onto v0.8.0 N>1
-#            — adds the 9-row CV talker prefill behind a RUNTIME-IF on langId.
-#            One binary now handles BOTH:
-#              * langId <  0  -> Base 8-row speaker-encoder prefill (UNCHANGED)
-#              * langId >= 0  -> CustomVoice 9-row langId prefill
-#            This supersedes the old pre-runtime-if CV patches
-#            (patches/v080-0007-customvoice-language-conditioning.patch and
-#             patches/0005-customvoice-language-conditioning.patch), which forced
-#            a SEPARATE CV-only binary that could not coexist with Base. Those
-#            patches are now ARCHIVAL ONLY (not in the build.sh apply chain).
-#   c48c0de  wire per-request language into the streaming worker buildRequest
-#            (per-request langId reaches the runtime-if path).   ← HEAD
+# C2 sparktts re-pin (2026-07-03): pin moved OFF the fork integration branch
+# (was c48c0de = suharvest/wip/cv-9row-v080-n1n2) back to the NVIDIA v0.8.0
+# base. ALL fork content now travels as overlay patches:
 #
-# Because the 2 CV commits are now IN the pinned branch, the apply chain is
-# UNCHANGED: still exactly ONE patch (0001-orin-tegra-build-compat) on top of the
-# branch + addon/. NO CV patch is applied (the runtime-if is in the branch).
+#   patches/v080-sparktts-0001..0030  =  git format-patch --no-stat
+#       f9cc7462..integration/v080-sparktts        (fork HEAD 8437f027)
 #
-# This pin is the SINGLE SOURCE for the v0.8.0 N>1 stack — Base AND CustomVoice
-# in ONE binary (runtime-if on langId). It is NVIDIA release/0.8.0 (f9cc746) +
-# 6 fork-port commits + the D2-1 shared-engine ctor + the C2b ASR self-build
-# commits + the 2 CV runtime-if commits, in one branch:
-#   f9cc746  NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD (PR #101)
-#   10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
-#   ba9ecdb  backport Base speaker-encoder (external-embedding) path onto v0.8.0
-#   867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
-#   26a4a69  cuBLAS-free tiled FP16 GEMM fallback for talker MLP/linear (sm_87)
-#   50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
-#   873ca22  fp8 text_embedding (native kernel path)
-#   a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
-#   8de933f  C3 N<=0 prefill guard (defensive early-return; N>0 paths unchanged)
-#   a099544  add minimal SessionLaneManager (runtime/asrStreamingSessionRuntime.{h,cpp})
-#   7142a30  expose LLMInferenceRuntime::maxSessionBatchSize() for N>1 worker
-#   12ee383  port 9-row CustomVoice language conditioning (runtime-if on langId)
-#   c48c0de  wire per-request language into streaming worker buildRequest
+# The 30-commit series is a strict superset of the previous pinned branch
+# (its 12 commits = v080-sparktts-0001..0012) plus the SparkTTS consolidation
+# set (bf16/fp16 mixed-precision, int4/W4A16-AWQ mixed-precision export+plugin,
+# borrowed/shared-engine ctor for voice-clone):
+#   0001..0006  fork-port TTS runtime (10b338d ba9ecdb 867b74d 26a4a69 50b8670 873ca22)
+#   0007        D2-1 shared-engine ctor for slot-pool (a361221)
+#   0008        C3 N<=0 prefill guard (8de933f)
+#   0009..0010  ASR SessionLaneManager + maxSessionBatchSize() (a099544 7142a30)
+#   0011..0012  CustomVoice 9-row runtime-if on langId (12ee383 c48c0de)
+#   0013..0028  SparkTTS mixed-precision + INT4-AWQ opt-in set (d234ef0..b8ea0c7)
+#   0029        borrowed/shared-engine ctor EngineExecutor+LLMInferenceRuntime (21119ec)
+#   0030        drop dev-only int4 microbench (8437f027 = fork branch HEAD)
 #
-# Because these are now IN the pinned branch, the old engine-overlay/patches/
-# v080-port-0001..0006 (fork-port) AND v080-0007 / 0005 (CV pre-runtime-if) are
-# REDUNDANT/SUPERSEDED and are NOT in the build.sh apply chain (kept on disk for
-# archival only). See patches/PATCH-STATE-v080.md §4 and §10/§12.
+# Apply chain (build.sh): addon/ + v080-sparktts-0001..0030 (in order)
+#                         + 0001-orin-tegra-build-compat.
+# Dry-run verified 2026-07-03 (Mac, git apply --check + apply): full chain
+# CLEAN on f9cc7462; resulting tracked tree == integration/v080-sparktts
+# (diff shows only addon files + 0001's 3 build-compat files).
 #
-# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-# fork remote (suharvest): branch suharvest/wip/cv-9row-v080-n1n2
-#
-# NOTE: build.sh fetches this SHA. The fork ref must be reachable from the
-# configured upstream.remote (set it to the suharvest fork for reproduction).
-# Verified reachable on suharvest: refs/heads/wip/cv-9row-v080-n1n2 = c48c0de
-# (also fetch-by-SHA OK — the exact path build.sh uses).
+# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git (this SHA
+# is a public NVIDIA commit; the suharvest fork also carries it as fallback).

@@ -1,0 +1,63 @@
+From 54a99075fb01d0b941da44df87d928789367140e Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 08:12:22 +0800
+Subject: [PATCH 16/30] feat(loader): load weights into their declared half
+ dtype
+
+_set_tensor now casts FP16/BF16 checkpoint tensors to the destination
+buffer's declared dtype, so the mixed-precision module tree keeps its
+FP16 attention weights and BF16 residual/MLP weights. Falls back to the
+legacy BF16->FP16 cast when the destination dtype is unknown. The tied-
+lm_head check accepts BF16Linear as well as FP16Linear.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+
+diff --git a/tensorrt_edgellm/checkpoint/loader.py b/tensorrt_edgellm/checkpoint/loader.py
+index b9e16be..c6f6c55 100644
+--- a/tensorrt_edgellm/checkpoint/loader.py
++++ b/tensorrt_edgellm/checkpoint/loader.py
+@@ -169,13 +169,14 @@ def load_weights(
+     config = getattr(model, "config", None)
+     if (hasattr(model, "tie_weights") and config is not None
+             and getattr(config, "tie_word_embeddings", False)):
+-        from ..models.linear import FP16Linear
+-        if isinstance(getattr(model, "lm_head", None), FP16Linear):
++        from ..models.linear import BF16Linear, FP16Linear
++        if isinstance(getattr(model, "lm_head", None),
++                      (FP16Linear, BF16Linear)):
+             model.tie_weights()
+             logger.info("Tied lm_head.weight to embed_tokens.weight")
+         else:
+             logger.debug(
+-                "Skipping tied lm_head.weight for non-FP16 lm_head type %s",
++                "Skipping tied lm_head.weight for non-FP16/BF16 lm_head type %s",
+                 type(getattr(model, "lm_head", None)).__name__)
+ 
+ 
+@@ -317,8 +318,21 @@ def _set_tensor(model: nn.Module, key: str, tensor: torch.Tensor) -> bool:
+     except (AttributeError, IndexError, TypeError):
+         return False
+ 
+-    if tensor.dtype == torch.bfloat16:
+-        tensor = tensor.to(torch.float16)
++    # Cast checkpoint tensors to match the destination's declared dtype when it
++    # is half-precision (FP16 / BF16).  The module tree fixes each weight's
++    # dtype at construction (FP16 attention vs. BF16 residual/MLP in the
++    # mixed-precision path; FP16 everywhere on the legacy path), so honouring
++    # the destination keeps each island in its intended precision.  When the
++    # destination is unknown (plain attribute / pre-load nn.Embedding), fall
++    # back to the legacy behaviour: BF16 -> FP16.
++    if tensor.dtype in (torch.bfloat16, torch.float16):
++        dst = module._parameters.get(attr) if attr in module._parameters \
++            else module._buffers.get(attr)
++        dst_dtype = getattr(dst, "dtype", None)
++        if dst_dtype in (torch.float16, torch.bfloat16):
++            tensor = tensor.to(dst_dtype)
++        elif tensor.dtype == torch.bfloat16:
++            tensor = tensor.to(torch.float16)
+ 
+     if attr in module._buffers:
+         module._buffers[attr] = tensor
+-- 
+2.50.1 (Apple Git-155)
+

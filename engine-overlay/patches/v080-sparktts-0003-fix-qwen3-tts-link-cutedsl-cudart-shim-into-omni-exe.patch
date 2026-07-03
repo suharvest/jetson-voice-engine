@@ -1,7 +1,7 @@
 From 867b74d0e889dcf2ec78538649b7e135efc73cb5 Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 04:19:08 +0800
-Subject: [PATCH 3/6] fix(qwen3-tts): link cutedsl cudart shim into omni exes
+Subject: [PATCH 03/30] fix(qwen3-tts): link cutedsl cudart shim into omni exes
  (CUDA 12.6 sm_87)
 
 

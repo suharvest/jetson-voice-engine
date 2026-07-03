@@ -2,10 +2,16 @@
 
 ```text
 upstream:       github.com/NVIDIA/TensorRT-Edge-LLM (Apache 2.0)
-UPSTREAM_PIN:   364769036fc83351d9d0aac4cc064a8e56a83178   (= tag v0.7.1)
-fork_branch:    v071/customvoice-product  (extracted HEAD 893ba2a, 90 commits ahead)
-extraction:     2026-05-31 (initial overlay extraction; build-verify DEFERRED → Jetson host)
+UPSTREAM_PIN:   f9cc74623d95d7acf1addab6026b9d410ba81f52   (= release/0.8.0 HEAD, pure NVIDIA)
+patch series:   v080-sparktts-0001..0030 (= fork integration/v080-sparktts @ 8437f027)
+repin:          2026-07-03 C2 sparktts re-pin — see patches/PATCH-STATE-v080.md §13
 ```
+
+> ⚠️ 2026-07-03 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
+> fork v071/customvoice-product),patch 编号/scope 以 PATCH-STATE-v080.md §13
+> 处置表为准:0003/0004/0005/v080-port-* 已删除;0002 重基为
+> `0002-weight-streaming-budget-v080-OPTIN`(仅 builderUtils hunk,不在默认链);
+> 0006/0007/0008 存档。(a)/(b) 分类与 SSE-fix PR-pending(禁自动提交)结论不变。
 
 ## (a)/(b) 判定准则
 

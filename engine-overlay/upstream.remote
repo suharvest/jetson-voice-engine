@@ -1,5 +1,6 @@
-https://github.com/suharvest/TensorRT-Edge-LLM.git
-# suharvest fork — hosts branch suharvest/port/qwen3-tts-base-v080-n1n2,
-# from which UPSTREAM_PIN (a361221) is reachable. The fork tracks NVIDIA
-# TensorRT-Edge-LLM (https://github.com/NVIDIA/TensorRT-Edge-LLM.git) at
-# release/0.8.0 (f9cc746) plus the Base TTS N>1 port commits (see UPSTREAM_PIN).
+https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+# UPSTREAM_PIN (f9cc7462) is a pure NVIDIA release/0.8.0 commit, so the NVIDIA
+# repo is the canonical remote again (C2 sparktts re-pin, 2026-07-03). The
+# suharvest fork (https://github.com/suharvest/TensorRT-Edge-LLM.git) carries
+# the same SHA and works as a fallback. Cross-wall / offline devices: override
+# with EDGELLM_UPSTREAM_REMOTE=<local checkout or bundle> (see build.sh).
