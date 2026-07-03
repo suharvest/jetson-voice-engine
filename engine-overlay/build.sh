@@ -51,6 +51,10 @@ if [ ! -d "${WORKDIR}/.git" ]; then
 fi
 git -C "${WORKDIR}" fetch --depth 1 origin "${PIN}" || git -C "${WORKDIR}" fetch origin
 git -C "${WORKDIR}" checkout -q "${PIN}"
+# Patches are applied with `git apply` onto tracked files; a plain checkout of
+# the same PIN does NOT reset that dirty tree, so a re-run would fail every
+# `git apply --check`. Hard-reset to the pin to make the script re-runnable.
+git -C "${WORKDIR}" reset --hard -q "${PIN}"
 git -C "${WORKDIR}" clean -fdq
 # Integration branch carries 3rdParty submodules (googletest, nlohmannJson, NVTX).
 # Without this the CMake configure fails on the missing 3rdParty/* trees.
@@ -161,6 +165,12 @@ esac
 #   system package → TRT_PACKAGE_DIR=/usr. Release build type matters
 #   (empty type ≈ 2x slower runtime).
 CUDA_CTK="${CUDA_CTK_VERSION:-12.6}"
+# Non-interactive shells (ssh/fleet exec) don't have nvcc on PATH → cmake dies
+# with CMAKE_CUDA_COMPILER-NOTFOUND. Point PATH/CUDACXX at the toolkit.
+if ! command -v nvcc >/dev/null 2>&1; then
+  export PATH="/usr/local/cuda-${CUDA_CTK}/bin:${PATH}"
+fi
+export CUDACXX="${CUDACXX:-/usr/local/cuda-${CUDA_CTK}/bin/nvcc}"
 TRT_PKG="${TRT_PACKAGE_DIR:-/usr}"
 # CUDA target SM. On aarch64/Tegra (Orin) the upstream CMakeLists, hardened by
 # 0001, SKIPS the desktop "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block — so
@@ -236,7 +246,7 @@ if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
         -DEDGE_LLM_SOURCE_DIR="${WORKDIR}" \
         -DEDGE_LLM_BUILD_DIR="${WORKDIR}/build"
   cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
-        --target qwen3_asr_worker
+        --target qwen3_asr_worker spark_tts_worker
 else
   echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR worker NOT built." >&2
 fi
