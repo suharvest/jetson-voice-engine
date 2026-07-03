@@ -329,6 +329,14 @@ struct SessionState
     std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
     Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
+    //! Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1, default OFF) state. When the
+    //! flag is OFF these stay untouched and the cumulative re-decode path is
+    //! byte-identical to #12. rawDecoded mirrors v0.7.x session.rawDecoded (the
+    //! accumulated transcript WITH its leading "language <X>" tag, exactly as the
+    //! model emits it). chunkId is the per-utterance hop counter that drives the
+    //! unfixedChunkNum warmup (first N hops use NO prefix => full re-decode).
+    std::string rawDecoded;                   //!< Accumulated transcript (lang tag included).
+    int32_t chunkId{0};                       //!< Hop counter (mirrors v0.7.x chunk_id).
 };
 
 std::mutex gEngineExecMutex;                                   //!< Serializes the whole prefill+decode engine step.
@@ -346,25 +354,70 @@ int64_t sidToOwnerId(std::string const& sid)
 //! Task #10: strip the leading "language <Lang>" tag the ASR head prepends, so
 //! partials and finals expose the same bare transcript. Applied consistently to
 //! both partial and final transcripts (idempotent — no tag => unchanged).
+//! Case-insensitive ASCII compare of literal ``lit`` against ``s`` at ``pos``.
+bool asciiIEqualsAt(std::string const& s, size_t pos, char const* lit)
+{
+    for (size_t i = 0; lit[i] != '\0'; ++i)
+    {
+        if (pos + i >= s.size()) return false;
+        char a = s[pos + i];
+        char b = lit[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+//! Longest known ASR language name matching ``s`` at ``pos`` (0 = none). Used to
+//! bound the "language <Lang>" strip so an ASCII transcript word glued to the tag
+//! (e.g. "language EnglishGo home." — no <asr_text> separator) is NOT consumed.
+size_t knownAsrLanguagePrefixLen(std::string const& s, size_t pos)
+{
+    static char const* const kLanguages[] = {
+        "Chinese", "English", "Cantonese", "Japanese", "Korean", "French", "German", "Spanish",
+        "Italian", "Portuguese", "Russian", "Arabic", "Hindi", "Bengali", "Urdu", "Indonesian",
+        "Malay", "Vietnamese", "Thai", "Turkish", "Dutch", "Polish", "Ukrainian", "Swedish",
+        "Norwegian", "Danish", "Finnish", "Greek", "Hebrew", "Persian", "Czech", "Slovak",
+        "Hungarian", "Romanian", "Bulgarian", "Croatian", "Serbian", "Tamil", "Telugu",
+        "Marathi", "Gujarati", "Kannada", "Malayalam", "Punjabi", "Nepali", "Sinhala",
+        "Burmese", "Khmer", "Lao", "Mongolian", "Tibetan", "Uyghur"};
+    size_t best = 0;
+    for (char const* lang : kLanguages)
+    {
+        size_t const n = std::strlen(lang);
+        if (n > best && asciiIEqualsAt(s, pos, lang)) best = n;
+    }
+    return best;
+}
+
 std::string stripLangTag(std::string const& s)
 {
-    // Match a leading ASCII "language" token (case-insensitive) + single space +
-    // a language word + a space, e.g. "language Chinese这并不是...". We only strip
-    // the "language <Word> " prefix; the CJK transcript that follows is preserved.
+    // Strip the "language <Lang>" / "language <Lang><asr_text>" head tag. The
+    // <asr_text> token is often a special token decoded to empty, so the language
+    // name can be glued to the first ASCII transcript word ("language EnglishGo
+    // home."). Matching a KNOWN language name (not a greedy ASCII-letter run)
+    // bounds the strip so the first word survives. CJK transcripts are non-ASCII
+    // so they were already safe; unknown/absent tags leave ``s`` unchanged.
     static char const* kTag = "language ";
+    static char const* kAsrTextTag = "<asr_text>";
     constexpr size_t kTagLen = 9; // strlen("language ")
     if (s.size() < kTagLen) return s;
-    for (size_t i = 0; i < kTagLen; ++i)
-    {
-        char a = s[i];
-        char b = kTag[i];
-        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
-        if (a != b) return s; // no "language " prefix -> leave untouched
-    }
-    // Skip the language word (run of ASCII letters) and exactly one following space.
+
+    if (!asciiIEqualsAt(s, 0, kTag)) return s; // no "language " prefix -> untouched
     size_t j = kTagLen;
-    while (j < s.size() && ((s[j] >= 'A' && s[j] <= 'Z') || (s[j] >= 'a' && s[j] <= 'z'))) ++j;
-    if (j < s.size() && s[j] == ' ') ++j;
+
+    // Forward-compat: if the <asr_text> separator survived, split on it directly.
+    if (asciiIEqualsAt(s, j, kAsrTextTag))
+    {
+        return s.substr(j + std::strlen(kAsrTextTag));
+    }
+
+    size_t const langLen = knownAsrLanguagePrefixLen(s, j);
+    if (langLen == 0) return s; // unknown language word -> don't risk eating text
+    j += langLen;
+    while (j < s.size() && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n')) ++j;
+    if (asciiIEqualsAt(s, j, kAsrTextTag)) j += std::strlen(kAsrTextTag);
     return s.substr(j);
 }
 
@@ -382,6 +435,32 @@ std::string transcriptFromCore(Json const& core)
     }
     return std::string();
 }
+
+//! Global tokenizer handle for the streaming-prefix rollback (OVS_ASR_STREAM_PREFIX).
+//! Loaded once in main() from the LLM engine dir (tokenizer.json + chat template)
+//! when the flag is ON; null otherwise. Used ONLY to encode/decode the accumulated
+//! transcript for the unfixedTokenNum roll-back (computePrefix). It is NOT used by
+//! the runtime decode path, so the cumulative/one-shot golden path is unaffected.
+std::unique_ptr<tokenizer::Tokenizer> gPrefixTokenizer;
+
+// Forward declarations for the streaming-prefix path (definitions live after the
+// asrStreamDelta namespace, alongside runOneShotCore which they reuse). handleChunk
+// / handleEnd reference these, so declare them up here.
+namespace asrStreamPrefix
+{
+struct HopOut
+{
+    bool ok{false};
+    std::string generated;   //!< CONTINUATION text from the runtime (post lang-preamble strip).
+    double totalMs{0.0};
+    std::string error;
+};
+bool enabled();
+std::string computePrefix(SessionState const& st, bool isFinish);
+HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
+    bool isFinish, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
+    std::unordered_map<std::string, std::string>& loraWeightsMap);
+} // namespace asrStreamPrefix
 
 //! begin: reserve a lane (pool_saturated -> 4429), register session, ack.
 void handleBegin(Json const& input)
@@ -516,6 +595,41 @@ void handleChunk(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream
         return;
     }
 
+    // Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1): chunk-and-confirm rollback.
+    // Each hop rolls back the last unfixedTokenNum tokens of the accumulated
+    // transcript (computePrefix) and re-derives them + the new words from the
+    // CURRENT cumulative audio, so a premature EOS / hallucinated tail in the
+    // unstable window is REVISED instead of permanently committed. The first
+    // unfixedChunkNum hops use NO prefix (full re-decode) while early audio is
+    // unstable. Audio stays cumulative; only DECODE is flattened.
+    if (asrStreamPrefix::enabled())
+    {
+        std::string const prefix = asrStreamPrefix::computePrefix(st, /*isFinish=*/false);
+        asrStreamPrefix::HopOut hop;
+        {
+            std::lock_guard<std::mutex> lk(gEngineExecMutex);
+            hop = asrStreamPrefix::runPrefixHop(
+                sid, st, prefix, /*capOverride*/ -1, /*isFinish=*/false, runtime, stream, loraWeightsMap);
+        }
+        if (hop.ok)
+        {
+            // Re-derive the rolled-back tail: rawDecoded = confirmed prefix + fresh
+            // continuation (NOT old-rawDecoded + continuation — that was the #25
+            // poisoning bug). The unstable last-N tokens are thus replaced each hop.
+            st.rawDecoded = prefix + hop.generated;
+            st.chunkId += 1;
+            std::cout << Json{{"event", "partial"}, {"id", sid}, {"text", stripLangTag(st.rawDecoded)}}.dump()
+                      << std::endl;
+        }
+        else
+        {
+            Json ev = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "partial_decode_failed"}};
+            if (!hop.error.empty()) ev["detail"] = hop.error;
+            std::cout << ev.dump() << std::endl;
+        }
+        return;
+    }
+
     // Cumulative re-decode on the session's reserved lane (serialized by the engine
     // exec mutex, identical step to the one-shot/finalize path).
     Json const req = buildFinalizeRequest(sid, st);
@@ -622,6 +736,56 @@ void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t
     {
         finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "no_audio_accumulated"}};
     }
+    else if (asrStreamPrefix::enabled())
+    {
+        // Streaming-prefix finalize. Partials (non-final hops) stay the cheap
+        // rollback-continuation. But the FINAL transcript must be BYTE-EXACT to the
+        // deployed one-shot, so by default we re-run the PROVEN golden one-shot core
+        // (buildFinalizeRequest = user-only message over the FULL cumulative audio,
+        // NO assistant-prefix) over the cumulative audio ONCE here — exactly what the
+        // deployed/default path (the `else` branch below) does. This eliminates the
+        // CER 0.01-0.025 rollback residual while keeping partials flat/cheap.
+        // OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT=0 reverts to the old rollback-final hop.
+        bool finalOneShot = true;
+        if (char const* fp = std::getenv("OVS_ASR_STREAM_PREFIX_FINAL_ONESHOT"))
+            finalOneShot = !(fp[0] == '0' && fp[1] == '\0');
+        if (finalOneShot)
+        {
+            Json const req = buildFinalizeRequest(sid, st);
+            Json core;
+            {
+                std::lock_guard<std::mutex> lk(gEngineExecMutex);
+                core = runOneShotCore(req, runtime, stream, loraWeightsMap);
+            }
+            finalEv = Json{{"event", "final"}, {"id", sid}, {"ok", core.value("ok", false)}};
+            if (core.contains("responses")) finalEv["responses"] = core["responses"];
+            if (core.value("ok", false)) finalEv["text"] = transcriptFromCore(core);
+            if (core.contains("total_ms")) finalEv["total_ms"] = core["total_ms"];
+            if (core.contains("error")) finalEv["error"] = core["error"];
+        }
+        else
+        {
+            // Legacy rollback-final: one last UNCAPPED chunk-and-confirm hop over the
+            // FULL cumulative audio (isFinish=true keeps >=1 confirmed prefix token).
+            std::string const prefix = asrStreamPrefix::computePrefix(st, /*isFinish=*/true);
+            asrStreamPrefix::HopOut hop;
+            {
+                std::lock_guard<std::mutex> lk(gEngineExecMutex);
+                hop = asrStreamPrefix::runPrefixHop(
+                    sid, st, prefix, /*uncapped*/ -1, /*isFinish=*/true, runtime, stream, loraWeightsMap);
+            }
+            std::string const finalRaw = prefix + hop.generated;
+            finalEv = Json{{"event", "final"}, {"id", sid}, {"ok", hop.ok}};
+            if (hop.ok)
+            {
+                finalEv["responses"] = Json::array(
+                    {Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", finalRaw}}});
+                finalEv["text"] = stripLangTag(finalRaw);
+            }
+            finalEv["total_ms"] = hop.totalMs;
+            if (!hop.error.empty()) finalEv["error"] = hop.error;
+        }
+    }
     else
     {
         Json const req = buildFinalizeRequest(sid, st);
@@ -689,15 +853,651 @@ void sweepIdleSessions()
     }
 }
 
+// ===========================================================================
+// Phase 2a: alternate finalize path via AsrStreamingSessionRuntime (single hop).
+//
+// Gated by env OVS_ASR_SESSION_PATH=1 (default OFF -> runOneShotCore unchanged).
+// When ON, the FULL utterance is driven through the streaming-session runtime as
+// a SINGLE chunk (mirrors examples/llm/spike_v080_m6_audio_streaming.cpp --chunks 1):
+//   beginAsrSession -> appendChunk(full mel, isFinal=true) -> decodeToTranscript
+//   -> getTranscript -> endAsrSession.
+// The mel consumed is the SAME `.safetensors` the one-shot path would feed via
+// requestFileParser (extracted from the request envelope below), and the audio-pad
+// token layout matches the one-shot prompt exactly (Qwen3-ASR config.json):
+//   prefix = <|im_start|>user\n      = [151644, 872, 198]
+//   audio  = <|audio_start|> Nx<|audio_pad|> <|audio_end|> = [151669, 151676*N, 151670]
+//   suffix = <|im_end|>\n<|im_start|>assistant\n = [151645, 198, 151644, 77091, 198]
+// (audio_*_token_id read from engines-v080/llm/config.json: start=151669, pad=151676,
+//  end=151670; chat template default_system_prompt is empty -> no system block, just
+//  like the one-shot user-message prompt.) N is derived from the REAL audio by probing
+// the encoder (encodeAudioChunk -> outEmbedding.getShape()[0]), never hardcoded.
+//
+// This is OFFLINE single-hop EQUIVALENCE validation only (Phase 2a). Delta/multi-hop
+// /partial extraction is Phase 2b.
+// ===========================================================================
+namespace asrSessionPath
+{
+constexpr int32_t kImStart = 151644;
+constexpr int32_t kUser = 872;
+constexpr int32_t kNl = 198;
+constexpr int32_t kAudioStart = 151669;
+constexpr int32_t kAudioPad = 151676;
+constexpr int32_t kAudioEnd = 151670;
+constexpr int32_t kImEnd = 151645;
+constexpr int32_t kAssistant = 77091;
+constexpr int32_t kMaxAudioTokensPerChunk = 2048; // worst-case per-chunk scratch size (matches m6).
+
+//! True iff OVS_ASR_SESSION_PATH=1 (cached once; default OFF). When OFF the worker
+//! is byte-identical to v080-0021 #10 — runOneShotCore is the unchanged golden path.
+bool enabled()
+{
+    static bool const on = []() {
+        char const* p = std::getenv("OVS_ASR_SESSION_PATH");
+        return p != nullptr && std::string(p) == "1";
+    }();
+    return on;
+}
+
+//! Dig the audio mel `.safetensors` path out of the one-shot request envelope
+//! (requests[0].messages[*].content[*] with type=="audio"). Returns "" if none.
+std::string extractMelPath(Json const& input)
+{
+    if (!input.contains("requests") || !input["requests"].is_array() || input["requests"].empty())
+        return std::string();
+    Json const& r0 = input["requests"][0];
+    if (!r0.contains("messages") || !r0["messages"].is_array())
+        return std::string();
+    for (Json const& msg : r0["messages"])
+    {
+        if (!msg.contains("content") || !msg["content"].is_array())
+            continue;
+        for (Json const& c : msg["content"])
+        {
+            if (c.contains("type") && c["type"] == "audio" && c.contains("audio") && c["audio"].is_string())
+                return c["audio"].get<std::string>();
+        }
+    }
+    return std::string();
+}
+
+//! Drive the full mel through AsrStreamingSessionRuntime as a SINGLE hop and return
+//! the bare transcript. Throws on any session-runtime failure. activeBatchSize=1.
+std::string runSingleHop(std::string const& melPath, rt::LLMInferenceRuntime& runtime, int32_t maxGenerateLength,
+    cudaStream_t stream)
+{
+    // 1) Probe the encoder to learn N (== number of <|audio_pad|> tokens this mel yields).
+    rt::Tensor probeScratch;
+    if (!runtime.allocateChunkAudioEmbedding(probeScratch, kMaxAudioTokensPerChunk))
+        throw std::runtime_error("session_path: allocateChunkAudioEmbedding failed");
+    rt::audioUtils::AudioData melDesc;
+    melDesc.melSpectrogramPath = melPath;
+    melDesc.melSpectrogramFormat = "safetensors";
+    if (!runtime.encodeAudioChunk(melDesc, probeScratch, stream))
+        throw std::runtime_error("session_path: encodeAudioChunk (probe) failed for " + melPath);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    int32_t const nTokens = static_cast<int32_t>(probeScratch.getShape()[0]);
+    if (nTokens <= 0)
+        throw std::runtime_error("session_path: probe produced 0 audio tokens");
+
+    // 2) maxPositions covers prefix(4) + N pads + suffix(6) + slack (matches m6: N + 64).
+    int32_t const maxPositions = nTokens + 64;
+
+    // 3) Single-session over lane 0 (Phase 3 single-lane; activeBatchSize == 1).
+    rt::AsrStreamingSessionRuntime sess(runtime, /*lane*/ 0);
+    if (!sess.beginAsrSession(/*promptTokenIds*/ {}, maxPositions, kMaxAudioTokensPerChunk, stream, maxGenerateLength))
+        throw std::runtime_error("session_path: beginAsrSession failed");
+
+    // 4) SINGLE chunk = the whole audio. Carries the full prompt: prefix + audio_start,
+    //    then N audio pads, then audio_end + assistant suffix; isFinal=true samples a token.
+    std::vector<int32_t> slice;
+    slice.push_back(kImStart);
+    slice.push_back(kUser);
+    slice.push_back(kNl);
+    slice.push_back(kAudioStart);
+    for (int32_t k = 0; k < nTokens; ++k)
+        slice.push_back(kAudioPad);
+    slice.push_back(kAudioEnd);
+    slice.push_back(kImEnd);
+    slice.push_back(kNl);
+    slice.push_back(kImStart);
+    slice.push_back(kAssistant);
+    slice.push_back(kNl);
+
+    rt::AudioChunk chunk;
+    chunk.data.melSpectrogramPath = melPath;
+    chunk.data.melSpectrogramFormat = "safetensors";
+    chunk.hasAudio = true;
+    if (!sess.appendChunk(slice, chunk, /*isFinalChunk*/ true, stream))
+    {
+        sess.endAsrSession(stream);
+        throw std::runtime_error("session_path: appendChunk (final) failed");
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (sess.status() != rt::AsrSessionStatus::kFinished)
+    {
+        sess.endAsrSession(stream);
+        throw std::runtime_error("session_path: session not finished after final chunk");
+    }
+
+    // 5) Decode-to-EOS, read transcript, then end the session (full-batch reset, Phase 3).
+    if (!sess.decodeToTranscript(stream))
+    {
+        sess.endAsrSession(stream);
+        throw std::runtime_error("session_path: decodeToTranscript failed");
+    }
+    std::string const transcript = sess.getTranscript();
+    sess.endAsrSession(stream);
+    return transcript;
+}
+
+//! Session-path analogue of runOneShotCore: same input/output envelope, but the
+//! transcript is produced by the streaming-session single-hop instead of
+//! handleRequest. Returns the SAME Json shape so all callers / the A/B gate compare
+//! apples-to-apples. The output_text carries the bare transcript exactly as the
+//! audio head emits it (lang tag included) — identical to handleRequest's outputTexts.
+Json runSessionCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream)
+{
+    Json response;
+    auto const requestStart = std::chrono::steady_clock::now();
+    try
+    {
+        std::string const id = input.value("id", "");
+        int64_t const maxGenLenOverride = input.value("max_generate_length_override", -1);
+        int64_t maxGenLen = input.value("max_generate_length", 256);
+        if (maxGenLenOverride > 0) maxGenLen = maxGenLenOverride;
+        if (maxGenLen <= 0) maxGenLen = 256;
+
+        std::string const melPath = extractMelPath(input);
+        if (melPath.empty())
+            throw std::runtime_error("session_path: no audio mel path in request");
+
+        std::string const text = runSingleHop(melPath, runtime, static_cast<int32_t>(maxGenLen), stream);
+
+        Json responses = Json::array();
+        responses.push_back(Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", text}});
+        double const totalMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
+        response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
+            {"total_ms", totalMs}, {"path", "session"}};
+    }
+    catch (std::exception const& e)
+    {
+        response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}, {"path", "session"}};
+    }
+    return response;
+}
+} // namespace asrSessionPath
+
+// ===========================================================================
+// Phase 2b: MULTI-HOP DELTA streaming path with non-evicting peek partials.
+//
+// Gated by env OVS_ASR_STREAM_DELTA=1 (default OFF; orthogonal to OVS_ASR_SESSION_PATH).
+// Splits a clip's mel into K disjoint hops (the .cN delta slices from gen_mel_np.py) and
+// drives them through AsrStreamingSessionRuntime as a TRUE incremental-KV stream:
+//   begin(prompt-open: prefix + audio_start, NO audio_end/suffix yet)
+//   hop k<K-1 (non-final): appendChunk(delta pads + delta mel, isFinal=false)  [O(delta) work]
+//                          -> peekTranscriptWithSuffix(...) -> emit `partial`   [non-evicting]
+//   hop K-1   (final):     appendChunk(last delta pads + audio_end + suffix, isFinal=true)
+//                          -> decodeToTranscript -> `final` (REAL, no restore) -> endAsrSession
+//
+// The (encode+append) wall time per hop is logged SEPARATELY from the peek-decode time so the
+// O(N) (flat per-hop append) vs O(N^2) (cumulative re-decode) win is observable (G2). Per-hop
+// pre-peek vs post-peek KV length + tokenIds + activeBatch are captured to prove zero peek
+// residue across interleaved appends (G3). The FINAL transcript must be byte-identical to the
+// one-shot golden (G1).
+//
+// Single-token guard (v080-0004): a non-final delta whose audio_pad count would be 1 is BUFFERED
+// and merged into the next hop (audio deltas are ~>=100 pads in practice, but guarded anyway).
+// ===========================================================================
+namespace asrStreamDelta
+{
+using namespace asrSessionPath; // reuse the token-id constants + kMaxAudioTokensPerChunk.
+
+//! True iff OVS_ASR_STREAM_DELTA=1 (cached once; default OFF).
+bool enabled()
+{
+    static bool const on = []() {
+        char const* p = std::getenv("OVS_ASR_STREAM_DELTA");
+        return p != nullptr && std::string(p) == "1";
+    }();
+    return on;
+}
+
+//! Probe one delta mel through the encoder to learn its audio-token count (nk pads).
+int32_t probeDelta(rt::LLMInferenceRuntime& runtime, std::string const& melPath, rt::Tensor& scratch,
+    cudaStream_t stream)
+{
+    rt::audioUtils::AudioData mel;
+    mel.melSpectrogramPath = melPath;
+    mel.melSpectrogramFormat = "safetensors";
+    if (!runtime.encodeAudioChunk(mel, scratch, stream))
+        return -1;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return static_cast<int32_t>(scratch.getShape()[0]);
+}
+
+//! Drive the multi-hop delta stream. Emits per-hop `partial` + `hop_metric` events on `out`,
+//! returns the FINAL bare transcript (lang tag included; same shape as runSessionCore).
+//! `deltaMels` are the K disjoint .cN mel slices, in order.
+Json runDelta(std::vector<std::string> const& deltaMels, rt::LLMInferenceRuntime& runtime,
+    int32_t maxGenLen, cudaStream_t stream, std::string const& id)
+{
+    auto const reqStart = std::chrono::steady_clock::now();
+    Json perHop = Json::array();
+
+    // 1) Probe every delta to learn nk, total tokens, and to apply the single-token guard.
+    rt::Tensor probeScratch;
+    if (!runtime.allocateChunkAudioEmbedding(probeScratch, kMaxAudioTokensPerChunk))
+        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: allocateChunkAudioEmbedding failed"}};
+    int32_t const K = static_cast<int32_t>(deltaMels.size());
+    std::vector<int32_t> nTok(K, 0);
+    int32_t total = 0;
+    for (int32_t i = 0; i < K; ++i)
+    {
+        nTok[i] = probeDelta(runtime, deltaMels[i], probeScratch, stream);
+        if (nTok[i] < 0)
+            return Json{{"event", "error"}, {"ok", false}, {"error", "delta: probe failed for " + deltaMels[i]}};
+        total += nTok[i];
+    }
+    int32_t const maxPositions = total + 64;
+
+    // 2) begin (prompt-open only: prefix + audio_start). No audio_end / suffix yet.
+    rt::AsrStreamingSessionRuntime sess(runtime, /*lane*/ 0);
+    if (!sess.beginAsrSession(/*promptTokenIds*/ {}, maxPositions, kMaxAudioTokensPerChunk, stream, maxGenLen))
+        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: beginAsrSession failed"}};
+
+    int32_t const lane = 0;
+    int32_t const lastIdx = K - 1;
+    std::vector<int32_t> const suffix
+        = {kAudioEnd, kImEnd, kNl, kImStart, kAssistant, kNl}; // speculative + real suffix.
+
+    int32_t bufferedPads = 0; // single-token guard carry (count of audio pads merged into next hop).
+
+    for (int32_t i = 0; i <= lastIdx; ++i)
+    {
+        bool const isFinal = (i == lastIdx);
+        int32_t padCount = nTok[i] + bufferedPads;
+
+        // Single-token guard: never let a NON-FINAL append be exactly 1 audio pad -> buffer + merge.
+        if (!isFinal && padCount == 1)
+        {
+            bufferedPads = padCount;
+            perHop.push_back(Json{{"hop", i}, {"buffered", true}, {"pads", nTok[i]},
+                {"note", "single-token-guard: deferred to next hop"}});
+            continue;
+        }
+        bufferedPads = 0;
+
+        // Build this hop's token slice.
+        std::vector<int32_t> slice;
+        if (i == 0)
+        {
+            slice.push_back(kImStart);
+            slice.push_back(kUser);
+            slice.push_back(kNl);
+            slice.push_back(kAudioStart);
+        }
+        for (int32_t k = 0; k < padCount; ++k)
+            slice.push_back(kAudioPad);
+        if (isFinal)
+            for (int32_t t : suffix)
+                slice.push_back(t);
+
+        rt::AudioChunk chunk;
+        chunk.data.melSpectrogramPath = deltaMels[i];
+        chunk.data.melSpectrogramFormat = "safetensors";
+        chunk.hasAudio = true;
+
+        // ── G2: time (encodeMelChunk + appendChunk) ONLY (the O(N) work). ──
+        auto const t0 = std::chrono::steady_clock::now();
+        bool const ok = sess.appendChunk(slice, chunk, isFinal, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto const t1 = std::chrono::steady_clock::now();
+        double const appendMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (!ok)
+        {
+            sess.endAsrSession(stream);
+            return Json{{"event", "error"}, {"ok", false},
+                {"error", "delta: appendChunk hop " + std::to_string(i) + " failed"}};
+        }
+
+        if (!isFinal)
+        {
+            // ── G3: pre-peek durable state snapshot. ──
+            auto const& ctxPre = sess.contextForTesting();
+            int32_t const kvPre = sess.peekKvCacheLength(stream);
+            std::vector<int32_t> const tokPre = ctxPre.tokenIds.at(lane);
+            int32_t const abPre = ctxPre.activeBatchSize;
+
+            // ── PEEK-WITH-SUFFIX (the CRUX): non-evicting partial from a MID-AUDIO session. ──
+            auto const p0 = std::chrono::steady_clock::now();
+            rt::DecodePeekResult pr = sess.peekTranscriptWithSuffix(suffix, maxGenLen, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto const p1 = std::chrono::steady_clock::now();
+            double const peekMs = std::chrono::duration<double, std::milli>(p1 - p0).count();
+
+            // ── G3: post-peek durable state (must equal pre-peek -> zero residue). ──
+            auto const& ctxPost = sess.contextForTesting();
+            int32_t const kvPost = sess.peekKvCacheLength(stream);
+            std::vector<int32_t> const tokPost = ctxPost.tokenIds.at(lane);
+            int32_t const abPost = ctxPost.activeBatchSize;
+            bool const residueFree = (kvPost == kvPre) && (tokPost == tokPre) && (abPost == abPre);
+
+            std::string const partial = stripLangTag(pr.transcript);
+            std::cout << Json{{"event", "partial"}, {"id", id}, {"hop", i}, {"text", partial}}.dump()
+                      << std::endl;
+
+            perHop.push_back(Json{{"hop", i}, {"final", false}, {"pads", padCount}, {"kv", kvPre},
+                {"append_ms", appendMs}, {"peek_ms", peekMs}, {"peek_ok", pr.ok},
+                {"partial", partial},
+                {"g3_kv_pre", kvPre}, {"g3_kv_post", kvPost}, {"g3_tok_pre", tokPre.size()},
+                {"g3_tok_post", tokPost.size()}, {"g3_tok_eq", (tokPost == tokPre)},
+                {"g3_ab_pre", abPre}, {"g3_ab_post", abPost}, {"g3_residue_free", residueFree}});
+        }
+        else
+        {
+            int32_t const kvFinal = sess.peekKvCacheLength(stream);
+            perHop.push_back(Json{{"hop", i}, {"final", true}, {"pads", padCount}, {"kv", kvFinal},
+                {"append_ms", appendMs}});
+        }
+    }
+
+    // 3) Final REAL decode (no restore) -> transcript -> end.
+    if (sess.status() != rt::AsrSessionStatus::kFinished)
+    {
+        sess.endAsrSession(stream);
+        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: not finished after final hop"}};
+    }
+    if (!sess.decodeToTranscript(stream))
+    {
+        sess.endAsrSession(stream);
+        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: final decodeToTranscript failed"}};
+    }
+    std::string const finalText = sess.getTranscript();
+    sess.endAsrSession(stream);
+
+    double const totalMs
+        = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - reqStart).count();
+    Json responses = Json::array();
+    responses.push_back(Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", finalText}});
+    return Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
+        {"total_ms", totalMs}, {"path", "stream_delta"}, {"per_hop", perHop}};
+}
+
+//! Dig the delta mel list out of the request (top-level "delta_mels": [paths...]).
+std::vector<std::string> extractDeltaMels(Json const& input)
+{
+    std::vector<std::string> out;
+    if (input.contains("delta_mels") && input["delta_mels"].is_array())
+        for (Json const& m : input["delta_mels"])
+            if (m.is_string())
+                out.push_back(m.get<std::string>());
+    return out;
+}
+
+//! Session-delta analogue of runSessionCore: same envelope, multi-hop delta path.
+Json runDeltaCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream)
+{
+    try
+    {
+        std::string const id = input.value("id", "");
+        int64_t maxGenLen = input.value("max_generate_length", 256);
+        int64_t const ovr = input.value("max_generate_length_override", -1);
+        if (ovr > 0) maxGenLen = ovr;
+        if (maxGenLen <= 0) maxGenLen = 256;
+
+        std::vector<std::string> deltas = extractDeltaMels(input);
+        if (deltas.empty())
+            return Json{{"event", "error"}, {"ok", false},
+                {"error", "stream_delta: no delta_mels[] in request"}, {"path", "stream_delta"}};
+        return runDelta(deltas, runtime, static_cast<int32_t>(maxGenLen), stream, id);
+    }
+    catch (std::exception const& e)
+    {
+        return Json{{"event", "error"}, {"ok", false}, {"error", e.what()}, {"path", "stream_delta"}};
+    }
+}
+} // namespace asrStreamDelta
+
+// ===========================================================================
+// Streaming-prefix CHUNK-AND-CONFIRM ROLLBACK (v0.7.x flat-decode, faithful port).
+//
+// Gated by env OVS_ASR_STREAM_PREFIX=1 (default OFF -> handleChunk/handleEnd take
+// the cumulative re-decode path, byte-identical to #12). Mirrors the v0.7.x worker
+// (asr-worker-build-verify/qwen3_asr_worker.cpp): session params unfixedChunkNum=2,
+// unfixedTokenNum=5, maxDecodeTokensPerHop=64; computePrefix() / runStreamingHop().
+//
+// Mechanism (THE fix the #25 attempt dropped): each hop the accumulated transcript
+// is rolled back by unfixedTokenNum tokens — the last N tokens are treated as
+// UNCONFIRMED/revisable. The runtime re-derives them (plus the new words) from the
+// CURRENT cumulative audio via an assistant-prefix continuation. A premature EOS /
+// hallucinated tail in that unstable window is therefore REVISED with more audio,
+// never permanently committed. Only the confirmed prefix (all but the last N
+// tokens) is reused cheaply (prefilled, not re-decoded). The first unfixedChunkNum
+// hops use NO prefix (full re-decode) while early audio is unstable.
+//
+// Audio stays CUMULATIVE (full mel each hop) — this flattens DECODE, not encode.
+// Per hop:
+//   prefix = computePrefix(rawDecoded, chunkId)   // rolled-back confirmed text
+//   request = user(audio=full cumulative mel) + assistant(prefix)   // open turn
+//   cap = maxDecodeTokensPerHop (final hop uncapped)
+//   rawDecoded = prefix + parseAsrText(generated) // re-derive the rolled-back tail
+// ===========================================================================
+namespace asrStreamPrefix
+{
+constexpr char const* kUtf8Replacement = "\xEF\xBF\xBD"; //!< U+FFFD as UTF-8 (multibyte-split guard).
+
+//! True iff OVS_ASR_STREAM_PREFIX=1 (cached once; default OFF).
+bool enabled()
+{
+    static bool const on = []() {
+        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX");
+        return p != nullptr && std::string(p) == "1";
+    }();
+    return on;
+}
+
+//! unfixedChunkNum (mirrors v0.7.x=2): first N hops use NO prefix => full re-decode
+//! (early audio is unstable, do not confirm anything yet). Env: OVS_ASR_PREFIX_WARMUP.
+int32_t unfixedChunkNum()
+{
+    static int32_t const v = []() {
+        char const* p = std::getenv("OVS_ASR_PREFIX_WARMUP");
+        int32_t x = (p != nullptr) ? std::atoi(p) : 2;
+        return (x >= 0) ? x : 2;
+    }();
+    return v;
+}
+
+//! unfixedTokenNum (mirrors v0.7.x=5): roll back the last N tokens of the accumulated
+//! transcript each hop (treat them UNCONFIRMED/revisable). Env: OVS_ASR_PREFIX_UNFIXED
+//! (the G-correct tuning knob; sweep {5,8,12}).
+int32_t unfixedTokenNum()
+{
+    static int32_t const v = []() {
+        char const* p = std::getenv("OVS_ASR_PREFIX_UNFIXED");
+        int32_t x = (p != nullptr) ? std::atoi(p) : 5;
+        return (x >= 1) ? x : 5;
+    }();
+    return v;
+}
+
+//! maxDecodeTokensPerHop (mirrors v0.7.x=64): per-hop decode cap for non-final hops.
+//! Env: OVS_ASR_STREAM_PREFIX_CAP. Final hop overrides this with an uncapped decode.
+int32_t maxDecodeTokensPerHop()
+{
+    static int32_t const v = []() {
+        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX_CAP");
+        int32_t x = (p != nullptr) ? std::atoi(p) : 64;
+        return (x >= 1) ? x : 64;
+    }();
+    return v;
+}
+
+//! Strip a leading "language X<asr_text>" / "language Xxx " preamble from a raw
+//! model output (mirrors v0.7.x parseAsrText). On a CONTINUATION hop the model does
+//! not re-emit the tag, so this is a no-op; on a fresh (warmup) hop it strips it.
+std::string parseAsrText(std::string const& raw)
+{
+    static constexpr char const* kAsrTextTag = "<asr_text>";
+    auto tagPos = raw.find(kAsrTextTag);
+    if (tagPos != std::string::npos)
+    {
+        return raw.substr(tagPos + std::strlen(kAsrTextTag));
+    }
+    // No tag: reuse the unified, known-language-bounded strip (handles the glued
+    // "language EnglishGo home." case without eating the first transcript word).
+    return stripLangTag(raw);
+}
+
+//! THE rollback (faithful port of v0.7.x computePrefix). Returns the CONFIRMED
+//! prefix = accumulated transcript with its last unfixedTokenNum tokens dropped
+//! (those are re-derived from current audio this hop). Returns "" for the first
+//! unfixedChunkNum hops (warmup: no prefix, full re-decode). UTF-8 guard: if the
+//! truncated decode would split a multibyte char (U+FFFD appears), increment the
+//! roll-back count and retry so we never cut a CJK character mid-byte.
+std::string computePrefix(SessionState const& st, bool isFinish)
+{
+    tokenizer::Tokenizer* tok = gPrefixTokenizer.get();
+    if (tok == nullptr || st.rawDecoded.empty())
+    {
+        return "";
+    }
+    if (st.chunkId < unfixedChunkNum())
+    {
+        return "";
+    }
+    auto tokens = tok->encode(st.rawDecoded, /*addBos=*/false, /*addEos=*/false);
+    if (tokens.empty())
+    {
+        return "";
+    }
+    int k = unfixedTokenNum();
+    int const total = static_cast<int>(tokens.size());
+    while (true)
+    {
+        int end = total - k;
+        if (isFinish)
+        {
+            end = std::max(1, end);
+        }
+        else
+        {
+            end = std::max(0, end);
+        }
+        std::string prefix;
+        if (end > 0)
+        {
+            std::vector<tokenizer::Rank> slice(tokens.begin(), tokens.begin() + end);
+            prefix = tok->decode(slice, /*skipSpecialTokens=*/false);
+        }
+        if (prefix.find(kUtf8Replacement) == std::string::npos)
+        {
+            return prefix;
+        }
+        if (!isFinish && end == 0)
+        {
+            return "";
+        }
+        if (isFinish && end == 1)
+        {
+            return prefix;
+        }
+        ++k; // multibyte char split at the boundary -> roll back one more token.
+    }
+}
+
+//! Build the one-shot-style request for an assistant-prefix continuation hop. The
+//! user message carries the FULL cumulative audio; the assistant message carries the
+//! rolled-back `prefix`. apply_chat_template=true + add_generation_prompt=false
+//! leave the assistant turn OPEN so the runtime generates ONLY the continuation
+//! (= the rolled-back tail re-derived from current audio + any new words). When
+//! prefix is empty (warmup hops) we open the turn with add_generation_prompt=true
+//! and NO assistant message (a user-only message with add_generation_prompt=false
+//! does not open the turn). capOverride is plumbed as max_generate_length_override.
+Json buildPrefixRequest(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride)
+{
+    Json req = st.beginMeta.is_object() ? st.beginMeta : Json::object();
+    if (!req.contains("batch_size")) req["batch_size"] = 1;
+    if (!req.contains("temperature")) req["temperature"] = 1.0;
+    if (!req.contains("top_p")) req["top_p"] = 1.0;
+    if (!req.contains("top_k")) req["top_k"] = 1;
+    if (!req.contains("max_generate_length")) req["max_generate_length"] = 256;
+    req["id"] = sid;
+    req["apply_chat_template"] = true;
+    req["max_generate_length_override"] = capOverride;
+
+    Json userContent = Json::array();
+    if (!st.melPath.empty())
+    {
+        userContent.push_back(Json{{"type", "audio"}, {"audio", st.melPath}});
+    }
+    Json messages = Json::array();
+    messages.push_back(Json{{"role", "user"}, {"content", userContent}});
+    if (prefix.empty())
+    {
+        req["add_generation_prompt"] = true;
+    }
+    else
+    {
+        req["add_generation_prompt"] = false;
+        messages.push_back(Json{{"role", "assistant"}, {"content", prefix}});
+    }
+    req["requests"] = Json::array({Json{{"messages", messages}, {"reference", "ref"}}});
+    return req;
+}
+
+//! Run a single chunk-and-confirm hop and return {ok, generated, total_ms}. The
+//! generated text is the CONTINUATION only (lang preamble stripped via parseAsrText
+//! for the warmup-hop case); the caller forms rawDecoded = prefix + generated.
+HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
+    bool isFinish, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
+    std::unordered_map<std::string, std::string>& loraWeightsMap)
+{
+    (void) isFinish;
+    HopOut out;
+    // capOverride: >0 caps the hop (non-final), <=0 (==-1) leaves it uncapped (final).
+    Json const req = buildPrefixRequest(sid, st, prefix, capOverride);
+    // Reuse the PROVEN parse->handleRequest core. runOneShotCore honors
+    // apply_chat_template / add_generation_prompt / max_generate_length_override
+    // straight from the request JSON. (We are inside OVS_ASR_STREAM_PREFIX, so
+    // asrStreamDelta/asrSessionPath are not the active branch in runOneShotCore.)
+    Json core = runOneShotCore(req, runtime, stream, loraWeightsMap);
+    out.ok = core.value("ok", false);
+    if (core.contains("total_ms")) out.totalMs = core["total_ms"].get<double>();
+    if (out.ok && core.contains("responses") && core["responses"].is_array() && !core["responses"].empty())
+    {
+        Json const& r0 = core["responses"][0];
+        if (r0.contains("output_text") && r0["output_text"].is_string())
+            out.generated = parseAsrText(r0["output_text"].get<std::string>());
+    }
+    if (!out.ok && core.contains("error") && core["error"].is_string())
+        out.error = core["error"].get<std::string>();
+    return out;
+}
+} // namespace asrStreamPrefix
+
 //! Core one-shot engine step: parse the `requests` payload, run handleRequest on
 //! each, and return the assembled response Json. This is the PROVEN golden path
 //! (CER 0.0000 + byte-identity). Both the legacy event-less one-shot path AND the
 //! streaming `end`/finalize path call this, so finalize inherits exact parity.
 //! NOT internally synchronized — callers must hold gEngineExecMutex (shared
 //! PipelineIO is mutated by handleRequest).
+//!
+//! Phase 2a: when OVS_ASR_SESSION_PATH=1 this delegates to the session single-hop
+//! path (asrSessionPath::runSessionCore) instead — an OFFLINE A/B equivalence
+//! surface. Default (flag OFF) is unchanged: handleRequest, byte-identical to before.
 Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
     std::unordered_map<std::string, std::string>& loraWeightsMap)
 {
+    if (asrStreamDelta::enabled())
+    {
+        return asrStreamDelta::runDeltaCore(std::move(input), runtime, stream);
+    }
+    if (asrSessionPath::enabled())
+    {
+        return asrSessionPath::runSessionCore(std::move(input), runtime, stream);
+    }
     Json response;
     std::filesystem::path tempPath;
     auto const requestStart = std::chrono::steady_clock::now();
@@ -810,6 +1610,35 @@ int main(int argc, char** argv)
         LOG_WARNING("CUDA graph capture failed for ASR one-shot runtime, proceeding without.");
     }
     rt::LLMInferenceRuntime* runtime = runtimePtr.get();
+
+    // Streaming-prefix rollback (OVS_ASR_STREAM_PREFIX=1): load the SAME tokenizer
+    // the engine uses (engineDir/tokenizer.json + processed_chat_template.json) so
+    // computePrefix can encode/decode the accumulated transcript for the
+    // unfixedTokenNum roll-back. Loaded ONLY when the flag is ON; the runtime decode
+    // path is untouched either way. A failed load leaves gPrefixTokenizer null and
+    // computePrefix degrades to "no prefix" (cumulative-equivalent, never crashes).
+    if (asrStreamPrefix::enabled())
+    {
+        auto tk = std::make_unique<tokenizer::Tokenizer>();
+        if (tk->loadFromHF(args.engineDir))
+        {
+            std::filesystem::path const ctPath
+                = std::filesystem::path(args.engineDir) / "processed_chat_template.json";
+            if (std::filesystem::exists(ctPath)) tk->loadChatTemplate(ctPath);
+            // Round-trip sanity check (stderr; does not perturb the stdout protocol).
+            std::string const probe = "language Chineseä½ å¥½ä¸ç";
+            auto ids = tk->encode(probe, false, false);
+            std::string rt2 = tk->decode(ids, false);
+            std::cerr << "[prefix-tok] loaded numVocab=" << tk->getNumVocab() << " probe_tokens=" << ids.size()
+                      << " roundtrip_ok=" << (rt2 == probe ? 1 : 0) << " decoded=" << rt2 << std::endl;
+            gPrefixTokenizer = std::move(tk);
+        }
+        else
+        {
+            std::cerr << "[prefix-tok] loadFromHF FAILED for " << args.engineDir
+                      << " -> prefix rollback degrades to no-prefix" << std::endl;
+        }
+    }
 
     // Task #9: lane reservation pool. asrMax = requested --max_slots, clamped to
     // the engine's physical batch capacity (maxSessionBatchSize). The b2 engine
