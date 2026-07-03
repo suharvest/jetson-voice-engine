@@ -20,6 +20,29 @@
 #include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager (lane reservation only)
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+
+// v0.9.0 re-port (P3c): the offline A/B experimental paths (OVS_ASR_SESSION_PATH /
+// OVS_ASR_STREAM_DELTA) depend on the full AsrStreamingSessionRuntime class plus the
+// LLMInferenceRuntime audio-chunk hooks (allocateChunkAudioEmbedding / encodeAudioChunk),
+// which have NOT been re-ported to the v0.9.0 baseline yet — P1 carried over
+// SessionLaneManager only. Compile those paths out by default; the production paths
+// (one-shot handleRequest, streaming handleChunk/handleEnd, OVS_ASR_STREAM_PREFIX
+// chunk-and-confirm) do not touch them and are unaffected. Define
+// EDGELLM_HAS_ASR_SESSION_RUNTIME=1 to re-enable once the session runtime lands.
+#ifndef EDGELLM_HAS_ASR_SESSION_RUNTIME
+#define EDGELLM_HAS_ASR_SESSION_RUNTIME 0
+#endif
+
+// v0.9.0 re-port (P3c): requestFileParser dropped `.safetensors` mel-spectrogram
+// input — it now accepts only raw .wav/.mp3/.flac, decodes to PCM via miniaudio,
+// and the runtime audio runner extracts mel INTERNALLY per
+// <multimodalEngineDir>/audio/config.json (mirrors the visual runner owning image
+// preprocessing). So on the v0.9.0 baseline the `pcm_b64` chunk path writes a
+// PCM16 WAV tempfile instead of a mel safetensors. Set to 0 to restore the
+// v0.8.0 behavior (worker-side MelExtractor -> mel safetensors).
+#ifndef EDGELLM_REQUEST_AUDIO_WAV
+#define EDGELLM_REQUEST_AUDIO_WAV 1
+#endif
 #include "tokenizer/tokenizer.h"
 #include <atomic>
 #include <chrono>
@@ -157,9 +180,70 @@ void writeMelSafetensors(std::vector<float> const& mel_f32, int32_t n_mels, int3
     f.write(reinterpret_cast<char const*>(half.data()), static_cast<std::streamsize>(nbytes));
 }
 
-//! Convert a cumulative float32-LE `pcm_b64` payload into a temp mel safetensors
-//! file and return its path. Throws on malformed/too-short PCM. Caller is
-//! responsible for removing the returned tempfile. Requires gMelExtractor.
+//! Sanitize a session id into a filesystem-safe fragment for temp filenames.
+std::string safeTempId(std::string const& sid)
+{
+    std::string safeId = sid.empty() ? std::string("s") : sid;
+    for (auto& ch : safeId)
+    {
+        bool const ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'
+            || ch == '-';
+        if (!ok) ch = '_';
+    }
+    return safeId;
+}
+
+#if EDGELLM_REQUEST_AUDIO_WAV
+//! Write mono float32 [-1,1] PCM as a PCM16 WAV @ 16 kHz (the sample rate the
+//! production stream_mode=worker path sends, and the rate requestFileParser
+//! resamples to anyway).
+void writePcm16Wav(std::vector<float> const& pcm, std::filesystem::path const& out_path)
+{
+    constexpr uint32_t kSampleRate = 16000;
+    constexpr uint16_t kNumChannels = 1;
+    constexpr uint16_t kBitsPerSample = 16;
+    uint32_t const dataBytes = static_cast<uint32_t>(pcm.size() * sizeof(int16_t));
+    uint32_t const byteRate = kSampleRate * kNumChannels * (kBitsPerSample / 8);
+    uint16_t const blockAlign = kNumChannels * (kBitsPerSample / 8);
+    uint32_t const riffSize = 36 + dataBytes;
+    uint32_t const fmtSize = 16;
+    uint16_t const audioFormat = 1; // PCM
+
+    std::vector<int16_t> samples(pcm.size());
+    for (size_t i = 0; i < pcm.size(); ++i)
+    {
+        float v = pcm[i];
+        if (v > 1.0f) v = 1.0f;
+        if (v < -1.0f) v = -1.0f;
+        samples[i] = static_cast<int16_t>(v * 32767.0f);
+    }
+
+    std::ofstream f(out_path, std::ios::binary);
+    if (!f) throw std::runtime_error("writePcm16Wav: cannot open " + out_path.string());
+    f.write("RIFF", 4);
+    f.write(reinterpret_cast<char const*>(&riffSize), 4);
+    f.write("WAVE", 4);
+    f.write("fmt ", 4);
+    f.write(reinterpret_cast<char const*>(&fmtSize), 4);
+    f.write(reinterpret_cast<char const*>(&audioFormat), 2);
+    f.write(reinterpret_cast<char const*>(&kNumChannels), 2);
+    f.write(reinterpret_cast<char const*>(&kSampleRate), 4);
+    f.write(reinterpret_cast<char const*>(&byteRate), 4);
+    f.write(reinterpret_cast<char const*>(&blockAlign), 2);
+    f.write(reinterpret_cast<char const*>(&kBitsPerSample), 2);
+    f.write("data", 4);
+    f.write(reinterpret_cast<char const*>(&dataBytes), 4);
+    f.write(reinterpret_cast<char const*>(samples.data()), static_cast<std::streamsize>(dataBytes));
+}
+#endif // EDGELLM_REQUEST_AUDIO_WAV
+
+//! Convert a cumulative float32-LE `pcm_b64` payload into a temp audio file the
+//! engine request can reference, and return its path. Throws on malformed/too-short
+//! PCM. Caller is responsible for removing the returned tempfile.
+//! v0.8.0 build (EDGELLM_REQUEST_AUDIO_WAV=0): worker-side MelExtractor -> mel
+//! `.safetensors` (requires gMelExtractor).
+//! v0.9.0 build (default): PCM16 `.wav` — the v0.9.0 requestFileParser accepts only
+//! raw audio and the runtime audio runner extracts mel internally.
 std::filesystem::path pcmB64ToMelSafetensors(std::string const& pcmB64, std::string const& sid)
 {
     std::vector<uint8_t> raw = base64Decode(pcmB64);
@@ -169,6 +253,13 @@ std::filesystem::path pcmB64ToMelSafetensors(std::string const& pcmB64, std::str
     }
     std::vector<float> pcm(raw.size() / sizeof(float));
     std::memcpy(pcm.data(), raw.data(), raw.size());
+#if EDGELLM_REQUEST_AUDIO_WAV
+    auto path = std::filesystem::temp_directory_path()
+        / ("qwen3_asr_pcm_" + safeTempId(sid) + "_"
+            + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".wav");
+    writePcm16Wav(pcm, path);
+    return path;
+#else
     int32_t n_frames = 0;
     // Pad to the encoder chunk size so the [-1, 128, 100] static profile is
     // satisfied for short first hops (≈0.5 s → 50 frames → pad to 100).
@@ -177,18 +268,24 @@ std::filesystem::path pcmB64ToMelSafetensors(std::string const& pcmB64, std::str
     {
         throw std::runtime_error("pcm_too_short: produced 0 mel frames");
     }
-    std::string safeId = sid.empty() ? std::string("s") : sid;
-    for (auto& ch : safeId)
-    {
-        bool const ok = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_'
-            || ch == '-';
-        if (!ok) ch = '_';
-    }
     auto path = std::filesystem::temp_directory_path()
-        / ("qwen3_asr_pcm_mel_" + safeId + "_"
+        / ("qwen3_asr_pcm_mel_" + safeTempId(sid) + "_"
             + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".safetensors");
     writeMelSafetensors(mel, gMelExtractor->n_mels(), n_frames, path);
     return path;
+#endif
+}
+
+//! True when the `pcm_b64` path can convert PCM into an engine-consumable audio
+//! file. WAV mode (v0.9.0 default) needs no worker-side mel assets; safetensors
+//! mode (v0.8.0) requires the MelExtractor (--melSettings/--melFilters).
+bool pcmInputSupported()
+{
+#if EDGELLM_REQUEST_AUDIO_WAV
+    return true;
+#else
+    return gMelExtractor != nullptr;
+#endif
 }
 
 enum OptionId : int
@@ -559,7 +656,7 @@ void handleChunk(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream
     // key and the worker SIGABRT'd; #11). Refuse cleanly if mel assets are absent.
     if (!st.pcmB64.empty())
     {
-        if (!gMelExtractor)
+        if (!pcmInputSupported())
         {
             std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_input_unsupported"},
                 {"hint", "worker started without --melSettings/--melFilters; pass them or set "
@@ -703,7 +800,7 @@ void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t
     // now (chunks already converted theirs into st.melPath/melPathOwned). Same guard
     // + conversion as handleChunk so the engine request only ever sees a .safetensors.
     Json finalEv;
-    if (endCarriedPcm && gMelExtractor)
+    if (endCarriedPcm && pcmInputSupported())
     {
         try
         {
@@ -722,7 +819,7 @@ void handleEnd(Json const& input, rt::LLMInferenceRuntime& runtime, cudaStream_t
                 {"detail", e.what()}};
         }
     }
-    else if (endCarriedPcm && !gMelExtractor)
+    else if (endCarriedPcm)
     {
         finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "pcm_input_unsupported"},
             {"hint", "worker started without --melSettings/--melFilters"}};
@@ -920,6 +1017,7 @@ std::string extractMelPath(Json const& input)
     return std::string();
 }
 
+#if EDGELLM_HAS_ASR_SESSION_RUNTIME
 //! Drive the full mel through AsrStreamingSessionRuntime as a SINGLE hop and return
 //! the bare transcript. Throws on any session-runtime failure. activeBatchSize=1.
 std::string runSingleHop(std::string const& melPath, rt::LLMInferenceRuntime& runtime, int32_t maxGenerateLength,
@@ -1026,6 +1124,17 @@ Json runSessionCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t s
     }
     return response;
 }
+#else  // !EDGELLM_HAS_ASR_SESSION_RUNTIME
+//! v0.9.0-baseline stub: AsrStreamingSessionRuntime is not re-ported yet. Reachable
+//! only when the caller explicitly sets OVS_ASR_SESSION_PATH=1 (default OFF).
+Json runSessionCore(Json input, rt::LLMInferenceRuntime& /*runtime*/, cudaStream_t /*stream*/)
+{
+    return Json{{"id", input.value("id", "")}, {"event", "error"}, {"ok", false},
+        {"error", "session_path: AsrStreamingSessionRuntime not available in this build "
+                  "(v0.9.0 baseline; rebuild with EDGELLM_HAS_ASR_SESSION_RUNTIME=1 once re-ported)"},
+        {"path", "session"}};
+}
+#endif // EDGELLM_HAS_ASR_SESSION_RUNTIME
 } // namespace asrSessionPath
 
 // ===========================================================================
@@ -1063,6 +1172,7 @@ bool enabled()
     return on;
 }
 
+#if EDGELLM_HAS_ASR_SESSION_RUNTIME
 //! Probe one delta mel through the encoder to learn its audio-token count (nk pads).
 int32_t probeDelta(rt::LLMInferenceRuntime& runtime, std::string const& melPath, rt::Tensor& scratch,
     cudaStream_t stream)
@@ -1257,6 +1367,17 @@ Json runDeltaCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t str
         return Json{{"event", "error"}, {"ok", false}, {"error", e.what()}, {"path", "stream_delta"}};
     }
 }
+#else  // !EDGELLM_HAS_ASR_SESSION_RUNTIME
+//! v0.9.0-baseline stub: AsrStreamingSessionRuntime is not re-ported yet. Reachable
+//! only when the caller explicitly sets OVS_ASR_STREAM_DELTA=1 (default OFF).
+Json runDeltaCore(Json input, rt::LLMInferenceRuntime& /*runtime*/, cudaStream_t /*stream*/)
+{
+    return Json{{"id", input.value("id", "")}, {"event", "error"}, {"ok", false},
+        {"error", "stream_delta: AsrStreamingSessionRuntime not available in this build "
+                  "(v0.9.0 baseline; rebuild with EDGELLM_HAS_ASR_SESSION_RUNTIME=1 once re-ported)"},
+        {"path", "stream_delta"}};
+}
+#endif // EDGELLM_HAS_ASR_SESSION_RUNTIME
 } // namespace asrStreamDelta
 
 // ===========================================================================
