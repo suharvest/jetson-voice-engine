@@ -1,0 +1,103 @@
+From a0da219024bf4f5bbcdf0f298d0016393f85b1d7 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 14:36:54 +0800
+Subject: [PATCH 17/38] feat(quant): exclude_attention option for INT4-AWQ
+ (FP16 attention island)
+
+build_quant_config / quantize_and_export / quantize CLI gain --exclude_attention
+which disables INT4 quantizers on q/k/v/o_proj, keeping attention FP16 while the
+MLP is INT4. Required for the mixed-precision overflow-safe recipe (attention
+FP16 island + INT4 MLP with BF16 down_proj output). Default False -> unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+
+diff --git a/tensorrt_edgellm/quantization/quantization_configs.py b/tensorrt_edgellm/quantization/quantization_configs.py
+index b0f63b1..e9b5046 100644
+--- a/tensorrt_edgellm/quantization/quantization_configs.py
++++ b/tensorrt_edgellm/quantization/quantization_configs.py
+@@ -202,6 +202,16 @@ _AUDIO_PREFIXES = (
+ )
+ _AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
+ 
++# Attention projection wildcards. Used by build_quant_config(exclude_attention=True)
++# to keep q/k/v/o_proj in FP16 (unquantized) — required by the mixed-precision
++# overflow-safe path where attention is an FP16 island and only the MLP is INT4.
++_ATTENTION_PROJ_PATTERNS = (
++    "*q_proj*",
++    "*k_proj*",
++    "*v_proj*",
++    "*o_proj*",
++)
++
+ 
+ def _audio_quant_cfg(input_cfg: Optional[Dict[str, Any]],
+                      weight_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+@@ -379,6 +389,7 @@ def build_quant_config(
+     kv_cache_quantization: Optional[str] = None,
+     visual_quantization: Optional[str] = None,
+     audio_quantization: Optional[str] = None,
++    exclude_attention: bool = False,
+ ) -> Dict[str, Any]:
+     """Build a composite ModelOpt quantization config from method names.
+ 
+@@ -438,6 +449,10 @@ def build_quant_config(
+         groups_to_disable.append(_VISUAL_PATTERNS)
+     if audio_quantization is None:
+         groups_to_disable.append(_AUDIO_PATTERNS)
++    if exclude_attention:
++        # Keep attention q/k/v/o_proj in FP16 (mixed-precision overflow-safe
++        # path: attention is an FP16 island, only the MLP is INT4).
++        groups_to_disable.append(_ATTENTION_PROJ_PATTERNS)
+     cfg["quant_cfg"] = _merge_quant_cfg(
+         cfg["quant_cfg"],
+         _disable_groups(*groups_to_disable),
+diff --git a/tensorrt_edgellm/quantization/quantize.py b/tensorrt_edgellm/quantization/quantize.py
+index 540237a..9c549b7 100644
+--- a/tensorrt_edgellm/quantization/quantize.py
++++ b/tensorrt_edgellm/quantization/quantize.py
+@@ -625,6 +625,7 @@ def quantize_and_export(
+     device: str = "cuda",
+     dataset: str = "cnn_dailymail",
+     num_samples: int = 512,
++    exclude_attention: bool = False,
+ ) -> str:
+     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
+ 
+@@ -678,6 +679,7 @@ def quantize_and_export(
+             kv_cache_quantization,
+             visual_quantization=visual_quantization,
+             audio_quantization=audio_quantization,
++            exclude_attention=exclude_attention,
+         )
+         if is_qwen3_asr_model(model_dir):
+             # ASR multimodal calibration: stream real (audio, transcript)
+diff --git a/tensorrt_edgellm/scripts/quantize.py b/tensorrt_edgellm/scripts/quantize.py
+index d3637c3..d39aa13 100644
+--- a/tensorrt_edgellm/scripts/quantize.py
++++ b/tensorrt_edgellm/scripts/quantize.py
+@@ -79,6 +79,13 @@ def _add_common_args(parser):
+     parser.add_argument("--device", default="cuda")
+     parser.add_argument("--dataset", default="cnn_dailymail")
+     parser.add_argument("--num_samples", type=int, default=512)
++    parser.add_argument(
++        "--exclude_attention",
++        action="store_true",
++        help=("Keep attention q/k/v/o_proj in FP16 (unquantized). Required for "
++              "the mixed-precision overflow-safe path: attention FP16 island + "
++              "INT4 MLP."),
++    )
+ 
+ 
+ def main():
+@@ -145,6 +152,7 @@ def main():
+             device=args.device,
+             dataset=args.dataset,
+             num_samples=args.num_samples,
++            exclude_attention=args.exclude_attention,
+         )
+     elif args.command == "draft":
+         if _is_dflash_draft(args.draft_model_dir):
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,7 +1,12 @@
 # Patch state — v0.8.0 Base TTS N>1 serving chain (C2-repin)
 
-> **CURRENT AUTHORITATIVE STATE = §13 (C2 sparktts re-pin, 2026-07-03), directly
-> below.** Everything after it (§C2-repin, §0–§12) is provenance.
+> **⚠️ SUPERSEDED 2026-07-04 by `PATCH-STATE-v090.md` (P4-1 v0.9.0 re-pin).**
+> This file is provenance for the v0.8.0 pin era. The `v080-sparktts-0001..0030`
+> series described in §13 has been DELETED (replaced by `v090-sparktts-0001..0038`).
+
+> **§13 (C2 sparktts re-pin, 2026-07-03), directly
+> below, was the authoritative state on the v0.8.0 pin.** Everything after it
+> (§C2-repin, §0–§12) is earlier provenance.
 
 ---
 

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 48786a5..1660d9f 100644
+index 4b310d2..af63930 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -61,7 +61,8 @@ endif()
@@ -45,10 +45,10 @@ index 48786a5..1660d9f 100644
    CURAND_KERNEL_INCLUDE_DIR
    NAMES curand_kernel.h
 diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
-index a0e2b9f..332f698 100644
+index 936757f..8d20838 100644
 --- a/cmake/CuteDsl.cmake
 +++ b/cmake/CuteDsl.cmake
-@@ -775,19 +775,28 @@ function(cute_dsl_setup)
+@@ -875,20 +875,29 @@ function(cute_dsl_setup)
    foreach(_tgt ${ARG_LINK_TARGETS})
      get_target_property(_tgt_type ${_tgt} TYPE)
      if(_tgt_type STREQUAL "STATIC_LIBRARY")
@@ -67,10 +67,11 @@ index a0e2b9f..332f698 100644
 +        target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
 +      endif()
      endif()
-     # CUDA < 12.8: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
-     # JetPack 6).
-     if(NOT _cute_dsl_cuda_ver STREQUAL "" AND _cute_dsl_cuda_ver VERSION_LESS
-                                               12.8)
+     # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+     # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
+     if(NOT _cute_dsl_cuda_ver STREQUAL ""
+        AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+        AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
 -      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
 +      if(_tgt_type STREQUAL "STATIC_LIBRARY")
 +        target_link_options(${_tgt} INTERFACE "-Wl,--wrap=_cudaLaunchKernelEx")
@@ -81,12 +82,12 @@ index a0e2b9f..332f698 100644
    endforeach()
  
 diff --git a/cpp/CMakeLists.txt b/cpp/CMakeLists.txt
-index 6d6c8e2..f815161 100644
+index 1853009..1f1fbc1 100644
 --- a/cpp/CMakeLists.txt
 +++ b/cpp/CMakeLists.txt
-@@ -69,10 +69,22 @@ else()
-   message(STATUS "FMHA Kernels: Compiling cubins for all SM architectures")
- endif()
+@@ -73,11 +73,23 @@ endif()
+ include(${CMAKE_SOURCE_DIR}/cmake/XQACubins.cmake)
+ edgellm_xqa_cubins_setup()
  
 +function(filter_macos_metadata out_var)
 +  set(_items ${${out_var}})
@@ -100,6 +101,7 @@ index 6d6c8e2..f815161 100644
  # Generate Core C++ static library for LLM-SDK
  file(GLOB_RECURSE COMMON_CPP_SRCS "common/*.cpp")
  file(GLOB_RECURSE KERNELS_CPP_SRCS "kernels/*.cpp")
+ edgellm_xqa_add_generated_sources(KERNELS_CPP_SRCS)
  file(GLOB_RECURSE KERNELS_CU_SRCS "kernels/*.cu")
 +filter_macos_metadata(COMMON_CPP_SRCS)
 +filter_macos_metadata(KERNELS_CPP_SRCS)
@@ -107,7 +109,7 @@ index 6d6c8e2..f815161 100644
  # Exclude MoE Marlin ops/sm80 - compiled only via include from moeMarlin.cu
  list(FILTER KERNELS_CU_SRCS EXCLUDE REGEX
       "marlin_moe_wna16/(ops|sm80_kernel_float16_u4_float16)\\.cu$")
-@@ -82,9 +94,15 @@ file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
+@@ -87,9 +99,15 @@ file(GLOB_RECURSE MULTIMODAL_CPP_SRCS "multimodal/*.cpp")
  file(GLOB_RECURSE ACTION_CPP_SRCS "action/*.cpp")
  file(GLOB_RECURSE RUNTIME_CPP_SRCS "runtime/*.cpp")
  file(GLOB_RECURSE PROFILER_CPP_SRCS "profiling/*.cpp")
@@ -120,10 +122,10 @@ index 6d6c8e2..f815161 100644
  # Enable relocatable device code for MoE Marlin kernels
  file(GLOB_RECURSE MOE_MARLIN_CU_SRCS "kernels/moe/moe_marlin/*.cu")
 +filter_macos_metadata(MOE_MARLIN_CU_SRCS)
- list(APPEND MOE_MARLIN_CU_SRCS
-      "${CMAKE_CURRENT_SOURCE_DIR}/kernels/moe/nvf4_w4an/decoding_kernels.cu")
  set_source_files_properties(${MOE_MARLIN_CU_SRCS} PROPERTIES COMPILE_FLAGS
-@@ -99,6 +117,7 @@ target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
+                                                              "-rdc=true")
+ 
+@@ -103,6 +121,7 @@ target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
  set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
  
  file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
@@ -131,16 +133,16 @@ index 6d6c8e2..f815161 100644
  
  add_library(
    edgellmCore STATIC
-@@ -114,7 +133,7 @@ add_library(
-   ${PROFILER_CPP_SRCS}
+@@ -119,7 +138,7 @@ add_library(
    ${TOKENIZER_CPP_SRCS})
  target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
+ edgellm_xqa_configure_target(edgellmCore)
 -target_link_libraries(edgellmCore PRIVATE dl)
 +target_link_libraries(edgellmCore PRIVATE dl ${CUBLAS_LIB} ${CUBLASLT_LIB})
  # Apply FMHA SM exclusion definitions
  target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
  # Enable separable compilation for MoE Marlin kernel templates
-@@ -122,6 +141,7 @@ set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+@@ -127,6 +146,7 @@ set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
  
  # Generate builder C++ static library
  file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")
@@ -148,7 +150,7 @@ index 6d6c8e2..f815161 100644
  add_library(edgellmBuilder STATIC ${BUILDER_CPP_SRCS} ${COMMON_CPP_SRCS})
  target_include_directories(edgellmBuilder PRIVATE ${ONNX_PARSER_INCLUDE_DIR}
                                                    ${COMMON_INCLUDE_DIRS})
-@@ -129,6 +149,7 @@ target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
+@@ -134,6 +154,7 @@ target_link_libraries(edgellmBuilder PRIVATE ${NV_ONNX_PARSER_LIB} dl)
  
  # Generate the TensorRT plugin shared libraries
  file(GLOB_RECURSE PLUGIN_CPP_SRCS "plugins/*.cpp")
@@ -156,7 +158,7 @@ index 6d6c8e2..f815161 100644
  add_library(NvInfer_edgellm_plugin SHARED ${PLUGIN_CPP_SRCS})
  set_target_properties(NvInfer_edgellm_plugin PROPERTIES VERSION 1.0 SOVERSION 1)
  set_target_properties(NvInfer_edgellm_plugin PROPERTIES LIBRARY_OUTPUT_DIRECTORY
-@@ -140,7 +161,8 @@ target_compile_definitions(NvInfer_edgellm_plugin
+@@ -145,7 +166,8 @@ target_compile_definitions(NvInfer_edgellm_plugin
                             PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
  target_link_libraries(
    NvInfer_edgellm_plugin PRIVATE commonLibraryExt edgellmKernels
@@ -165,4 +167,4 @@ index 6d6c8e2..f815161 100644
 +                                 ${CUBLAS_LIB} ${CUBLASLT_LIB})
  add_cross_build_link_options(NvInfer_edgellm_plugin)
  
- # CuTe DSL unified kernels (FMHA + GDN): link local prebuilt static library.
+ # cmake-format: off

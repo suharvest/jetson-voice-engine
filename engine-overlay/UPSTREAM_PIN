@@ -1,32 +1,37 @@
-f9cc74623d95d7acf1addab6026b9d410ba81f52
-# = NVIDIA TensorRT-Edge-LLM origin/release/0.8.0 HEAD ("Merge #101 from
-#   JCalafato/dev-release/0.8.0"). PURE NVIDIA commit — no fork content.
+1ac0f2b99642045125e1c5ac7b109434ba3b36c7
+# = NVIDIA TensorRT-Edge-LLM tag v0.9.0 ("Merge pull request #122 from
+#   jhalabi-nv/dev-release/0.9.0"). PURE NVIDIA commit — no fork content.
 #
-# C2 sparktts re-pin (2026-07-03): pin moved OFF the fork integration branch
-# (was c48c0de = suharvest/wip/cv-9row-v080-n1n2) back to the NVIDIA v0.8.0
-# base. ALL fork content now travels as overlay patches:
+# P4-1 v0.9.0 re-pin (2026-07-04): pin moved v0.8.0 (f9cc7462) -> v0.9.0 tag.
+# ALL fork content travels as overlay patches:
 #
-#   patches/v080-sparktts-0001..0030  =  git format-patch --no-stat
-#       f9cc7462..integration/v080-sparktts        (fork HEAD 8437f027)
+#   patches/v090-sparktts-0001..0038  =  git format-patch --no-stat
+#       1ac0f2b9..integration/v090-sparktts        (fork HEAD e8c59c1)
 #
-# The 30-commit series is a strict superset of the previous pinned branch
-# (its 12 commits = v080-sparktts-0001..0012) plus the SparkTTS consolidation
-# set (bf16/fp16 mixed-precision, int4/W4A16-AWQ mixed-precision export+plugin,
-# borrowed/shared-engine ctor for voice-clone):
-#   0001..0006  fork-port TTS runtime (10b338d ba9ecdb 867b74d 26a4a69 50b8670 873ca22)
-#   0007        D2-1 shared-engine ctor for slot-pool (a361221)
-#   0008        C3 N<=0 prefill guard (8de933f)
-#   0009..0010  ASR SessionLaneManager + maxSessionBatchSize() (a099544 7142a30)
-#   0011..0012  CustomVoice 9-row runtime-if on langId (12ee383 c48c0de)
-#   0013..0028  SparkTTS mixed-precision + INT4-AWQ opt-in set (d234ef0..b8ea0c7)
-#   0029        borrowed/shared-engine ctor EngineExecutor+LLMInferenceRuntime (21119ec)
-#   0030        drop dev-only int4 microbench (8437f027 = fork branch HEAD)
+# The 38-commit series is the v0.9.0 rebase of the previous v080-sparktts
+# series (0001..0030) PLUS the v0.9.0-specific re-ports and export fixes:
+#   0001..0003  sm_87 build/perf (cudart shim link, cuBLAS-free tiled GEMM,
+#               warp-per-column M=1 GEMV)                     (d18bfa3 e024b2c 07d3f4f)
+#   0004..0005  ASR SessionLaneManager + maxSessionBatchSize() (d87bf38 ab54e31)
+#   0006..0023  SparkTTS mixed-precision + INT4-AWQ opt-in set, incl.
+#               mixed_precision -> bf16_residual rename        (eb03efd..d74e35b)
+#   0024        streaming worker RE-PORTED to the v0.9.0 native streaming API
+#               (slot-pool, examples/omni)                     (bc3540e)
+#   0025..0032  omni-TTS features on the new worker: N<=0 guard, CV 9-row
+#               langId, external speaker-embedding, FP8 text_embedding,
+#               language+speaker_embedding_b64 wiring, cooperative cancel,
+#               shared-engine ctors, differentiated chunking   (dcf47de..6f0fbfc)
+#   0033..0034  MOSS-TTS-Nano re-port + CMake target (examples/omni) — MOSS is
+#               now IN-SERIES; its files were REMOVED from addon/ (were
+#               addon-only on v0.8.0)                          (2a48e62 d18ddd2)
+#   0035..0038  checkpoint/export fixes (fp32 cast, ASR mrope, base-export
+#               guard demotion, codec_language_id)             (13be473..e8c59c1)
 #
-# Apply chain (build.sh): addon/ + v080-sparktts-0001..0030 (in order)
-#                         + 0001-orin-tegra-build-compat.
-# Dry-run verified 2026-07-03 (Mac, git apply --check + apply): full chain
-# CLEAN on f9cc7462; resulting tracked tree == integration/v080-sparktts
+# Apply chain (build.sh): addon/ + v090-sparktts-0001..0038 (in order)
+#                         + 0001-orin-tegra-build-compat (REBASED onto v0.9.0).
+# Dry-run verified 2026-07-04 (Mac, git apply --check + apply): full chain
+# CLEAN on 1ac0f2b9; resulting tracked tree == integration/v090-sparktts
 # (diff shows only addon files + 0001's 3 build-compat files).
 #
 # upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git (this SHA
-# is a public NVIDIA commit; the suharvest fork also carries it as fallback).
+# is the public NVIDIA v0.9.0 tag; the suharvest fork also carries it).
