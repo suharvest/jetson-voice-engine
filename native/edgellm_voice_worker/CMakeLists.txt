@@ -211,9 +211,13 @@ set_target_properties(qwen3_asr_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 # Vocoder engines run via raw TRT (per-slot IExecutionContext over shared engines).
 # -----------------------------------------------------------------------------
 add_executable(spark_tts_worker spark_tts_worker.cpp)
+# examples/omni: v0.9.0 re-port keeps slotPool.h on the example side
+# (examples/omni/slotPool.h, verbatim carry-over of cpp/runtime/slotPool.h).
+# Harmless no-op for v0.8.0 trees where cpp/runtime/slotPool.h still exists.
 target_include_directories(
   spark_tts_worker PRIVATE ${COMMON_INCLUDE_DIRS}
-                           ${EDGE_LLM_SOURCE_DIR}/examples/utils)
+                           ${EDGE_LLM_SOURCE_DIR}/examples/utils
+                           ${EDGE_LLM_SOURCE_DIR}/examples/omni)
 target_link_libraries(spark_tts_worker PRIVATE voiceWorkerUtils edgellmCore
                                                commonLibraryExt)
 add_cross_build_link_options(spark_tts_worker)

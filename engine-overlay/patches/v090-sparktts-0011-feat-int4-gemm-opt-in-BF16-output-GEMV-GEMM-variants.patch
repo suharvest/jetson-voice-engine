@@ -1,0 +1,449 @@
+From 7084ec22c72a48e3e255d0d5379d98763be5288b Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 14:18:10 +0800
+Subject: [PATCH 11/38] feat(int4-gemm): opt-in BF16-output GEMV/GEMM variants
+ for mixed-precision
+
+Add gemv_forward_cuda_new_bf16 and gemm_forward_cuda_new_bf16 alongside the
+existing FP16 paths (untouched). The BF16 variants reduce/accumulate in FP32
+and store BF16, preventing FP16 overflow (>65504 -> inf) for overflow-prone
+linears (e.g. down_proj output channel ~2.3e5). GEMV templates the output
+store dtype; GEMM adds an FP32-accumulate mma (f32.f16.f16.f32) clone with a
+BF16-packed epilogue. Shared-memory staging stays FP16, so smem sizing is
+unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+
+diff --git a/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h b/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
+index 530ac3d..381045f 100644
+--- a/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
++++ b/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
+@@ -17,6 +17,7 @@
+ 
+ #pragma once
+ 
++#include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <stdint.h>
+ 
+@@ -51,6 +52,21 @@ constexpr int32_t kGemvMaxM = 6;   // gemv_forward_cuda_new has template instant
+ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
+     int m, int n, int k, int group_size, cudaStream_t stream);
+ 
++/*!
++ * @brief BF16-output variant of gemv_forward_cuda_new (opt-in mixed-precision path).
++ *
++ * Identical INT4 weight / FP16 activation compute as gemv_forward_cuda_new, but the
++ * per-output-channel accumulation is reduced in FP32 and stored as BF16. This avoids
++ * FP16 overflow when an output channel's pre-activation magnitude exceeds the FP16
++ * range (max 65504) — e.g. SparkTTS/Qwen down_proj output channel 62 (~2.3e5). The
++ * existing FP16 path is left untouched; callers opt into this variant only for
++ * overflow-prone linears under config.mixed_precision.
++ *
++ * @param out_feats Output features [M, N] in BF16
++ */
++void gemv_forward_cuda_new_bf16(half const* in_feats, int8_t const* kernel, half const* scaling_factors,
++    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream);
++
+ /*!
+  * @brief INT4 group-wise quantized GEMM (matrix-matrix multiplication)
+  *
+@@ -69,5 +85,18 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
+  */
+ void gemm_forward_cuda_new(half const* in_feats, int8_t const* kernel, half const* scaling_factors, half* out_feats,
+     int m, int n, int k, int group_size, cudaStream_t stream) noexcept;
++
++/*!
++ * @brief BF16-output variant of gemm_forward_cuda_new (opt-in mixed-precision path).
++ *
++ * Same INT4 weight / FP16 activation tiled GEMM as gemm_forward_cuda_new, but the
++ * tensor-core accumulation is performed in FP32 (mma f32.f16.f16.f32) and the result
++ * is stored as BF16. This prevents FP16 overflow / inf in the accumulator and output
++ * for overflow-prone linears (down_proj). The existing FP16 path is untouched.
++ *
++ * @param out_feats Output features [M, N] in BF16
++ */
++void gemm_forward_cuda_new_bf16(half const* in_feats, int8_t const* kernel, half const* scaling_factors,
++    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept;
+ } // namespace kernel
+ } // namespace trt_edgellm
+diff --git a/cpp/kernels/int4GroupwiseGemmKernels/int4WoQGemvCuda.cu b/cpp/kernels/int4GroupwiseGemmKernels/int4WoQGemvCuda.cu
+index 78f10e6..f0f04fd 100644
+--- a/cpp/kernels/int4GroupwiseGemmKernels/int4WoQGemvCuda.cu
++++ b/cpp/kernels/int4GroupwiseGemmKernels/int4WoQGemvCuda.cu
+@@ -41,6 +41,7 @@
+ 
+ #include "common/checkMacros.h"
+ #include "dequantize.cuh"
++#include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ #include <stdexcept>
+ #include <string>
+@@ -92,9 +93,27 @@ __device__ __forceinline__ int make_divisible(int c, int divisor)
+     return (c + divisor - 1) / divisor;
+ }
+ 
+-template <int NPerBlock, int Batch, int BlockSize, int GroupSize>
++// Convert the FP32 reduced accumulator to the requested output dtype. The BF16 path
++// (mixed-precision, opt-in) is what prevents FP16 overflow when an output channel's
++// magnitude exceeds the FP16 range (>65504 -> inf).
++template <typename OutT>
++__device__ __forceinline__ OutT gemvStoreCast(float acc);
++
++template <>
++__device__ __forceinline__ half gemvStoreCast<half>(float acc)
++{
++    return static_cast<half>(acc);
++}
++
++template <>
++__device__ __forceinline__ __nv_bfloat16 gemvStoreCast<__nv_bfloat16>(float acc)
++{
++    return __float2bfloat16(acc);
++}
++
++template <int NPerBlock, int Batch, int BlockSize, int GroupSize, typename OutT = half>
+ __global__ void gemv_kernel(
+-    half const* inputs, uint32_t const* weight, half const* scales, half* outputs, int const IC, int const OC)
++    half const* inputs, uint32_t const* weight, half const* scales, OutT* outputs, int const IC, int const OC)
+ {
+     int const kStride = 64;
+     int const kElemsPerThread = MEM_ACCESS_SIZE / 4;
+@@ -209,12 +228,13 @@ __global__ void gemv_kernel(
+         {
+             acc += out_smem[j][i];
+         }
+-        outputs[batch_idx * OC + blk_row_offset + oc_idx] = static_cast<half>(acc);
++        outputs[batch_idx * OC + blk_row_offset + oc_idx] = gemvStoreCast<OutT>(acc);
+     }
+ }
+ 
+-void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
+-    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
++template <typename OutT>
++static void gemv_forward_cuda_new_impl(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
++    OutT* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
+ {
+     auto kernel = reinterpret_cast<uint32_t const*>(weights_device);
+     static constexpr int N_PER_BLOCK = 2;
+@@ -229,32 +249,45 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
+     switch (m)
+     {
+     case 1:
+-        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 1, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     case 2:
+-        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 2, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     case 3:
+-        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 3, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     case 4:
+-        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 4, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     case 5:
+-        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 5, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     case 6:
+-        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128>
++        gemv_kernel<N_PER_BLOCK, 6, BLOCK_SIZE, 128, OutT>
+             <<<num_blocks, num_threads, 0, stream>>>(in_feats, kernel, scaling_factors, out_feats, k, n);
+         break;
+     default: throw std::runtime_error("Unsupported batch size for gemv kernel.\n");
+     }
+ }
+ 
++void gemv_forward_cuda_new(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
++    half* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
++{
++    gemv_forward_cuda_new_impl<half>(in_feats, weights_device, scaling_factors, out_feats, m, n, k, group_size, stream);
++}
++
++void gemv_forward_cuda_new_bf16(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
++    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream)
++{
++    gemv_forward_cuda_new_impl<__nv_bfloat16>(
++        in_feats, weights_device, scaling_factors, out_feats, m, n, k, group_size, stream);
++}
++
+ } // namespace kernel
+ } // namespace trt_edgellm
+\ No newline at end of file
+diff --git a/cpp/kernels/int4GroupwiseGemmKernels/int4WoqGemmCuda.cu b/cpp/kernels/int4GroupwiseGemmKernels/int4WoqGemmCuda.cu
+index 5eac186..c3c887f 100644
+--- a/cpp/kernels/int4GroupwiseGemmKernels/int4WoqGemmCuda.cu
++++ b/cpp/kernels/int4GroupwiseGemmKernels/int4WoqGemmCuda.cu
+@@ -40,6 +40,7 @@
+ 
+ #include "dequantize.cuh"
+ #include "int4GroupwiseGemm.h"
++#include <cuda_bf16.h>
+ #include <cuda_pipeline_primitives.h>
+ #include <mutex>
+ 
+@@ -129,6 +130,20 @@ __device__ __inline__ void mma_m16n8k16(half* C_warp, half* A_shared_warp, half*
+         "r"(((unsigned*) C_warp)[0]), "r"(((unsigned*) C_warp)[1]));
+ }
+ 
++// FP32-accumulate variant (mixed-precision path). A/B remain FP16; the accumulator C
++// is FP32 (4 floats per m16n8 tile) which avoids FP16 accumulator overflow for
++// overflow-prone linears (down_proj). Used only by the BF16-output GEMM.
++__device__ __inline__ void mma_m16n8k16_f32(float* C_warp, half* A_shared_warp, half* B_shared_warp)
++{
++    __asm__ __volatile__(
++        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"
++        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
++        : "=f"(C_warp[0]), "=f"(C_warp[1]), "=f"(C_warp[2]), "=f"(C_warp[3])
++        : "r"(((unsigned*) A_shared_warp)[0]), "r"(((unsigned*) A_shared_warp)[1]), "r"(((unsigned*) A_shared_warp)[2]),
++        "r"(((unsigned*) A_shared_warp)[3]), "r"(((unsigned*) B_shared_warp)[0]), "r"(((unsigned*) B_shared_warp)[1]),
++        "f"(C_warp[0]), "f"(C_warp[1]), "f"(C_warp[2]), "f"(C_warp[3]));
++}
++
+ template <int CTA_M, int CTA_N, int CTA_K, int CTA_SIZE, int SHARED_K_ITERS, int STAGES>
+ __device__ __inline__ void global_to_share_one_stage_A_T2(half const* src, half* dst, int global_nrows,
+     int global_ncols, int cta_offset_m, int cta_offset_n, int global_iter_k, int shared_iter_k, bool mask)
+@@ -512,5 +527,230 @@ void gemm_forward_cuda_new(half const* in_feats, int8_t const* weights_device, h
+         in_feats, kernel, scaling_factors, out_feats, m, n, k);
+ }
+ 
++// =====================================================================================
++// BF16-output GEMM (opt-in mixed-precision path)
++// -------------------------------------------------------------------------------------
++// Clone of gemm_w4a16_T2 with an FP32 tensor-core accumulator (mma f32.f16.f16.f32) and
++// a BF16-packed epilogue. A/B/scales staging in shared memory is unchanged (still FP16),
++// so shared-memory sizing is identical. This avoids FP16 accumulator overflow / inf for
++// overflow-prone linears (down_proj). The FP16 kernel above is left byte-identical.
++// =====================================================================================
++template <int CTA_M, int CTA_N, int CTA_K, int WARP_M, int WARP_N, int WARP_K, int STAGES, int G>
++__global__ void gemm_w4a16_T2_bf16(half const* __restrict__ A, half const* __restrict__ B,
++    half const* __restrict__ scales, __nv_bfloat16* __restrict__ C, int M, int N, int K)
++{
++    constexpr int NUM_WARPS = CTA_M / WARP_M * CTA_N / WARP_N;
++    constexpr int CTA_SIZE = NUM_WARPS * WARP_SIZE;
++    int num_blocks_n = (N + CTA_N - 1) / CTA_N;
++    int num_blocks_m = (M + CTA_M - 1) / CTA_M;
++    int blockIdx_y = blockIdx.x % (num_blocks_m * num_blocks_n);
++    int const log_tile = get_log_tile<1>((N + CTA_N - 1) / CTA_N);
++    int blockIdx_m = blockIdx_y / (num_blocks_n >> log_tile);
++    int blockIdx_n = blockIdx_y % (num_blocks_n >> log_tile);
++    uint2 const block_idx_mapping = get_block_idx_mapping(blockIdx_m, blockIdx_n, log_tile);
++    blockIdx_m = block_idx_mapping.x;
++    blockIdx_n = block_idx_mapping.y;
++
++    float C_warp[CTA_M * CTA_N / CTA_SIZE]; // FP32 accumulator
++    constexpr int kSmemPadKA = CTA_K + SMEM_PAD_A;
++    constexpr int kSmemPadKB = CTA_K + SMEM_PAD_B;
++    constexpr int kSmemSizeAPerStage = CTA_M * kSmemPadKA;
++    constexpr int kSmemSizeBPerStage = CTA_N / kInterleave * kSmemPadKB;
++    constexpr int kSmemSizeA = kSmemSizeAPerStage * STAGES;
++    constexpr int kSmemSizeB = kSmemSizeBPerStage * STAGES;
++    constexpr int scales_load_interval = G / CTA_K;
++    extern __shared__ half mem_shared[];
++    half* A_shared = mem_shared;
++    half* B_shared = mem_shared + kSmemSizeA;
++    half* scales_shared = mem_shared + kSmemSizeA + kSmemSizeB;
++    half A_shared_warp_[2][WARP_M * INTRIN_K / WARP_SIZE];
++    half B_shared_warp_[2][WARP_N * 32 / WARP_SIZE];
++    half B_shared_warp_tmp_[2][WARP_N * 16 / WARP_SIZE];
++    int cta_offset_m = blockIdx_m * CTA_M;
++    int cta_offset_n = blockIdx_n * CTA_N;
++    int warp_offset_m = (threadIdx.y % (CTA_M / WARP_M)) * WARP_M;
++    int warp_offset_n = (threadIdx.y / (CTA_M / WARP_M)) * WARP_N;
++
++    for (int i = 0; i < CTA_M * CTA_N / CTA_SIZE; i++)
++        C_warp[i] = 0.0f;
++
++    int gemm_iters = (K + CTA_K - 1) / CTA_K;
++    int k_0_0_ld = 0;
++    int k_0_0 = 0;
++    constexpr int prologue_stages = STAGES == 1 ? 1 : STAGES - 1;
++#pragma unroll
++    for (k_0_0_ld = 0; k_0_0_ld < prologue_stages; ++k_0_0_ld)
++    {
++        global_to_share_one_stage_A_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
++            A, A_shared + k_0_0_ld * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
++        global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, 1, STAGES>(
++            B, B_shared + k_0_0_ld * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld, 0, true);
++        global_to_share_one_stage_scales_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(scales,
++            scales_shared + (k_0_0_ld / scales_load_interval) * CTA_N, K / G * N, N, cta_offset_m, cta_offset_n,
++            k_0_0_ld, 0, k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
++        if constexpr (STAGES > 1)
++            __pipeline_commit();
++    }
++    if constexpr (STAGES > 1)
++        __pipeline_wait_prior(STAGES - 2);
++    __syncthreads();
++
++    share_to_reg_one_stage_A_T2<CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(
++        A_shared, A_shared_warp_[0], warp_offset_m, warp_offset_n, 0);
++    share_to_reg_one_stage_B_T2<CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
++        B_shared, scales_shared, B_shared_warp_tmp_[0], B_shared_warp_[0], warp_offset_m, warp_offset_n, 0);
++    constexpr int SHARED_K_ITERS = WARP_K / INTRIN_K;
++
++    for (; k_0_0 < gemm_iters; ++k_0_0, ++k_0_0_ld)
++    {
++        int ld_stage = k_0_0_ld % STAGES;
++        int compute_stage = k_0_0 % STAGES;
++        half* A_shared_this_compute_stage;
++        half* B_shared_this_compute_stage;
++        half* scales_shared_this_compute_stage;
++
++        for (int iter_k = 0; iter_k < SHARED_K_ITERS; ++iter_k)
++        {
++            A_shared_this_compute_stage = A_shared + compute_stage * kSmemSizeAPerStage;
++            B_shared_this_compute_stage = B_shared + compute_stage * kSmemSizeBPerStage;
++            scales_shared_this_compute_stage = scales_shared + (compute_stage / scales_load_interval) * CTA_N;
++            share_to_reg_one_stage_A_T2<CTA_M, CTA_N, CTA_K, STAGES, WARP_M / INTRIN_M>(A_shared_this_compute_stage,
++                A_shared_warp_[(iter_k + 1) % 2], warp_offset_m, warp_offset_n, (iter_k + 1) % SHARED_K_ITERS);
++            if ((iter_k + 1) % kInterleave == 0)
++            {
++                if (compute_stage % 2 == 1)
++                {
++                    share_to_reg_one_stage_B_T2<CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
++                        B_shared_this_compute_stage, scales_shared_this_compute_stage, B_shared_warp_tmp_[1],
++                        B_shared_warp_[((iter_k + 1) / 2) % 2], warp_offset_m, warp_offset_n,
++                        (iter_k + 1) % SHARED_K_ITERS);
++                }
++                else
++                {
++                    share_to_reg_one_stage_B_T2<CTA_M, CTA_N, CTA_K, STAGES, true, WARP_N / INTRIN_N, G>(
++                        B_shared_this_compute_stage, scales_shared_this_compute_stage, B_shared_warp_tmp_[0],
++                        B_shared_warp_[((iter_k + 1) / 2) % 2], warp_offset_m, warp_offset_n,
++                        (iter_k + 1) % SHARED_K_ITERS);
++                }
++            }
++            else
++            {
++                if (compute_stage % 2 == 1)
++                {
++                    share_to_reg_one_stage_B_T2<CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
++                        B_shared_this_compute_stage, scales_shared_this_compute_stage, B_shared_warp_tmp_[1],
++                        B_shared_warp_[((iter_k + 1) / 2) % 2], warp_offset_m, warp_offset_n,
++                        (iter_k + 1) % SHARED_K_ITERS);
++                }
++                else
++                {
++                    share_to_reg_one_stage_B_T2<CTA_M, CTA_N, CTA_K, STAGES, false, WARP_N / INTRIN_N, G>(
++                        B_shared_this_compute_stage, scales_shared_this_compute_stage, B_shared_warp_tmp_[0],
++                        B_shared_warp_[((iter_k + 1) / 2) % 2], warp_offset_m, warp_offset_n,
++                        (iter_k + 1) % SHARED_K_ITERS);
++                }
++            }
++            __syncthreads();
++            half* A_shared_warp = A_shared_warp_[iter_k % 2];
++            half* B_shared_warp = B_shared_warp_[(iter_k / 2) % 2];
++            for (int i_0_3 = 0; i_0_3 < WARP_M / INTRIN_M; ++i_0_3)
++            {
++                for (int j_0_4 = 0; j_0_4 < WARP_N / INTRIN_N; ++j_0_4)
++                {
++                    mma_m16n8k16_f32(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8, A_shared_warp + i_0_3 * 8,
++                        B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4);
++                    mma_m16n8k16_f32(C_warp + i_0_3 * WARP_N / INTRIN_N * 8 + j_0_4 * 8 + 4, A_shared_warp + i_0_3 * 8,
++                        B_shared_warp + j_0_4 * 16 + (iter_k % 2) * 4 + 8);
++                }
++            }
++
++            if (iter_k < WARP_K / INTRIN_K - 1)
++            {
++                if constexpr (STAGES == 1)
++                    __syncthreads();
++                global_to_share_one_stage_A_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(A,
++                    A_shared + ld_stage * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k,
++                    k_0_0_ld < gemm_iters);
++                global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(B,
++                    B_shared + ld_stage * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld,
++                    iter_k, k_0_0_ld < gemm_iters);
++            }
++
++            if (iter_k == WARP_K / INTRIN_K - 2)
++            {
++                if constexpr (STAGES == 1 && WARP_K / INTRIN_K > 2)
++                {
++                    __syncthreads();
++                }
++                global_to_share_one_stage_A_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(A,
++                    A_shared + ld_stage * kSmemSizeAPerStage, M, K, cta_offset_m, cta_offset_n, k_0_0_ld, iter_k + 1,
++                    k_0_0_ld < gemm_iters);
++                global_to_share_one_stage_B_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, WARP_K / INTRIN_K, STAGES>(B,
++                    B_shared + ld_stage * kSmemSizeBPerStage, N / 4 * K, K, cta_offset_m, cta_offset_n, k_0_0_ld,
++                    iter_k + 1, k_0_0_ld < gemm_iters);
++                global_to_share_one_stage_scales_T2<CTA_M, CTA_N, CTA_K, CTA_SIZE, STAGES, G>(scales,
++                    scales_shared + (ld_stage / scales_load_interval) * CTA_N, K / G * N, N, cta_offset_m, cta_offset_n,
++                    k_0_0_ld, iter_k, k_0_0_ld < gemm_iters && k_0_0_ld % scales_load_interval == 0);
++                if constexpr (STAGES > 1)
++                {
++                    __pipeline_commit();
++                    __pipeline_wait_prior(STAGES - 2);
++                }
++                compute_stage = (k_0_0 + 1) % STAGES;
++                __syncthreads();
++            }
++        }
++    }
++    for (int ax0_0_1 = 0; ax0_0_1 < WARP_M / INTRIN_M; ++ax0_0_1)
++    {
++        for (int ax1_0_1 = 0; ax1_0_1 < WARP_N / INTRIN_N; ++ax1_0_1)
++        {
++            for (int local_id = 0; local_id < OP_M * 16 / WARP_SIZE; local_id += 2)
++            {
++                int write_row
++                    = cta_offset_m + warp_offset_m + ax0_0_1 * OP_M + ((local_id % 4) / 2 * 8 + (threadIdx.x / 4));
++                if (write_row < M)
++                {
++                    float const* acc = C_warp + ax0_0_1 * WARP_N / INTRIN_N * 8 + ax1_0_1 * 8 + local_id;
++                    __nv_bfloat162 packed = __floats2bfloat162_rn(acc[0], acc[1]);
++                    *reinterpret_cast<__nv_bfloat162*>(C + write_row * N + cta_offset_n + warp_offset_n + ax1_0_1 * 16
++                        + (local_id / 4) * 8 + (local_id % 2) + (threadIdx.x % 4) * 2)
++                        = packed;
++                }
++            };
++        }
++    }
++}
++
++void gemm_forward_cuda_new_bf16(half const* in_feats, int8_t const* weights_device, half const* scaling_factors,
++    __nv_bfloat16* out_feats, int m, int n, int k, int group_size, cudaStream_t stream) noexcept
++{
++    half const* kernel = reinterpret_cast<half const*>(weights_device);
++
++    constexpr int G = 128;
++    constexpr int CTA_M = 64;
++    constexpr int CTA_N = kGemmCtaN;
++    constexpr int CTA_K = 64;
++    constexpr int WARP_M = 64;
++    constexpr int WARP_N = 32;
++    constexpr int WARP_K = 64;
++    constexpr int STAGES = 4;
++
++    constexpr int NUM_WARPS = (CTA_M / WARP_M) * (CTA_N / WARP_N);
++    constexpr int kSmemByteSize
++        = (CTA_M * (CTA_K + SMEM_PAD_A) + CTA_N * (CTA_K + SMEM_PAD_B) / kInterleave + CTA_N) * STAGES * sizeof(half);
++    static_assert(kSmemByteSize < 99 * 1024, "Shared Memory exceeds device limit.");
++
++    int j_factors1 = n / CTA_N / 1;
++    dim3 num_blocks((m + CTA_M - 1) / CTA_M * j_factors1);
++    dim3 threads_per_block(WARP_SIZE, NUM_WARPS);
++    auto kernel_func = gemm_w4a16_T2_bf16<CTA_M, CTA_N, CTA_K, WARP_M, WARP_N, WARP_K, STAGES, G>;
++    static std::once_flag sAttrFlag;
++    std::call_once(sAttrFlag,
++        [&]() { cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemByteSize); });
++    kernel_func<<<num_blocks, threads_per_block, kSmemByteSize, stream>>>(
++        in_feats, kernel, scaling_factors, out_feats, m, n, k);
++}
++
+ } // namespace kernel
+ } // namespace trt_edgellm
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,6 +1,74 @@
 # Patch state — v0.8.0 Base TTS N>1 serving chain (C2-repin)
 
-> **CURRENT AUTHORITATIVE STATE = §C2-repin below (this section).**
+> **⚠️ SUPERSEDED 2026-07-04 by `PATCH-STATE-v090.md` (P4-1 v0.9.0 re-pin).**
+> This file is provenance for the v0.8.0 pin era. The `v080-sparktts-0001..0030`
+> series described in §13 has been DELETED (replaced by `v090-sparktts-0001..0038`).
+
+> **§13 (C2 sparktts re-pin, 2026-07-03), directly
+> below, was the authoritative state on the v0.8.0 pin.** Everything after it
+> (§C2-repin, §0–§12) is earlier provenance.
+
+---
+
+## §13 — C2 sparktts re-pin (CURRENT, 2026-07-03)
+
+### Pin (supersedes §12)
+```
+UPSTREAM_PIN = f9cc74623d95d7acf1addab6026b9d410ba81f52
+             = NVIDIA origin/release/0.8.0 HEAD (PURE NVIDIA, no fork content)
+upstream.remote = https://github.com/NVIDIA/TensorRT-Edge-LLM.git (fork = fallback)
+```
+The overlay no longer pins a fork branch. ALL fork content travels as patches:
+`v080-sparktts-0001..0030` = `git format-patch --no-stat
+f9cc7462..integration/v080-sparktts` (fork HEAD `8437f027`). This series is a
+strict superset of the previously-pinned `wip/cv-9row-v080-n1n2` (`c48c0de`):
+its 12 commits are `v080-sparktts-0001..0012` verbatim; `0013..0030` add the
+SparkTTS consolidation set (bf16/fp16 mixed-precision, INT4-AWQ/W4A16
+mixed-precision export+plugin+GEMM, borrowed/shared-engine ctor for
+voice-clone) — all opt-in, default paths byte-identical to upstream v0.8.0.
+
+### Apply chain
+`addon/` → `v080-sparktts-0001..0030` (numeric order) → `0001-orin-tegra-build-compat`.
+
+**Dry-run verified 2026-07-03** (Mac, worktree @ f9cc7462, build.sh contract:
+addon copy then `git apply --check` + `git apply` per patch): all 30 sparktts
+patches CLEAN, then legacy `0001` CLEAN on top. Tracked-tree parity check:
+staged worktree vs `integration/v080-sparktts` diff = **44 files, ALL of them
+addon files (41) + 0001's 3 build-compat files — zero divergence in the 35
+patched source files** (`git diff --stat f9cc7462..integration/v080-sparktts`
+= 35 files / +3462 −200).
+
+### Disposition table (old → new)
+| patch | disposition | reason |
+|---|---|---|
+| `0001-orin-tegra-build-compat` | **KEPT, in chain (last)** | not in fork branch; apply-check CLEAN on top of the full 30-patch tree. |
+| `0002-weight-streaming-budget` | **REBASED → `0002-weight-streaming-budget-v080-OPTIN.patch`, NOT in chain** | builderUtils.cpp hunk rebased onto v0.8.0 `createBuilderConfig` (after the `kALIASED_PLUGIN_IO_10_03` block), apply-check CLEAN. OPT-IN: every serve-gated v0.8.0 build was produced WITHOUT it. Other v0.7.1 hunks dropped for cause: `eagleDraftEngineRunner.cpp`/`llmEngineRunner.{cpp,h}`/`llmRuntimeUtils.{cpp,h}` no longer exist at those paths; shared-engine-ctor content superseded by `v080-sparktts-0007` (a361221) + `0029` (21119ec). |
+| `0003-asr-streaming-session` | **DELETED** | replaced by in-series ASR path (`v080-sparktts-0009/0010` SessionLaneManager + vendored `native/edgellm_voice_worker/qwen3_asr_worker.cpp` on the vanilla one-shot core). |
+| `0004-tts-slotpool-concurrency` | **DELETED** | replaced by in-series streaming worker + slot-pool (`v080-sparktts-0001/0007`, fork 10b338d/a361221). |
+| `0005-customvoice-language-conditioning` | **DELETED — fully covered** | symbol-level check: `v080-sparktts-0011` (12ee383) carries the identical 9-row langId kernel logic (`kFixedPrefixLen = (langId>=0)?9:8`, row-5 langId injection) behind the runtime-if, and covers export via `tensorrt_edgellm/scripts/export.py` (v0.8.0 location; 0005's `experimental/llm_loader/export_all_cli.py` path no longer exists). Residual delta: none functional. CV gate PASSED on this content 2026-06-22 (§12). |
+| `0006-server-sse-disconnect-and-openai-api` | **ARCHIVAL, not rebasable** | v0.8.0 REWROTE `experimental/server` and ships its own `tool_calling` module (tool-call half superseded UPSTREAM). The SSE-disconnect watcher is still ABSENT upstream (grep: no `is_disconnected` in v0.8.0 server) but porting it = re-implementation against the rewritten server + runtime verification, not a rebase → backlog. SSE fix remains (a) PR-pending — do NOT auto-submit. NOTE: `addon/experimental/server/tests/*` import `_ToolCallStreamParser` from the PATCHED v0.7.1 server → orphaned until that port happens (additive files, never built/run by build.sh — harmless). |
+| `0007-server-openai-api-docs` | **ARCHIVAL** | bound to 0006. |
+| `0008-build-misc-example-registration` | **ARCHIVAL, must NOT be rebased into chain** | omni hunk superseded verbatim by `v080-sparktts-0001` (10b338d registers `qwen3_tts_streaming_worker`); its `examples/llm` hunks register v0.7.1-API spikes (`appendPrefillEmbeds` etc.) that do not exist on v0.8.0 → would break the build. `.gitignore` hunk cosmetic. |
+| `v080-port-0001..0006` | **DELETED** | byte-duplicates of `v080-sparktts-0001..0006` (same fork commits). |
+| `v080-0007` / `v080-0008` (pre-runtime-if CV) | **kept ARCHIVAL** | superseded by `v080-sparktts-0011/0012` (§12 unchanged). |
+| `v080-0001..0006/0010/0012/0024..0027` | **kept ARCHIVAL/DEFERRED** | incremental-KV spike track, C3 backlog (§5/§9.1/§11.3 unchanged). |
+| `v080-0011-moss-tts-nano-port` | **kept ARCHIVAL** | MOSS single-sourced to `addon/` (§4); apply-check on the new tree fails with "already exists" for every file = the expected double-source guard. |
+
+### addon/ reconciliation
+No file created by the 30-patch series exists in `addon/` (the v0.7.1-vendored
+`qwen3_tts_streaming_worker.cpp` + `slotPool.h` were already removed in C2a §8;
+`v080-sparktts-0001` now creates them from the fork content). 41 addon files, all
+additive.
+
+### ASR voice worker (vendored, outside the fork patch series)
+`native/edgellm_voice_worker/qwen3_asr_worker.cpp` updated
+`ab09b992` → **`13b34dcb`** (= `deploy/asr-worker-v080/qwen3_asr_worker.cpp`, the
+PRODUCTION source of the shipped binary). Delta = ①  stripLangTag first-word fix
+(known-language-name set: `asciiIEqualsAt` + `knownAsrLanguagePrefixLen`, per
+`deploy/asr-worker-v080/stripLangTag-firstword-fix.patch`) ② opt-in
+streaming-prefix path (`OVS_ASR_STREAM_PREFIX=1`, default OFF — byte-identical
+cumulative re-decode when OFF). C3 still owes moving this into the fork as the
+single source.
 > Produced by **C2-repin** (Mac, git/source only — no engine build, no deploy).
 > Finalizes the overlay to reproduce the **Base Qwen3-TTS N>1** stack (streaming
 > worker + slot-pool + shared-engine ctor, NO CustomVoice) by repinning to the

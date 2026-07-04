@@ -2,10 +2,23 @@
 
 ```text
 upstream:       github.com/NVIDIA/TensorRT-Edge-LLM (Apache 2.0)
-UPSTREAM_PIN:   364769036fc83351d9d0aac4cc064a8e56a83178   (= tag v0.7.1)
-fork_branch:    v071/customvoice-product  (extracted HEAD 893ba2a, 90 commits ahead)
-extraction:     2026-05-31 (initial overlay extraction; build-verify DEFERRED → Jetson host)
+UPSTREAM_PIN:   1ac0f2b99642045125e1c5ac7b109434ba3b36c7   (= tag v0.9.0, pure NVIDIA)
+patch series:   v090-sparktts-0001..0038 (= fork integration/v090-sparktts @ e8c59c1)
+repin:          2026-07-04 P4-1 v0.9.0 re-pin — see patches/PATCH-STATE-v090.md
 ```
+
+> ⚠️ 2026-07-04 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
+> fork v071/customvoice-product),patch 编号/scope 以 PATCH-STATE-v090.md
+> 处置表为准:v080-sparktts-0001..0030 已删除(由 v090-sparktts-0001..0038 取代);
+> 0001 重基到 v0.9.0(上游未吸收:Tegra autodetect/aarch64 arch guard/静态库
+> shim 传播/cublas link 均仍缺;官方 v0.9.0 JP6.2 文档已改为手动传
+> -DEMBEDDED_TARGET=jetson-orin);0002 重命名为
+> `0002-weight-streaming-budget-v090-OPTIN`(v0.9.0 上重验 apply CLEAN,内容
+> 未变,仍不在默认链);0006/0007/0008 存档。MOSS 移入 patch 系列
+> (v090-sparktts-0033/0034),addon/ 中 8 个 MOSS 文件删除。(a)/(b) 分类与
+> SSE-fix PR-pending(禁自动提交)结论不变。GDN LLM 引擎构建需
+> ENABLE_CUTE_DSL=ALL + 设备现场 cutlass-dsl 4.5.2 重造 sm_87 artifact
+> (语音 worker 构建保持 OFF)——见 README「Dual build configuration」。
 
 ## (a)/(b) 判定准则
 

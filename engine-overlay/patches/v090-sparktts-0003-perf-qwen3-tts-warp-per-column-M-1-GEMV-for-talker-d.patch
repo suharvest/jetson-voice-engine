@@ -1,12 +1,12 @@
-From 50b867083d9cc54fcb78d0a0c43c98595c064fb9 Mon Sep 17 00:00:00 2001
+From 07d3f4fabcc4eda751450657c4a091240fbc375d Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 05:56:53 +0800
-Subject: [PATCH 5/6] perf(qwen3-tts): warp-per-column M=1 GEMV for talker
+Subject: [PATCH 03/38] perf(qwen3-tts): warp-per-column M=1 GEMV for talker
  decode hot path (sm_87)
 
 
 diff --git a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
-index daceeb4..bce03b8 100644
+index 634a705..78ca7cc 100644
 --- a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
 +++ b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
 @@ -327,11 +327,82 @@ __global__ void gemmNTBiasActKernel(half const* __restrict__ A, half const* __re

@@ -48,7 +48,11 @@
 #include "common/trtUtils.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
-#include "runtime/slotPool.h"
+#if __has_include("runtime/slotPool.h")
+#include "runtime/slotPool.h" // v0.8.0 fork: cpp/runtime/slotPool.h
+#else
+#include "slotPool.h" // v0.9.0 re-port: moved verbatim to examples/omni/slotPool.h (same namespace)
+#endif
 #include "runtime/streaming.h"
 
 #include <NvInfer.h>
@@ -889,29 +893,20 @@ int main(int argc, char** argv)
 
     SlotPool<SparkTTSSlot> pool(args.maxSlots);
     std::unordered_map<std::string, std::string> loraWeights;
-    // Shared-engine slot pool: slot 0 OWNS the deserialized base LLM engine weights; slots 1..N-1
-    // BORROW those read-only weights via the shared-engine ctor, so the (large) base engine is loaded
-    // once instead of N times. Every slot still allocates its own execution context, KV cache,
-    // PipelineIO tensors, CUDA-graph cache, and CUDA streams — no mutable state is shared. Slot 0 must
-    // outlive every borrower (enforced by reverse-order teardown below).
-    nvinfer1::ICudaEngine* sharedBaseEngine = nullptr;
+    // v0.9.0 re-port (P3c) note: the shared-engine slot pool (slot 0 OWNS the deserialized
+    // base LLM engine weights; slots 1..N-1 BORROW them via the borrowedBaseEngine ctor +
+    // getBaseEngine(), fork patch #3 on integration/v080-sparktts) has NOT been re-ported to
+    // the v0.9.0 baseline yet — the ctor does not exist there. Until it lands, EVERY slot
+    // deserializes its own copy of the base engine. N=1 (the S1/S2 default) is unaffected;
+    // N>1 costs one extra base-engine copy of VRAM per slot. Restore the borrow path when
+    // the shared-engine patch is re-ported.
     for (int32_t s = 0; s < args.maxSlots; ++s)
     {
         auto slot = std::make_unique<SparkTTSSlot>();
         slot->slotId = s;
         CUDA_CHECK(cudaStreamCreate(&slot->llmStream));
         CUDA_CHECK(cudaStreamCreate(&slot->vocStream));
-        if (s == 0)
-        {
-            slot->llm = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, slot->llmStream);
-            sharedBaseEngine = slot->llm->getBaseEngine();
-            if (!sharedBaseEngine) throw std::runtime_error("slot 0 base engine pointer is null");
-        }
-        else
-        {
-            slot->llm = std::make_unique<LLMInferenceRuntime>(
-                sharedBaseEngine, args.llmEngineDir, "", loraWeights, slot->llmStream);
-        }
+        slot->llm = std::make_unique<LLMInferenceRuntime>(args.llmEngineDir, "", loraWeights, slot->llmStream);
         if (!slot->llm->captureDecodingCUDAGraph(slot->llmStream))
             LOG_WARNING("CUDA graph capture failed for SparkTTS LLM slot %d, proceeding without.", s);
         slot->spkCtx = gSpkEngine->createExecutionContext();

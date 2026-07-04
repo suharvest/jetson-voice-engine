@@ -2,7 +2,8 @@
 # voxedge-engine build wrapper (overlay reproduction contract)
 #
 # CONTRACT
-#   inputs : UPSTREAM_PIN, upstream.remote, addon/, patches/0001..0008, a build manifest
+#   inputs : UPSTREAM_PIN, upstream.remote, addon/, patches/ (v090-sparktts series
+#            + 0001 build-compat), a build manifest
 #            (manifests/*.toml), target sm (e.g. sm_87 Orin), CUDA/TRT version, model src ref.
 #   outputs: worker binaries  (qwen3_asr_worker [N>1] / qwen3_tts_worker / moss_tts_nano_worker)
 #            plugin .so       (libNvInfer_edgellm_plugin.so)
@@ -31,7 +32,7 @@ PIN="$(grep -vE '^[[:space:]]*#' "${HERE}/UPSTREAM_PIN" | head -1 | tr -d '[:spa
 # REMOTE source of the upstream fork. Default = upstream.remote file (the github fork).
 # Override via EDGELLM_UPSTREAM_REMOTE for cross-wall / offline devices that cannot
 # reach github.com — point it at a LOCAL fork checkout or git bundle, e.g.
-#   EDGELLM_UPSTREAM_REMOTE=/home/harvest/project/edgellm-v080 bash build.sh
+#   EDGELLM_UPSTREAM_REMOTE=/home/harvest/project/edgellm-v090 bash build.sh
 # (any path/URL `git clone` accepts; the PIN must be fetchable from it).
 REMOTE="${EDGELLM_UPSTREAM_REMOTE:-$(grep -vE '^[[:space:]]*#' "${HERE}/upstream.remote" | head -1 | tr -d '[:space:]')}"
 WORKDIR="${VOXEDGE_WORKDIR:-${HERE}/.build/upstream}"
@@ -50,6 +51,10 @@ if [ ! -d "${WORKDIR}/.git" ]; then
 fi
 git -C "${WORKDIR}" fetch --depth 1 origin "${PIN}" || git -C "${WORKDIR}" fetch origin
 git -C "${WORKDIR}" checkout -q "${PIN}"
+# Patches are applied with `git apply` onto tracked files; a plain checkout of
+# the same PIN does NOT reset that dirty tree, so a re-run would fail every
+# `git apply --check`. Hard-reset to the pin to make the script re-runnable.
+git -C "${WORKDIR}" reset --hard -q "${PIN}"
 git -C "${WORKDIR}" clean -fdq
 # Integration branch carries 3rdParty submodules (googletest, nlohmannJson, NVTX).
 # Without this the CMake configure fails on the missing 3rdParty/* trees.
@@ -66,63 +71,54 @@ echo "==> copying addon/ (new files)"
   done )
 
 # --- 3. apply patches in order -----------------------------------------------
-# BASE + CUSTOMVOICE N>1 SERVING BUILD CHAIN (v0.8.0, CV re-pin / Option A).
+# P4-1 V0.9.0 RE-PIN (2026-07-04): UPSTREAM_PIN is the PURE NVIDIA v0.9.0 tag
+# (1ac0f2b9). ALL fork content travels as patches:
 #
-# Ground truth: this overlay reproduces the Qwen3-TTS N>1 stack (streaming
-# worker + slot-pool + shared-engine ctor) with BOTH Base AND CustomVoice in ONE
-# binary via a RUNTIME-IF on langId (langId<0 => Base 8-row speaker-encoder
-# prefill, UNCHANGED; langId>=0 => CustomVoice 9-row langId prefill). The single
-# source for the FULL N>1 stack (TTS streaming worker + ASR voice worker + CV
-# runtime-if) is the fork integration branch pinned in UPSTREAM_PIN
-# (c48c0de = suharvest/wip/cv-9row-v080-n1n2), which is:
+#   patches/v090-sparktts-0001..0038
+#     = git format-patch --no-stat 1ac0f2b9..integration/v090-sparktts
+#       (fork HEAD e8c59c1)
+#     The v0.9.0 rebase of the former v080-sparktts series (0001..0030,
+#     DELETED) plus v0.9.0-specific re-ports: the streaming worker is
+#     RE-PORTED to the v0.9.0 native streaming API (0024), MOSS-TTS-Nano is
+#     now IN-SERIES as a CMake target under examples/omni (0033/0034 — its
+#     files were REMOVED from addon/), and the export fixes 0035..0038.
+#     All opt-in: default paths byte-identical to upstream v0.9.0 behaviour.
 #
-#     f9cc746  (NVIDIA release/0.8.0 HEAD)
-#   + 10b338d  port streaming worker (base, N>1 slot-pool) onto v0.8.0
-#   + ba9ecdb  backport Base speaker-encoder (external-embedding) path
-#   + 867b74d  link cutedsl cudart shim into omni exes (CUDA 12.6 sm_87)
-#   + 26a4a69  cuBLAS-free tiled FP16 GEMM fallback (talker MLP/linear, sm_87)
-#   + 50b8670  warp-per-column M=1 GEMV for talker decode hot path (sm_87)
-#   + 873ca22  fp8 text_embedding (native kernel path)
-#   + a361221  D2-1 shared-engine ctor for slot-pool (Base N>1)
-#   + 8de933f  C3 N<=0 prefill guard (defensive; N>0 paths unchanged)
-#   + a099544  add minimal SessionLaneManager (lane allocator)
-#   + 7142a30  SessionLaneManager accessor maxSessionBatchSize() —
-#              the ASR voice worker's #include target (lane allocator ONLY, no
-#              deferred streaming wrapper). Makes step 4b self-contained.
-#   + 12ee383  port 9-row CustomVoice language conditioning onto v0.8.0 N>1
-#              (RUNTIME-IF on langId; Base path unchanged when langId<0)
-#   + c48c0de  wire per-request language into streaming worker buildRequest  <- HEAD
-#
-# Because all of these commits are IN the pinned branch, the old
-# engine-overlay/patches/v080-port-0001..0006 (fork-port) are REDUNDANT and are
-# NOT applied (kept on disk for archival only). See PATCH-STATE-v080.md §4 / §12.
-#
-# APPLY CHAIN = exactly ONE patch on top of the pinned branch + addon/:
-#   + addon/   (new files: MOSS runtime+worker, w8a16 kernels, statefulCode2Wav,
-#               spikes, scripts — all additive; copied in step 2 above)
-#   + 0001-orin-tegra-build-compat  (Orin/Tegra CUDA-12.6 build-host compat;
+# APPLY CHAIN on top of 1ac0f2b9 + addon/:
+#   + addon/   (new files: w8a16 kernels, statefulCode2Wav, spikes, scripts —
+#               all additive; copied in step 2 above. MOSS files are NO LONGER
+#               here — they come from v090-sparktts-0033/0034.)
+#   + v090-sparktts-0001..0038   (in numeric order)
+#   + 0001-orin-tegra-build-compat  (REBASED onto v0.9.0 2026-07-04:
+#               Tegra autodetect + aarch64 arch guard + cublas/cublasLt link +
 #               static-lib PUBLIC/INTERFACE shim + --wrap=_cudaLaunchKernelEx
-#               propagation. NOT in the fork branch — verified git-apply CLEAN.)
+#               propagation + macOS-metadata GLOB filter. NOT absorbed by
+#               upstream v0.9.0 (verified: v0.9.0 still lacks all hunks);
+#               official v0.9.0 JP6.2 docs DO now instruct passing
+#               -DEMBEDDED_TARGET=jetson-orin manually — the autodetect stays
+#               as convenience. Verified git-apply CLEAN on top of the full
+#               v090-sparktts chain.)
 #
-# DROPPED / SUPERSEDED — NOT applied (see PATCH-STATE-v080.md §4 / §10 / §12):
-#   - v080-port-0001..0006  : redundant, now in the pinned branch.
-#   - v080-0007-customvoice-language-conditioning  AND
-#     0005-customvoice-language-conditioning : the OLD pre-runtime-if CV patches.
-#       They forced a SEPARATE CV-only binary whose 9-row prefill could not
-#       coexist with the Base 8-row path. SUPERSEDED by fork commit 12ee383,
-#       which puts the 9-row CV prefill behind a RUNTIME-IF on langId so ONE
-#       binary serves both Base (langId<0) and CV (langId>=0). These two patches
-#       are now ARCHIVAL ONLY (kept on disk, never applied).
-#   - v080-0008-tts-cutedsl-wrap : built on top of v080-0007's shim block, FAILS
-#       git-apply on this branch (examples/omni/CMakeLists.txt context drift).
-#       Superseded by the fork's 867b74d cutedsl shim + the
-#       --wrap=_cudaLaunchKernelEx already in cmake/CuteDsl.cmake (CUDA<12.8) and
-#       hardened by 0001. Archival only.
+# Dry-run verified 2026-07-04: full chain git-apply --check CLEAN on 1ac0f2b9;
+# resulting tracked tree == fork integration/v090-sparktts exactly.
+#
+# NOT APPLIED — kept on disk (see PATCH-STATE-v090.md disposition table):
+#   - 0002-weight-streaming-budget-v090-OPTIN : re-verified git-apply CLEAN on
+#       v0.9.0 builderUtils.cpp UNCHANGED (upstream still has no
+#       weight-streaming there; renamed from -v080-). OPT-IN only — serve-gated
+#       builds are produced WITHOUT it.
+#   - 0006/0007 server SSE-disconnect + OpenAI API (v0.7.1) : still archival;
+#       needs re-implementation against the rewritten server (backlog), not a
+#       rebase. PR-pending status of the SSE fix unchanged — do NOT auto-submit.
+#   - 0008-build-misc-example-registration : archival (superseded registrations
+#       + v0.7.1 spike API).
+#   - v080-0007 / v080-0008 (pre-runtime-if CV patches) : superseded by
+#       v090-sparktts-0026/0029 (runtime-if on langId). Archival.
 #   - v080-NNNN ASR-streaming / TTS-batch incremental-KV experiments : DEFERRED
 #       (C3 backlog). N>1 ASR is delivered by the vendored worker
-#       native/edgellm_voice_worker/qwen3_asr_worker.cpp on the vanilla one-shot
-#       core + the asr-b2 engine (export artifact), selected via the n2 profile —
-#       it needs NONE of these engine patches.
+#       native/edgellm_voice_worker/qwen3_asr_worker.cpp (adapted to v0.9.0 by
+#       port/v090-workers) on the vanilla one-shot core + the asr-b2 engine,
+#       selected via the n2 profile — it needs NONE of these engine patches.
 echo "==> applying patches"
 apply_one() {
   local p="$1"
@@ -144,22 +140,19 @@ apply_one() {
     return 1
   fi
 }
-# Base+CV N>1 serving chain — explicit ordered allow-list (NOT a glob).
-# Verified: full chain git-apply --check CLEAN on the pinned branch + addon/.
-for n in \
-    0001-orin-tegra-build-compat \
-; do
-  apply_one "${HERE}/patches/${n}.patch"
+# v090-sparktts series in numeric order (deterministic glob), then build-compat.
+# Verified: full chain git-apply --check CLEAN on 1ac0f2b9 + addon/.
+for p in "${HERE}"/patches/v090-sparktts-00*.patch; do
+  apply_one "${p}"
 done
+apply_one "${HERE}/patches/0001-orin-tegra-build-compat.patch"
 echo "==> patched source tree ready at ${WORKDIR}"
-echo "    Base+CustomVoice N>1 chain applied (pinned branch c48c0de + 0001)."
-echo "    Streaming worker + slot-pool + shared-engine ctor + Base speaker-encoder"
-echo "    + 9-row CV runtime-if (langId) come from the pinned branch. MOSS via addon/."
-echo "    v080-port-0001..0006 are redundant (in branch); the OLD CV patches"
-echo "    (v080-0007 / 0005 / v080-0008) are SUPERSEDED by the in-branch runtime-if"
-echo "    (12ee383/c48c0de) and intentionally NOT applied; v080-NNNN streaming/batch"
-echo "    experiments are NOT applied either."
-echo "    See patches/PATCH-STATE-v080.md (§4 chain, §10/§12 CustomVoice runtime-if)."
+echo "    v0.9.0 base (1ac0f2b9) + v090-sparktts-0001..0038 + 0001 build-compat."
+echo "    Tracked tree == fork integration/v090-sparktts (HEAD e8c59c1):"
+echo "    streaming worker (v0.9.0 native streaming API) + slot-pool +"
+echo "    shared-engine ctors + external speaker-embedding + 9-row CV runtime-if"
+echo "    (langId) + SparkTTS mixed-precision/int4 opt-ins + MOSS (in-series)."
+echo "    See patches/PATCH-STATE-v090.md for dispositions."
 
 if [ "${APPLY_ONLY}" -eq 1 ]; then
   echo "==> --apply-only: stopping before compile (no CUDA/TRT needed)."
@@ -186,6 +179,12 @@ esac
 #   system package → TRT_PACKAGE_DIR=/usr. Release build type matters
 #   (empty type ≈ 2x slower runtime).
 CUDA_CTK="${CUDA_CTK_VERSION:-12.6}"
+# Non-interactive shells (ssh/fleet exec) don't have nvcc on PATH → cmake dies
+# with CMAKE_CUDA_COMPILER-NOTFOUND. Point PATH/CUDACXX at the toolkit.
+if ! command -v nvcc >/dev/null 2>&1; then
+  export PATH="/usr/local/cuda-${CUDA_CTK}/bin:${PATH}"
+fi
+export CUDACXX="${CUDACXX:-/usr/local/cuda-${CUDA_CTK}/bin/nvcc}"
 TRT_PKG="${TRT_PACKAGE_DIR:-/usr}"
 # Ensure nvcc is discoverable. Non-login shells (ssh exec / nohup / CI) often
 # lack /usr/local/cuda-*/bin on PATH, so a CLEAN cmake configure fails with
@@ -214,11 +213,41 @@ case "$(uname -m)" in
   aarch64) CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-87}" ;;
   *)       CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-}" ;;
 esac
-echo "==> cmake configure (CUDA_CTK_VERSION=${CUDA_CTK}, TRT_PACKAGE_DIR=${TRT_PKG}, CUDA_ARCH=${CUDA_ARCH:-<cmake default>}, Release)"
+# ============================================================================
+# DUAL BUILD CONFIGURATION (v0.9.0-specific fork) — pick per artifact family:
+#
+# (A) VOICE WORKER BUILDS (this script's default): ENABLE_CUTE_DSL=OFF.
+#     The voice stack (qwen3_tts_streaming_worker / qwen3_asr_worker /
+#     moss_tts_nano_worker + plugin) does NOT need CuTe DSL kernels — the
+#     talker hot path uses our own sm_87 kernels from the patch series
+#     (v090-sparktts-0002 cuBLAS-free tiled FP16 GEMM + 0003 warp-per-column
+#     M=1 GEMV) with the cuBLAS fallback linked by 0001. On JetPack 6
+#     (CUDA 12.6) ENABLE_CUTE_DSL=ALL is a LINK-TIME TRAP for these targets
+#     unless you also do (B)'s artifact rebuild, so keep it OFF here.
+#
+# (B) GDN LLM ENGINE BUILDS (Qwen3.5 GDN/MTP, SEPARATE build dir — not this
+#     script): need ENABLE_CUTE_DSL=ALL (the GDN group is CuTe-DSL-only).
+#     On Jetson Orin (sm_87, CUDA 12.6/JP6.2) that additionally requires:
+#       1. regenerating the sm_87 CuTe DSL artifact ON the device with
+#          cutlass-dsl 4.5.2:  pip install nvidia-cutlass-dsl==4.5.2 &&
+#          python kernelSrcs/build_cutedsl.py --gpu_arch sm_87
+#          (upstream v0.9.0 ships no sm_87 prebuilt tarball — only desktop /
+#          Thor / GB10 arches under kernelSrcs/cuteDSLPrebuilt/);
+#       2. the cudart shim + --wrap=_cudaLaunchKernelEx propagation from
+#          patch 0001 (upstream links the shim PRIVATE on static libs, so
+#          without 0001 the final exe link fails on CUDA < 12.8);
+#       3. the official v0.9.0 JP6.2 cmake flags: -DEMBEDDED_TARGET=jetson-orin
+#          (0001 autodetects this on Tegra) — CuTe DSL then auto-selects the
+#          sm_87 artifact tag.
+#     Do NOT mix (A) and (B) artifacts in one build dir.
+# ============================================================================
+CUTE_DSL="${ENABLE_CUTE_DSL:-OFF}"
+echo "==> cmake configure (CUDA_CTK_VERSION=${CUDA_CTK}, TRT_PACKAGE_DIR=${TRT_PKG}, CUDA_ARCH=${CUDA_ARCH:-<cmake default>}, ENABLE_CUTE_DSL=${CUTE_DSL}, Release)"
 cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
       -DCUDA_CTK_VERSION="${CUDA_CTK}" \
       -DTRT_PACKAGE_DIR="${TRT_PKG}" \
       ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"} \
+      -DENABLE_CUTE_DSL="${CUTE_DSL}" \
       -DCMAKE_BUILD_TYPE=Release
 echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so + Base TTS N>1 streaming worker)"
 cmake --build "${WORKDIR}/build" -j"$(nproc)"
@@ -233,11 +262,11 @@ cmake --build "${WORKDIR}/build" -j"$(nproc)" --target qwen3_tts_streaming_worke
 # Base TTS N>1 is the streaming worker built in step 4 above (examples/omni/
 # qwen3_tts_streaming_worker — slot-pool + shared-engine ctor). This step builds
 # the ASR side only: native/edgellm_voice_worker/ is a SEPARATE CMake project
-# that links qwen3_asr_worker (N>1 lane-pool + streaming PARTIALs, v080-0023,
-# binary md5 5ebd436b) against the libedgellmCore.a just built above. It is the
-# formalization of the previously hand-built worker (v080-0021 "Box build dir
-# ~/project/v080-worker-build"): now reproducible from THIS overlay.
-# Source of truth = ${HERE}/../native/edgellm_voice_worker (vendored at feat HEAD).
+# that links qwen3_asr_worker (N>1 lane-pool + streaming PARTIALs) against the
+# libedgellmCore.a just built above. The worker sources were ADAPTED to the
+# v0.9.0 runtime API by port/v090-workers (d7aa144, merged into this branch);
+# they no longer build against v0.8.0.
+# Source of truth = ${HERE}/../native/edgellm_voice_worker (vendored).
 VOICE_WORKER_SRC="${VOICE_WORKER_SRC:-${HERE}/../native/edgellm_voice_worker}"
 if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
   echo "==> building ASR voice worker (qwen3_asr_worker N>1)"
@@ -248,21 +277,21 @@ if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
         -DEDGE_LLM_SOURCE_DIR="${WORKDIR}" \
         -DEDGE_LLM_BUILD_DIR="${WORKDIR}/build"
   cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
-        --target qwen3_asr_worker
+        --target qwen3_asr_worker spark_tts_worker
 else
   echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR worker NOT built." >&2
 fi
 
-# --- 4c. MOSS worker (own helper) --------------------------------------------
-# Pin EDGELLM_SRC to THIS overlay's freshly-built clone (WORKDIR). Without it the
-# helper defaults EDGELLM_SRC=/home/harvest/TensorRT-Edge-LLM — a stale per-dev
-# checkout — so on a clean build the edgellmCore .o files it links are MISSING and
-# the MOSS worker fails (BUILD_EXIT=1) even though TTS+ASR built fine from WORKDIR.
-# (ORT_ROOT/SP_ROOT/CUDA_ROOT remain build-host env per the helper's defaults.)
-if [ -x "${WORKDIR}/cpp/workers/build_moss_worker.sh" ]; then
-  echo "==> building MOSS worker"
-  ( cd "${WORKDIR}/cpp/workers" && EDGELLM_SRC="${WORKDIR}" bash build_moss_worker.sh )
-fi
+# --- 4c. MOSS worker (CMake target since v0.9.0) ------------------------------
+# v090-sparktts-0033/0034 moved the worker to examples/omni/moss_tts_nano_worker.cpp
+# and registered the CMake target `moss_tts_nano_worker` (needs onnxruntime via
+# ORT_ROOT env / /usr/local/onnxruntime / ~/ort-from-container + SentencePiece;
+# the target is SKIPPED with a STATUS message when deps are missing, so this is
+# best-effort). The old cpp/workers/build_moss_worker.sh helper is LEGACY
+# reference only — do not use it on v0.9.0.
+echo "==> building MOSS worker (cmake target moss_tts_nano_worker, best-effort)"
+cmake --build "${WORKDIR}/build" -j"$(nproc)" --target moss_tts_nano_worker \
+  || echo "WARN: moss_tts_nano_worker target unavailable (ORT/SentencePiece missing?) — skipped." >&2
 # --- 4d. plugin unversioned symlink -----------------------------------------
 # The plugin builds as libNvInfer_edgellm_plugin.so.1.0 (VERSION 1.0/SOVERSION 1).
 # The workers default to the UNVERSIONED relative path build/libNvInfer_edgellm_plugin.so.
@@ -280,7 +309,8 @@ fi
 echo "==> build done. Artifacts:"
 echo "      ${WORKDIR}/build/                       libNvInfer_edgellm_plugin.so*"
 echo "      ${WORKDIR}/build/examples/omni/         qwen3_tts_streaming_worker (Base N>1, slot-pool + shared-engine ctor)"
-echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1, 5ebd436b)"
+echo "      ${WORKDIR}/build/examples/omni/         moss_tts_nano_worker (if ORT/SP present)"
+echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1)"
 echo "    Collect worker binaries + plugin .so + .engine, write md5 sidecars,"
 echo "    and reconcile against ${MANIFEST}. Engine build uses build_engine_bundle.py."
 echo "    ONE worker handles BOTH via runtime-if on langId:"

@@ -1,8 +1,8 @@
-From 26a4a693347b4d6f2fa7e167f85dbaa1dde0ab89 Mon Sep 17 00:00:00 2001
+From e024b2c56105019f8e3360ab3e3e2de4917458d8 Mon Sep 17 00:00:00 2001
 From: suharvest <suharvest@gmail.com>
 Date: Sat, 20 Jun 2026 04:30:21 +0800
-Subject: [PATCH 4/6] feat(qwen3-tts): cuBLAS-free tiled FP16 GEMM fallback for
- talker MLP/linear (Jetson sm_87)
+Subject: [PATCH 02/38] feat(qwen3-tts): cuBLAS-free tiled FP16 GEMM fallback
+ for talker MLP/linear (Jetson sm_87)
 
 The CuTe-DSL GEMM prebuilt 'Ampere' cubin is not sm_87-runnable (kernel launch ->
 invalid device function), and invokeTalkerMLP/invokeLinearLayer had only a CuTe path
@@ -11,7 +11,7 @@ bias + optional SiLU epilogue and route both #else branches to it, so the talker
 runs on Orin with ENABLE_CUTE_DSL=OFF. No new link deps (no cuBLAS/dlopen).
 
 diff --git a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
-index 033c22f..daceeb4 100644
+index 60056ae..634a705 100644
 --- a/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
 +++ b/cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu
 @@ -275,6 +275,70 @@ void invokeAddBias(rt::Tensor& data, rt::Tensor const& bias, cudaStream_t stream

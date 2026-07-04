@@ -1,30 +1,37 @@
-8437f027d58c047ff390d7a34790d017ba8c31d8
-# = suharvest fork integration branch HEAD: integration/v080-sparktts
+1ac0f2b99642045125e1c5ac7b109434ba3b36c7
+# = NVIDIA TensorRT-Edge-LLM tag v0.9.0 ("Merge pull request #122 from
+#   jhalabi-nv/dev-release/0.9.0"). PURE NVIDIA commit — no fork content.
 #
-# Repinned from c48c0de -> 8437f027: folds the SparkTTS edge-llm framework
-# changes (①②③, all opt-in / default byte-identical) INTO the single baseline,
-# so an upstream NVIDIA bump = ONE rebase of this branch (no per-variant patches).
+# P4-1 v0.9.0 re-pin (2026-07-04): pin moved v0.8.0 (f9cc7462) -> v0.9.0 tag.
+# ALL fork content travels as overlay patches:
 #
-# 8437f027 = c48c0de (Base + CustomVoice runtime-if, the prior v0.8.0 N>1 stack)
-#   + ① bf16/fp16 mixed-precision (config.mixed_precision; BF16 residual/MLP +
-#       FP16 attention island) — fixes Qwen2.5 fp16 residual overflow (SparkTTS LLM)
-#   + ② W4A16 INT4-AWQ with BF16 GEMM output (mixed_precision_with_quant; int4
-#       GEMM/GEMV kBF16 output path) — −58% engine / −22% decode for SparkTTS
-#   + ③ shared-engine ctor for EngineExecutor + LLMInferenceRuntime (borrowed
-#       read-only engine across slots; distinct from a361221's Omni-runtime
-#       shared-engine — SparkTTS uses the plain LLMInferenceRuntime path)
-#   - dropped dev-only bf16_overflow_microbench.cu (CMake glob dup-symbol)
+#   patches/v090-sparktts-0001..0038  =  git format-patch --no-stat
+#       1ac0f2b9..integration/v090-sparktts        (fork HEAD e8c59c1)
 #
-# All three are opt-in: Base / CustomVoice binaries are unaffected (default off).
-# SparkTTS is a product variant = this baseline + its own worker (jve
-# native/edgellm_voice_worker/spark_tts_worker.cpp) + config — NOT a separate pin.
+# The 38-commit series is the v0.9.0 rebase of the previous v080-sparktts
+# series (0001..0030) PLUS the v0.9.0-specific re-ports and export fixes:
+#   0001..0003  sm_87 build/perf (cudart shim link, cuBLAS-free tiled GEMM,
+#               warp-per-column M=1 GEMV)                     (d18bfa3 e024b2c 07d3f4f)
+#   0004..0005  ASR SessionLaneManager + maxSessionBatchSize() (d87bf38 ab54e31)
+#   0006..0023  SparkTTS mixed-precision + INT4-AWQ opt-in set, incl.
+#               mixed_precision -> bf16_residual rename        (eb03efd..d74e35b)
+#   0024        streaming worker RE-PORTED to the v0.9.0 native streaming API
+#               (slot-pool, examples/omni)                     (bc3540e)
+#   0025..0032  omni-TTS features on the new worker: N<=0 guard, CV 9-row
+#               langId, external speaker-embedding, FP8 text_embedding,
+#               language+speaker_embedding_b64 wiring, cooperative cancel,
+#               shared-engine ctors, differentiated chunking   (dcf47de..6f0fbfc)
+#   0033..0034  MOSS-TTS-Nano re-port + CMake target (examples/omni) — MOSS is
+#               now IN-SERIES; its files were REMOVED from addon/ (were
+#               addon-only on v0.8.0)                          (2a48e62 d18ddd2)
+#   0035..0038  checkpoint/export fixes (fp32 cast, ASR mrope, base-export
+#               guard demotion, codec_language_id)             (13be473..e8c59c1)
 #
-# Apply chain: the integration branch 8437f027 ALREADY carries
-# 0001-orin-tegra-build-compat (Tegra auto-detect + AARCH64 arch guard + cublas
-# links + cuteDSL static-lib shim + filter_macos_metadata). build.sh's apply_one
-# is idempotent: it forward-applies a patch if needed, SKIPS it if already
-# present (reverse --check passes), and only fails on a genuine conflict. So on
-# this pin 0001 is skipped (already-present) — net apply chain is effectively
-# EMPTY. No SparkTTS engine patch — everything is in the pinned branch.
-# Fork ref must be reachable on upstream.remote (suharvest): push
-# integration/v080-sparktts so build.sh can fetch SHA 8437f027.
+# Apply chain (build.sh): addon/ + v090-sparktts-0001..0038 (in order)
+#                         + 0001-orin-tegra-build-compat (REBASED onto v0.9.0).
+# Dry-run verified 2026-07-04 (Mac, git apply --check + apply): full chain
+# CLEAN on 1ac0f2b9; resulting tracked tree == integration/v090-sparktts
+# (diff shows only addon files + 0001's 3 build-compat files).
+#
+# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git (this SHA
+# is the public NVIDIA v0.9.0 tag; the suharvest fork also carries it).
