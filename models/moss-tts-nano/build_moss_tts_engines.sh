@@ -16,6 +16,25 @@
 
 set -euo pipefail
 
+# ---- Precision recipe ("mix1") ---------------------------------------------
+# VALIDATED on DGX Spark (GB10, sm_121, TRT 10.14) 2026-07-13. A naive all-fp16
+# build compiles cleanly but produces SILENT audio (RMS=0): the global
+# transformer (prefill/decode_step) AND the codec attention caches are fp32
+# precision-critical — fp16 collapses them to zeros. The sampler feeds valid
+# non-zero frame_tokens either way, so the silence is downstream in fp16 globals
+# + fp16 codec. Working recipe:
+#   * prefill / decode_step  → FP32  (global transformer, precision-critical)
+#   * local_*                → BF16  (local decoder/sampler; fp16 also collapses)
+#   * codec_decode_step      → FP32  (codec attn caches are float32 in meta;
+#                                     runtime binds fp32 buffers, --fp16 → silence)
+# NOTE: build the FP32 globals from the CLEAN full-precision ONNX (the non-paged
+# moss-tts-nano-onnx export). A fresh FP32 build from the paged-fp16 ONNX still
+# collapses — its weights were already truncated to fp16 precision.
+# Override with GLOBAL_PREC / LOCAL_PREC / CODEC_PREC if a device needs different.
+GLOBAL_PREC=${GLOBAL_PREC:-}          # empty = fp32 (no trtexec precision flag)
+LOCAL_PREC=${LOCAL_PREC:---bf16}
+CODEC_PREC=${CODEC_PREC:-}            # empty = fp32
+
 ONNX_DIR=${ONNX_DIR:-/opt/models/moss-tts-nano/onnx}
 CODEC_ONNX_DIR=${CODEC_ONNX_DIR:-/opt/models/moss-tts-nano/codec_onnx}
 OUT_DIR=${OUT_DIR:-/opt/models/moss-tts-nano}
@@ -37,10 +56,12 @@ echo "[build] (1/6) moss_tts_prefill.plan ..."
 # past_valid_lengths — that is a decode-step input). Shapes updated to match the
 # current export (the old profile referenced a non-existent input and failed
 # with "Cannot find input tensor past_valid_lengths").
-${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_prefill.onnx" --fp16 \
+# maxShapes raised to 1024: the MOSS prompt includes ~218 voice-conditioning
+# code rows + text, so real prefill seq len exceeds the old 256 cap.
+${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_prefill.onnx" ${GLOBAL_PREC} \
   --minShapes=input_ids:1x1x17,attention_mask:1x1 \
-  --optShapes=input_ids:1x32x17,attention_mask:1x32 \
-  --maxShapes=input_ids:1x256x17,attention_mask:1x256 \
+  --optShapes=input_ids:1x256x17,attention_mask:1x256 \
+  --maxShapes=input_ids:1x1024x17,attention_mask:1x1024 \
   --saveEngine="${ENGINES_DIR}/moss_tts_prefill.plan" 2>&1 | tail -8
 
 # ---- 2) Decode step (12 layers KV cache; all past_key_*/past_value_* dynamic) ---
@@ -54,7 +75,7 @@ done
 # NOTE: decode_step inputs are input_ids + past_valid_lengths + past_key_*/
 # past_value_* (12 layers) — NO attention_mask (removed; the old profile listed
 # a non-existent attention_mask input).
-${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_decode_step.onnx" --fp16 \
+${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_decode_step.onnx" ${GLOBAL_PREC} \
   --minShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_MIN%,}" \
   --optShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_OPT%,}" \
   --maxShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_MAX%,}" \
@@ -62,23 +83,23 @@ ${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_decode_step.onnx" --fp16 \
 
 # ---- 3) Local decoder (one-shot, static shapes) ----------------------------
 echo "[build] (3/6) moss_tts_local_decoder.plan ..."
-${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_decoder.onnx" --fp16 \
+${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_decoder.onnx" ${LOCAL_PREC} \
   --saveEngine="${ENGINES_DIR}/moss_tts_local_decoder.plan" 2>&1 | tail -5
 
 # ---- 4) Local cached step (optional, MVP unused but loaded) -----------------
 echo "[build] (4/6) moss_tts_local_cached_step.plan ..."
-${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_cached_step.onnx" --fp16 \
+${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_cached_step.onnx" ${LOCAL_PREC} \
   --saveEngine="${ENGINES_DIR}/moss_tts_local_cached_step.plan" 2>&1 | tail -5 || \
   echo "[build] WARN: local_cached_step build failed (non-fatal; engine is optional)"
 
 # ---- 5) Local fixed sampled frame (production sampler, static) -------------
 echo "[build] (5/6) moss_tts_local_fixed_sampled_frame.plan ..."
-${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_fixed_sampled_frame.onnx" --fp16 \
+${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_fixed_sampled_frame.onnx" ${LOCAL_PREC} \
   --saveEngine="${ENGINES_DIR}/moss_tts_local_fixed_sampled_frame.plan" 2>&1 | tail -5
 
 # ---- 6) Codec decode_step (audio_codes dynamic on frame count) -------------
 echo "[build] (6/6) codec_decode_step.plan ..."
-${TRTEXEC} --onnx="${CODEC_ONNX_DIR}/moss_audio_tokenizer_decode_step.onnx" --fp16 \
+${TRTEXEC} --onnx="${CODEC_ONNX_DIR}/moss_audio_tokenizer_decode_step.onnx" ${CODEC_PREC} \
   --minShapes=audio_codes:1x1x16,audio_code_lengths:1 \
   --optShapes=audio_codes:1x4x16,audio_code_lengths:1 \
   --maxShapes=audio_codes:1x8x16,audio_code_lengths:1 \
