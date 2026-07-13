@@ -1,0 +1,56 @@
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index 936757f..7ba20f3 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -131,6 +131,18 @@ function(_cute_dsl_infer_artifact_tag OUT_VAR ARCH)
+     return()
+   endif()
+ 
++  # Fallback: infer tag from CMAKE_CUDA_ARCHITECTURES so NON-embedded targets
++  # (sbsa/desktop Blackwell, e.g. GB10/DGX Spark) resolve without EMBEDDED_TARGET
++  # or an explicit -DCUTE_DSL_ARTIFACT_TAG. "121a"/"121" -> sm_121, "110" -> sm_110.
++  if(DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
++    list(GET CMAKE_CUDA_ARCHITECTURES 0 _first_arch)
++    string(REGEX MATCH "^[0-9]+" _arch_num "${_first_arch}")
++    if(NOT _arch_num STREQUAL "")
++      set(${OUT_VAR} "sm_${_arch_num}" PARENT_SCOPE)
++      return()
++    endif()
++  endif()
++
+   set(_artifact_root "${CMAKE_SOURCE_DIR}/cpp/kernels/cuteDSLArtifact/${ARCH}")
+   set(_candidate_tags)
+   if(EXISTS "${_artifact_root}")
+@@ -875,20 +887,29 @@ function(cute_dsl_setup)
+   foreach(_tgt ${ARG_LINK_TARGETS})
+     get_target_property(_tgt_type ${_tgt} TYPE)
+     if(_tgt_type STREQUAL "STATIC_LIBRARY")
+-      target_link_libraries(${_tgt} PUBLIC "${_static_lib}")
++      target_link_libraries(${_tgt} PUBLIC "${_static_lib}"
++                                           trt_edgellm_cutedsl_cudart_shim)
+     else()
+       target_link_libraries(${_tgt} PRIVATE "${_static_lib}"
+                                             trt_edgellm_cutedsl_cudart_shim)
+     endif()
+     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
+-      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_libraries(${_tgt} PUBLIC "${CUDA_DRIVER_LIB}")
++      else()
++        target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
++      endif()
+     endif()
+     # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+     # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
+     if(NOT _cute_dsl_cuda_ver STREQUAL ""
+        AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+        AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
+-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_options(${_tgt} INTERFACE "-Wl,--wrap=_cudaLaunchKernelEx")
++      else()
++        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      endif()
+     endif()
+   endforeach()
+ 
