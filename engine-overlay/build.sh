@@ -203,16 +203,19 @@ if ! command -v nvcc >/dev/null 2>&1; then
   fi
 fi
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-${CUDA_CTK}}"
-# CUDA target SM. On aarch64/Tegra (Orin) the upstream CMakeLists, hardened by
-# 0001, SKIPS the desktop "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block — so
-# nothing sets the arch and the int4 WOQ GEMM fails to compile with
-# "cp.async requires sm_80+". Orin is sm_87, so default to 87 there (matching
-# the EMBEDDED_TARGET=jetson-orin Tegra detection in 0001). Override via
-# CMAKE_CUDA_ARCHITECTURES for other targets.
-case "$(uname -m)" in
-  aarch64) CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-87}" ;;
-  *)       CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-}" ;;
-esac
+# CUDA target SM + platform — SINGLE SOURCE OF TRUTH via detect-target.sh.
+# The upstream CMakeLists (hardened by 0001) SKIPS the desktop
+# "set(CMAKE_CUDA_ARCHITECTURES 80;86;89)" block on aarch64, so we MUST set the
+# arch explicitly or int4 WOQ GEMM fails ("cp.async requires sm_80+").
+# The old code hardcoded aarch64->sm_87 (assumed Jetson Orin); that silently
+# mis-built on non-Orin aarch64 (GB10/Spark sm_121). detect-target.sh emits
+# (TARGET_SM, TARGET_PLATFORM, CMAKE_CUDA_ARCH, CUTE_DSL_ARTIFACT_TAG,
+# EDGELLM_EMBEDDED_TARGET) from nvidia-smi + platform markers. Override with
+# CMAKE_CUDA_ARCHITECTURES or TARGET_SM/TARGET_PLATFORM.
+_TGT="$(bash "${HERE}/detect-target.sh")" || { echo "ERROR: target detection failed; set TARGET_SM (e.g. 121a/87/110)." >&2; exit 3; }
+eval "${_TGT}"
+CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-${CMAKE_CUDA_ARCH}}"
+echo "==> target: SM=${TARGET_SM} platform=${TARGET_PLATFORM} arch=${CUDA_ARCH} cute_tag=${CUTE_DSL_ARTIFACT_TAG} embedded='${EDGELLM_EMBEDDED_TARGET}'"
 # ============================================================================
 # DUAL BUILD CONFIGURATION (v0.9.0-specific fork) — pick per artifact family:
 #
@@ -247,6 +250,8 @@ cmake -S "${WORKDIR}" -B "${WORKDIR}/build" \
       -DCUDA_CTK_VERSION="${CUDA_CTK}" \
       -DTRT_PACKAGE_DIR="${TRT_PKG}" \
       ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"} \
+      ${CUTE_DSL_ARTIFACT_TAG:+-DCUTE_DSL_ARTIFACT_TAG="${CUTE_DSL_ARTIFACT_TAG}"} \
+      ${EDGELLM_EMBEDDED_TARGET:+-DEMBEDDED_TARGET="${EDGELLM_EMBEDDED_TARGET}"} \
       -DENABLE_CUTE_DSL="${CUTE_DSL}" \
       -DCMAKE_BUILD_TYPE=Release
 echo "==> make -j$(nproc) (engine core libedgellmCore.a + plugin .so + Base TTS N>1 streaming worker)"
@@ -271,9 +276,15 @@ VOICE_WORKER_SRC="${VOICE_WORKER_SRC:-${HERE}/../native/edgellm_voice_worker}"
 if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
   echo "==> building ASR voice worker (qwen3_asr_worker N>1)"
   echo "    src=${VOICE_WORKER_SRC}  EDGE_LLM_BASE=${WORKDIR}  EDGE_LLM_BUILD=${WORKDIR}/build"
+  # CRITICAL: propagate the target arch. Without -DCMAKE_CUDA_ARCHITECTURES this
+  # sub-build inherited CMake's compiler default (sm_75) — SILENTLY, so the main
+  # build was sm_121a but qwen3_asr_worker was sm_75 → "no kernel image is
+  # available for execution on the device" at runtime on GB10. Must match the
+  # main build's ${CUDA_ARCH}.
   cmake -S "${VOICE_WORKER_SRC}" -B "${WORKDIR}/build/voice-workers" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCUDA_CTK_VERSION="${CUDA_CTK}" \
+        ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"} \
         -DEDGE_LLM_SOURCE_DIR="${WORKDIR}" \
         -DEDGE_LLM_BUILD_DIR="${WORKDIR}/build"
   cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
