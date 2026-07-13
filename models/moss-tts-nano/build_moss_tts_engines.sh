@@ -33,10 +33,14 @@ echo "[build] trtexec: $(${TRTEXEC} --version 2>&1 | head -1)"
 
 # ---- 1) Prefill engine ------------------------------------------------------
 echo "[build] (1/6) moss_tts_prefill.plan ..."
+# NOTE: prefill ONNX inputs are ONLY input_ids + attention_mask (no
+# past_valid_lengths — that is a decode-step input). Shapes updated to match the
+# current export (the old profile referenced a non-existent input and failed
+# with "Cannot find input tensor past_valid_lengths").
 ${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_prefill.onnx" --fp16 \
-  --minShapes=input_ids:1x1x17,attention_mask:1x1,past_valid_lengths:1 \
-  --optShapes=input_ids:1x32x17,attention_mask:1x32,past_valid_lengths:1 \
-  --maxShapes=input_ids:1x256x17,attention_mask:1x256,past_valid_lengths:1 \
+  --minShapes=input_ids:1x1x17,attention_mask:1x1 \
+  --optShapes=input_ids:1x32x17,attention_mask:1x32 \
+  --maxShapes=input_ids:1x256x17,attention_mask:1x256 \
   --saveEngine="${ENGINES_DIR}/moss_tts_prefill.plan" 2>&1 | tail -8
 
 # ---- 2) Decode step (12 layers KV cache; all past_key_*/past_value_* dynamic) ---
@@ -47,10 +51,13 @@ for i in $(seq 0 11); do
   PAST_OPT+="past_key_${i}:1x64x12x64,past_value_${i}:1x64x12x64,"
   PAST_MAX+="past_key_${i}:1x512x12x64,past_value_${i}:1x512x12x64,"
 done
+# NOTE: decode_step inputs are input_ids + past_valid_lengths + past_key_*/
+# past_value_* (12 layers) — NO attention_mask (removed; the old profile listed
+# a non-existent attention_mask input).
 ${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_decode_step.onnx" --fp16 \
-  --minShapes="input_ids:1x1x17,attention_mask:1x1,past_valid_lengths:1,${PAST_MIN%,}" \
-  --optShapes="input_ids:1x1x17,attention_mask:1x64,past_valid_lengths:1,${PAST_OPT%,}" \
-  --maxShapes="input_ids:1x1x17,attention_mask:1x512,past_valid_lengths:1,${PAST_MAX%,}" \
+  --minShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_MIN%,}" \
+  --optShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_OPT%,}" \
+  --maxShapes="input_ids:1x1x17,past_valid_lengths:1,${PAST_MAX%,}" \
   --saveEngine="${ENGINES_DIR}/moss_tts_decode_step.plan" 2>&1 | tail -8
 
 # ---- 3) Local decoder (one-shot, static shapes) ----------------------------
