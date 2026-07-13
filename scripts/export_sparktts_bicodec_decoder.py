@@ -7,19 +7,40 @@ Boundary (locked by spike, from sparktts/models/bicodec.py:detokenize):
 Phase-1a upgrade over spike: validate dynamic T across multiple lengths (50/100/300)
 with onnxruntime vs PyTorch, to ensure the engine is not frozen to a single T.
 
-Run on WSL (x86 + CPU is fine for export determinism).
+Export is arch-independent (ONNX runs on any GPU); run wherever the SparkTTS
+model + Spark-TTS repo are available (x86 + CPU is fine for determinism).
+
+Paths are parameterized — set via env or CLI (CLI wins):
+    SPARKTTS_MODEL_DIR   dir containing BiCodec/  (required)
+    SPARKTTS_REPO        Spark-TTS repo root (for `sparktts` import)  (required)
+    SPARKTTS_OUT_DIR     output dir for ONNX + sidecar (default: cwd)
 """
+import os
 import sys
 import json
+import argparse
 import hashlib
 
 import numpy as np
 import torch
 
-MODEL_DIR = "/home/harve/project/v090-assets/spark-tts-0.5b"
-REPO = "/home/harve/spike-sparktts/Spark-TTS"
+ap = argparse.ArgumentParser(description="Export SparkTTS BiCodec decoder to ONNX")
+ap.add_argument("--model-dir", default=os.environ.get("SPARKTTS_MODEL_DIR"),
+                help="dir containing BiCodec/ (env SPARKTTS_MODEL_DIR)")
+ap.add_argument("--repo", default=os.environ.get("SPARKTTS_REPO"),
+                help="Spark-TTS repo root for `sparktts` import (env SPARKTTS_REPO)")
+ap.add_argument("--out-dir", default=os.environ.get("SPARKTTS_OUT_DIR", "."),
+                help="output dir (env SPARKTTS_OUT_DIR, default cwd)")
+args = ap.parse_args()
+if not args.model_dir or not args.repo:
+    ap.error("--model-dir/--repo (or SPARKTTS_MODEL_DIR/SPARKTTS_REPO) are required")
+
+MODEL_DIR = args.model_dir
+REPO = args.repo
 DEV = "cpu"
-ONNX_PATH = "bicodec_decoder_dynT.onnx"
+os.makedirs(args.out_dir, exist_ok=True)
+ONNX_PATH = os.path.join(args.out_dir, "bicodec_decoder_dynT.onnx")
+CONFIG_PATH = os.path.join(args.out_dir, "bicodec_decoder_dynT.config.json")
 OPSET = 17
 EXPORT_T = 200  # opt-ish example length for tracing
 VALIDATE_TS = [50, 100, 300]
@@ -130,7 +151,7 @@ cfg = {
     "onnx_md5": md5,
     "dynamic_T_validation": results,
 }
-with open("bicodec_decoder_dynT.config.json", "w") as f:
+with open(CONFIG_PATH, "w") as f:
     json.dump(cfg, f, indent=2)
-print("Wrote sidecar bicodec_decoder_dynT.config.json", flush=True)
+print("Wrote sidecar", CONFIG_PATH, flush=True)
 print("EXPORT_DYN_DONE", flush=True)

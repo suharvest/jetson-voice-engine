@@ -13,19 +13,41 @@ torch index_select / embedding gather (mathematically identical), which traces c
 We then validate the exported ONNX vs the OFFICIAL detokenize (max_abs must be ~0) over
 several random + the real mixed-engine global id sets.
 
-Run on WSL (x86 CPU; export is deterministic).
+Export is arch-independent (ONNX runs on any GPU); run wherever the SparkTTS
+model + Spark-TTS repo are available (x86 CPU; export is deterministic).
+
+Paths are parameterized — set via env or CLI (CLI wins):
+    SPARKTTS_MODEL_DIR   dir containing BiCodec/  (required)
+    SPARKTTS_REPO        Spark-TTS repo root (for `sparktts` import)  (required)
+    SPARKTTS_OUT_DIR     output dir for ONNX + sidecar (default: cwd)
 """
+import os
 import sys
 import json
+import argparse
 import hashlib
 
 import numpy as np
 import torch
 
-MODEL_DIR = "/home/harve/project/v090-assets/spark-tts-0.5b"
-REPO = "/home/harve/spike-sparktts/Spark-TTS"
+ap = argparse.ArgumentParser(description="Export SparkTTS speaker decoder to ONNX")
+ap.add_argument("--model-dir", default=os.environ.get("SPARKTTS_MODEL_DIR"),
+                help="dir containing BiCodec/ (env SPARKTTS_MODEL_DIR)")
+ap.add_argument("--repo", default=os.environ.get("SPARKTTS_REPO"),
+                help="Spark-TTS repo root for `sparktts` import (env SPARKTTS_REPO)")
+ap.add_argument("--out-dir", default=os.environ.get("SPARKTTS_OUT_DIR", "."),
+                help="output dir (env SPARKTTS_OUT_DIR, default cwd)")
+args = ap.parse_args()
+if not args.model_dir or not args.repo:
+    ap.error("--model-dir/--repo (or SPARKTTS_MODEL_DIR/SPARKTTS_REPO) are required")
+
+MODEL_DIR = args.model_dir
+REPO = args.repo
 DEV = "cpu"
-ONNX_PATH = "sparktts_speaker_decoder.onnx"
+os.makedirs(args.out_dir, exist_ok=True)
+ONNX_PATH = os.path.join(args.out_dir, "sparktts_speaker_decoder.onnx")
+CONFIG_PATH = os.path.join(args.out_dir, "sparktts_speaker_decoder.config.json")
+MIXED_GLOBALS_PATH = os.path.join(args.out_dir, "mixed_globals.json")
 OPSET = 17
 
 sys.path.insert(0, REPO)
@@ -136,7 +158,7 @@ for i in range(5):
 
 # real mixed-engine global ids
 try:
-    gmap = json.load(open("mixed_globals.json"))
+    gmap = json.load(open(MIXED_GLOBALS_PATH))
     for cid, ids in gmap.items():
         assert len(ids) == 32
         ref = official_detokenize(ids)
@@ -161,7 +183,7 @@ cfg = {
     "onnx_vs_official_max_abs": max_abs_all,
     "validation": results,
 }
-with open("sparktts_speaker_decoder.config.json", "w") as f:
+with open(CONFIG_PATH, "w") as f:
     json.dump(cfg, f, indent=2)
 print("max_abs_all (onnx vs official):", max_abs_all, flush=True)
 print("EXPORT_SPK_DECODER_DONE", flush=True)
