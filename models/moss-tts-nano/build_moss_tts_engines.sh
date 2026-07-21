@@ -24,7 +24,14 @@ set -euo pipefail
 # non-zero frame_tokens either way, so the silence is downstream in fp16 globals
 # + fp16 codec. Working recipe:
 #   * prefill / decode_step  → FP32  (global transformer, precision-critical)
-#   * local_*                → BF16  (local decoder/sampler; fp16 also collapses)
+#   * local_*                → BF16 on GB10/sm_121, where fp16 collapses.
+#                                NOT on Orin NX (sm_87, TRT 10.3): --bf16 there
+#                                selects no bf16 kernel at all, so every weight
+#                                stays fp32 and the three local engines cost
+#                                +439 MB (227/230/231 MB instead of 65/115/69).
+#                                --fp16 on sm_87 produces frame-identical audio
+#                                — verified byte-for-byte on the three longest
+#                                inputs. Set LOCAL_PREC=--fp16 on Orin.
 #   * codec_decode_step      → FP32  (codec attn caches are float32 in meta;
 #                                     runtime binds fp32 buffers, --fp16 → silence)
 # NOTE: build the FP32 globals from the CLEAN full-precision ONNX (the non-paged
