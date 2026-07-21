@@ -1,0 +1,70 @@
+diff --git a/experimental/server/api_server.py b/experimental/server/api_server.py
+index 541a12e..c039599 100644
+--- a/experimental/server/api_server.py
++++ b/experimental/server/api_server.py
+@@ -40,7 +40,7 @@ import time
+ import uuid
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+-from .engine import SamplingParams, finish_reason_name
++from .engine import SamplingParams, finish_reason_name, _GEN_LOCK
+ from .tool_calling import (ToolConfig, parse_assistant_output,
+                            validate_tool_request)
+ 
+@@ -176,7 +176,8 @@ def _create_app(llm_instance):
+                 tool_choice=tool_config.tool_choice,
+                 tool_config=tool_config,
+             )
+-            response = llm_instance._runtime.handle_request(request)
++            with _GEN_LOCK:
++                response = llm_instance._runtime.handle_request(request)
+         except (ValueError, KeyError) as exc:
+             return JSONResponse(
+                 status_code=400,
+diff --git a/experimental/server/engine.py b/experimental/server/engine.py
+index 1559107..e185555 100644
+--- a/experimental/server/engine.py
++++ b/experimental/server/engine.py
+@@ -249,6 +249,9 @@ def _ensure_export_package() -> None:
+ # ---------------------------------------------------------------------------
+ 
+ 
++_GEN_LOCK = threading.Lock()  # serialize runtime; official LLM continuous-batching is deferred
++
++
+ class LLM:
+     """vLLM-style entry point for TensorRT Edge-LLM inference.
+ 
+@@ -707,6 +710,7 @@ class LLM:
+         request.add_generation_prompt = add_prompt
+         request.enable_thinking = params.enable_thinking
+         request.disable_spec_decode = params.disable_spec_decode
++        request.save_system_prompt_kv_cache = True
+         return request
+ 
+     def _parse_generation_output(
+@@ -845,7 +849,8 @@ class LLM:
+ 
+         def _run():
+             try:
+-                self._runtime.handle_request(request)
++                with _GEN_LOCK:
++                    self._runtime.handle_request(request)
+             except Exception as exc:
+                 error_holder[0] = exc
+                 channel.cancel()
+diff --git a/experimental/server/setup_pybind.py b/experimental/server/setup_pybind.py
+index 04856ab..edb6b24 100644
+--- a/experimental/server/setup_pybind.py
++++ b/experimental/server/setup_pybind.py
+@@ -56,6 +56,10 @@ class CMakeBuild(build_ext):
+             "-DBUILD_PYTHON_BINDINGS=ON",
+         ]
+ 
++        _extra = os.environ.get("EDGELLM_EXTRA_CMAKE_ARGS", "")
++        if _extra:
++            cmake_args += _extra.split()
++
+         if os.environ.get("AARCH64_BUILD", "").lower() in (
+                 "1",
+                 "true",
