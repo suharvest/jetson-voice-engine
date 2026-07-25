@@ -21,7 +21,7 @@ checksums = "patches/v091-candidate/SHA256SUMS"
 count = 35
 sparse_numbering = true
 series_sha256 = "a358dcafc5d3fc70468a01e21c97236a1a6664644d26f635ed6ee6934d3be3d5"
-checksums_sha256 = "79161e8ea93b70ab06e1a16ff5a060779f96866a6c3a42bee7087246e10d44d3"
+checksums_sha256 = "810eab4177951bbffed0d7fa40c592dce5a5c376a7fbd7f286c7fe2314f1753a"
 
 [target]
 device = "jetson-orin-nx"

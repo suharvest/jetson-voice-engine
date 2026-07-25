@@ -32,4 +32,4 @@ d16958dcbee7abd89782e0204460774ca6849e3c36a7df628748ba5602277d7b  0023-feat-omni
 6f0b12f7efd708d2c174fdf73367c17c2efe11282ebea2a780758ba2799a0e8a  0032-build-moss-tts-nano-wire-worker-into-v0.9.0-CMake-ex.patch
 afcb0afe003a85f5027132b6bd1ed4238dcc420855da0e59e1775210b19f2c11  0035-fix-export-demote-Qwen3-TTS-non-CustomVoice-guard-to.patch
 e37dd5a4a9ccd5855e436b8c86d2f7adacda97963abe6a233c2276d085a28d17  0036-fix-export-carry-codec_language_id-into-the-exported.patch
-a9a401046d3d2f55d43bce48d9646165142eba4b4eb35426517fdd7a3843a94e  0041-feat-moss-worker-concurrent-dispatch-cancel.patch
+c8d8a14e3f06702144f714e59fa9ed61f1672e183fbcd3c371ac505572158780  0041-feat-moss-worker-concurrent-dispatch-cancel.patch

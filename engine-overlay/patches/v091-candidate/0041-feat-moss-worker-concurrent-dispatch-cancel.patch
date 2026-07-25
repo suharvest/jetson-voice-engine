@@ -147,7 +147,7 @@ index c3d1fac..220bf80 100644
 @@ -657,12 +692,65 @@ int main(int argc, char** argv)
  
          CodecEncodeRunner codec(args.codecOnnxDir);
-        MossTtsNanoRuntime runtime(args.engineDir, args.codecOnnxDir, args.maxSlots, args.maxSeqLen);
+         MossTtsNanoRuntime runtime(args.engineDir, args.codecOnnxDir, args.maxSlots, args.maxSeqLen);
 +        std::mutex preprocessMutex;
 +
 +        struct Task

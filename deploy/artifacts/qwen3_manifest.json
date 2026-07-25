@@ -157,7 +157,7 @@
             "proposed_upstream_series_sha256": "9fe8677a4c6886a4b7d8d253a245b6d95509d26a7fe8072eb0de6ed83633c733",
             "overlay_patch_count": 35,
             "overlay_series_sha256": "a358dcafc5d3fc70468a01e21c97236a1a6664644d26f635ed6ee6934d3be3d5",
-            "overlay_checksums_sha256": "79161e8ea93b70ab06e1a16ff5a060779f96866a6c3a42bee7087246e10d44d3",
+            "overlay_checksums_sha256": "810eab4177951bbffed0d7fa40c592dce5a5c376a7fbd7f286c7fe2314f1753a",
             "required_files": [
                 "manifest.json",
                 "SHA256SUMS",
