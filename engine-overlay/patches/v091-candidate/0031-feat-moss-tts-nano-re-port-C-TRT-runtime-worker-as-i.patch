@@ -354,7 +354,7 @@ index 0000000..b13ec75
 +
 +// ---- Construction --------------------------------------------------------
 +
-+MossTtsNanoRuntime::MossTtsNanoRuntime(std::string const& engineDir, int32_t maxSlots, int32_t maxSeqLen)
++MossTtsNanoRuntime::MossTtsNanoRuntime(std::string const& engineDir, std::string const& codecDir, int32_t maxSlots, int32_t maxSeqLen)
 +    : mMaxSlots(maxSlots), mMaxSeqLen(maxSeqLen)
 +{
 +    if (mMaxSlots <= 0) throw std::runtime_error("MossTtsNanoRuntime maxSlots must be positive");
@@ -362,7 +362,7 @@ index 0000000..b13ec75
 +
 +    readMetadata(engineDir);
 +    loadEngines(engineDir);
-+    loadCodecEngine(engineDir);
++    loadCodecEngine(codecDir.empty() ? engineDir : codecDir);
 +
 +    mGlobalHiddenOutputName = findOutputTensor(*mPrefillEngine);
 +    mHiddenSize = inferHiddenSize(*mPrefillEngine, mGlobalHiddenOutputName);
@@ -1591,7 +1591,7 @@ index 0000000..d3223b6
 +        int32_t mSlotId{-1};
 +    };
 +
-+    MossTtsNanoRuntime(std::string const& engineDir, int32_t maxSlots, int32_t maxSeqLen);
++    MossTtsNanoRuntime(std::string const& engineDir, std::string const& codecDir, int32_t maxSlots, int32_t maxSeqLen);
 +    ~MossTtsNanoRuntime();
 +
 +    MossTtsNanoRuntime(MossTtsNanoRuntime const&) = delete;
@@ -1853,7 +1853,7 @@ index 0000000..c3d1fac
 +{
 +    std::string engineDir;        // contains *.plan + tts/codec meta + browser_poc_manifest.json
 +    std::string tokenizerModel;   // SentencePiece tokenizer.model path
-+    std::string codecOnnxDir;     // dir containing moss_audio_tokenizer_encode.onnx (for voice clone)
++    std::string codecOnnxDir;     // dir containing codec decode plan/meta + voice-clone encoder ONNX
 +    int32_t maxSlots{1};
 +    int32_t maxSeqLen{1024};
 +};
@@ -2460,7 +2460,7 @@ index 0000000..c3d1fac
 +            throw std::runtime_error("Failed to load tokenizer: " + spSt.ToString());
 +
 +        CodecEncodeRunner codec(args.codecOnnxDir);
-+        MossTtsNanoRuntime runtime(args.engineDir, args.maxSlots, args.maxSeqLen);
++        MossTtsNanoRuntime runtime(args.engineDir, args.codecOnnxDir, args.maxSlots, args.maxSeqLen);
 +
 +        emit(Json{{"event", "worker_ready"}, {"ok", true},
 +            {"sample_rate", runtime.codecSampleRate()}, {"channels", runtime.codecChannels()},

@@ -63,7 +63,10 @@ All model/product behavior remains local:
 - `0022`–`0030`: Qwen3 TTS streaming, Base/CustomVoice conditioning,
   shared-engine slots, cancellation, and chunk policy;
 - `0031`–`0032`, `0041`: MOSS runtime/kernel/worker plus true concurrent
-  dispatch and cooperative cancellation;
+  dispatch and cooperative cancellation. The worker now passes its explicit
+  codec directory to the stateful decoder as well as the voice-clone encoder,
+  so `codec_decode_step.plan` and codec metadata no longer need duplicate
+  compatibility links in the TTS engine root;
 - `0035`–`0036`: Base export guard and CustomVoice language-id export.
 
 NVIDIA v0.9.1 does not provide the MOSS or Spark model integrations, the Base
