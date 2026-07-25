@@ -98,6 +98,11 @@ tests/verify-patch-stack.sh /path/to/official-checkout-with-locked-objects
 tests/test-provenance-negative.sh /path/to/official-checkout-with-locked-objects
 ```
 
+The replay source may be a normal clone or a standard linked Git worktree;
+validation uses Git plumbing and does not assume `.git` is a directory. The
+temporary replay tree is materialized from the exact PIN only, so unrelated
+broken/partial refs in the source cannot poison the gate.
+
 ## Build-verify status
 
 The predecessor 41-patch source built on Orin NX in both fallback and

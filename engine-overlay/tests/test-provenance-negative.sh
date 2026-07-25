@@ -108,6 +108,17 @@ PY
 expect_fail sha_order_set \
   bash "${TMP_ROOT}/sums-order-overlay/tests/verify-patch-stack.sh"
 
+mkdir -p "${TMP_ROOT}/not-a-repository"
+expect_fail non_git_replay_source \
+  bash "${HERE}/tests/verify-patch-stack.sh" \
+  "${TMP_ROOT}/not-a-repository"
+
+MISSING_PIN="${TMP_ROOT}/missing-pin-repository"
+mkdir -p "${MISSING_PIN}"
+git -C "${MISSING_PIN}" init -q
+expect_fail missing_target_pin \
+  bash "${HERE}/tests/verify-patch-stack.sh" "${MISSING_PIN}"
+
 if [ "${SKIP_AUTOCLONE:-0}" = "1" ]; then
   echo "autocrlf=true clone: SKIP"
   exit 0
@@ -135,6 +146,37 @@ check_sums "${AUTOCLONE}/engine-overlay/patches/upstream-v091-prs"
 check_sums "${AUTOCLONE}/engine-overlay/patches/v091-candidate"
 
 if [ -n "${OFFICIAL_CHECKOUT}" ]; then
+  OFFICIAL_CLONE="${TMP_ROOT}/official-clone"
+  git clone --no-local "${OFFICIAL_CHECKOUT}" "${OFFICIAL_CLONE}" >/dev/null
+  while IFS='|' read -r file pr commit parent tree patch_id expected_sha; do
+    case "${file}" in ""|\#*) continue ;; esac
+    git -C "${OFFICIAL_CLONE}" fetch "${OFFICIAL_CHECKOUT}" "${commit}" \
+      >/dev/null
+  done < "${HERE}/patches/upstream-v091-prs/LOCK"
+  bash "${HERE}/tests/verify-patch-stack.sh" "${OFFICIAL_CLONE}" >/dev/null
+  echo "ordinary Git clone replay source: PASS"
+
+  python3 - "${OFFICIAL_CLONE}/.git/refs/heads/unrelated-broken" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text("0" * 40 + "\n")
+PY
+  bash "${HERE}/tests/verify-patch-stack.sh" \
+    "${OFFICIAL_CLONE}" >/dev/null
+  echo "unrelated broken ref replay source: PASS"
+
+  OFFICIAL_WORKTREE="${TMP_ROOT}/official-worktree"
+  git -C "${OFFICIAL_CHECKOUT}" worktree add --detach \
+    "${OFFICIAL_WORKTREE}" "${PIN}" >/dev/null
+  [ -f "${OFFICIAL_WORKTREE}/.git" ] \
+    || { echo "ERROR: regression fixture is not a standard linked worktree" >&2; exit 1; }
+  bash "${HERE}/tests/verify-patch-stack.sh" "${OFFICIAL_WORKTREE}" >/dev/null
+  git -C "${OFFICIAL_CHECKOUT}" worktree remove "${OFFICIAL_WORKTREE}"
+  echo "linked Git worktree replay source: PASS"
+
   bash "${AUTOCLONE}/engine-overlay/tests/verify-patch-stack.sh" \
     "${OFFICIAL_CHECKOUT}" >/dev/null
 else

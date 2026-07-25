@@ -148,7 +148,8 @@ if [ -z "${REPLAY_SOURCE}" ]; then
   exit 0
 fi
 
-[ -d "${REPLAY_SOURCE}/.git" ] || die "not a Git checkout: ${REPLAY_SOURCE}"
+git -C "${REPLAY_SOURCE}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "not a Git checkout or worktree: ${REPLAY_SOURCE}"
 git -C "${REPLAY_SOURCE}" cat-file -e "${PIN}^{commit}" \
   || die "upstream checkout lacks ${PIN}"
 for ((index=0; index < ${#LOCK_COMMITS[@]}; index++)); do
@@ -178,8 +179,15 @@ cleanup() {
 trap cleanup EXIT
 
 REPLAY="${TMP_ROOT}/repo"
-git clone --no-local --no-checkout "${REPLAY_SOURCE}" "${REPLAY}" >/dev/null
-git -C "${REPLAY}" checkout -q "${PIN}"
+mkdir -p "${REPLAY}"
+git -C "${REPLAY}" init -q
+# Consume only the exact locked base tree. Cloning/fetching the source would
+# enumerate every source ref and can fail on an unrelated broken/partial ref
+# even when PIN and all seven locked commits are present.
+git -C "${REPLAY_SOURCE}" archive "${PIN}" | tar -x -C "${REPLAY}"
+git -C "${REPLAY}" add -A
+git -C "${REPLAY}" -c user.name=overlay-replay \
+  -c user.email=overlay-replay@invalid commit -q -m "exact v0.9.1 replay base"
 
 for file in "${UPSTREAM_SERIES[@]}"; do
   git -C "${REPLAY}" apply --check "${UPSTREAM_DIR}/${file}"
