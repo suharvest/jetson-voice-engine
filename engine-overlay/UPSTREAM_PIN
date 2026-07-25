@@ -1,13 +1,15 @@
 7f061f21f0a581ba234a1e233c9315b89d8e47d6
 # = NVIDIA TensorRT-Edge-LLM tag v0.9.1. PURE NVIDIA commit; no fork content.
 #
-# Active production migration chain (2026-07-24):
-#   addon/ + patches/v091-candidate/0001..0040, in numeric order.
+# Active normalized migration chain (2026-07-25):
+#   patches/upstream-v091-prs/series (7 exact proposed-upstream commits)
+#   + addon/
+#   + patches/v091-candidate/series (36 sparse product patches).
 #
 # The candidate removes the old v0.9.0 development-only microbenchmark add/drop
-# pair and otherwise preserves product behavior while rebasing onto v0.9.1.
-# Patches 0037..0040 are narrow JetPack 6.2 compatibility fixes discovered
-# during the Orin NX audit. See patches/v091-candidate/PATCH-STATE.md.
+# pair and retires generic local duplicates now carried byte-exact from PR
+# #118/#145-149. Product behavior remains local. See
+# patches/v091-candidate/PATCH-STATE.md.
 #
 # v0.8.0/v0.9.0 profiles, manifests, patches, images, and engine directories are
 # retained as rollback/history. Never combine their plugin, worker, or engine

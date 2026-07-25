@@ -179,17 +179,22 @@ full patched source tree at build time instead of vendoring it:
 engine-overlay/
   UPSTREAM_PIN       # exact NVIDIA commit (7f061f21… = tag v0.9.1)
   upstream.remote    # https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+  patches/upstream-v091-prs/
+                     # exact commits from PR #118/#145–149 + lock/checksums
   addon/             # additive product files at original relative paths
-  patches/           # active v091-candidate/0001..0040 plus rollback history
-  build.sh           # clone upstream@pin → copy addon → apply patches → build (Jetson host)
+  patches/v091-candidate/
+                     # explicit sparse 36-patch product series
+  build.sh           # pin → 7 upstream patches → addon → 36 local patches → build
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a) upstreamable / (b) carried classification + PR/retirement plan
   README.md          # overlay model, addon-vs-patch discipline, reproduction
 ```
 
-The active v0.9.1 series conservatively carries the voice/product features and
-adds four isolated JP6.2 compatibility fixes. Manifests pin reproducible builds
-for `qwen3-tts-highperf-sm87`, `qwen3-asr-sm87`, and `customvoice-v091`.
+The active v0.9.1 source contract applies seven exact proposed-upstream bug
+fixes before the reduced 36-patch product stack. MOSS, Spark, Base/CustomVoice,
+ASR/TTS concurrency, cancellation, and service-facing worker behavior remain
+local. Manifests pin reproducible builds for `qwen3-tts-highperf-sm87`,
+`qwen3-asr-sm87`, and `customvoice-v091`.
 
 Reproduce the patched tree (no CUDA needed) or do a full Jetson build:
 
@@ -199,8 +204,9 @@ cd engine-overlay
 ./build.sh manifests/qwen3-tts-highperf-sm87.toml    # full build on Orin / sm_87
 ```
 
-> The complete source chain has built on Orin NX for fallback and local-SM87
-> CuTe variants. Fresh-engine runtime qualification remains required.
+> The predecessor 41-patch chain built on Orin NX for fallback and local-SM87
+> CuTe variants. The normalized 7+36 identity must complete its own Orin
+> rebuild and runtime qualification before publication.
 > `build.sh` refuses to compile on non-aarch64. See
 > `engine-overlay/README.md` and `engine-overlay/DIVERGENCE.md` for details,
 > including the **SSE/client-disconnect fix (patch `0006`) which is

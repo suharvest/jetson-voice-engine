@@ -1,13 +1,17 @@
-From e567aadea8674cad45f1b97607f0e871f2333e55 Mon Sep 17 00:00:00 2001
-From: Codex Validation <codex@local.invalid>
-Date: Fri, 24 Jul 2026 17:16:14 +0800
-Subject: [PATCH 40/40] fix(attention): scope FMHA cubin loading by mask type
+From aebcb41d1dc0cc74897e4a1ae14458bb6e47f04f Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 20:04:03 +0800
+Subject: [PATCH] fix(attention): scope FMHA cubin loading by mask type
 
+Signed-off-by: suharvest <suharvest@gmail.com>
 ---
  .../contextFMHARunner.cpp                     | 34 ++++++++++++-------
- .../contextFMHARunner.h                       |  3 +-
- .../attentionPlugin/attentionPlugin.cpp       | 10 ++++--
- 3 files changed, 30 insertions(+), 17 deletions(-)
+ .../contextFMHARunner.h                       |  4 ++-
+ .../attentionPlugin/attentionPlugin.cpp       | 15 ++++----
+ .../vitAttentionPlugin/vitAttentionPlugin.cpp |  5 +--
+ unittests/contextAttentionTest.cpp            |  2 +-
+ unittests/visionPackedMaskFMHATest.cpp        |  3 +-
+ 6 files changed, 39 insertions(+), 24 deletions(-)
 
 diff --git a/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp b/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp
 index ee98381..e236cb8 100644
@@ -133,35 +137,46 @@ index ee98381..e236cb8 100644
      check::check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
  
 diff --git a/cpp/kernels/contextAttentionKernels/contextFMHARunner.h b/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
-index 59c21a5..72c3f71 100644
+index 59c21a5..01f7d15 100644
 --- a/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
 +++ b/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
-@@ -134,7 +134,8 @@ public:
+@@ -131,10 +131,12 @@ public:
+      * @brief Load FMHA kernel cubins into device
+      * @param sm CUDA compute capability
+      * @param dataType Data type
++     * @param maskType Attention mask type
       * @return True if successful
       * @throws std::runtime_error if a CUDA driver error occurs
       */
 -    static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
-+    static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType,
-+        ContextAttentionMaskType maskType = ContextAttentionMaskType::CAUSAL);
++    static bool loadContextFMHAKernels(
++        int32_t sm, nvinfer1::DataType dataType, ContextAttentionMaskType maskType);
  
  private:
      nvinfer1::DataType mDataType; //!< Data type
 diff --git a/cpp/plugins/attentionPlugin/attentionPlugin.cpp b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
-index 8d5ae1a..8821bef 100644
+index 8d5ae1a..6060703 100644
 --- a/cpp/plugins/attentionPlugin/attentionPlugin.cpp
 +++ b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
-@@ -177,7 +177,9 @@ bool loadFMHAKernels(
-             useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
+@@ -172,12 +172,13 @@ bool loadFMHAKernels(
+     if (!useCuteDslFMHA)
+ #endif
+     {
+-        canImplementFMHA = ContextFMHARunner::canImplement(headSize, smVersion, dataType,
+-            AttentionInputLayout::SEPARATE_Q_K_V,
+-            useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
++        auto const maskType = useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
++                                               : ContextAttentionMaskType::CAUSAL;
++        canImplementFMHA = ContextFMHARunner::canImplement(
++            headSize, smVersion, dataType, AttentionInputLayout::SEPARATE_Q_K_V, maskType);
          if (canImplementFMHA)
          {
 -            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
-+            auto const maskType = useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
-+                                                   : ContextAttentionMaskType::CAUSAL;
 +            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType, maskType))
              {
                  LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", smVersion);
                  canImplementFMHA = false;
-@@ -407,7 +409,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
+@@ -407,7 +408,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
          // Availability is discovered from the cubin metadata table.
          mCanImplementCustomMaskFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType,
                                            AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CUSTOM_MASK)
@@ -171,7 +186,7 @@ index 8d5ae1a..8821bef 100644
  
          enforceVisionBlockKernelSupport();
  
-@@ -511,7 +514,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection
+@@ -511,7 +513,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection
      {
          mCanImplementCustomMaskFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType,
                                            AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CUSTOM_MASK)
@@ -181,3 +196,56 @@ index 8d5ae1a..8821bef 100644
  
          enforceVisionBlockKernelSupport();
      }
+diff --git a/cpp/plugins/vitAttentionPlugin/vitAttentionPlugin.cpp b/cpp/plugins/vitAttentionPlugin/vitAttentionPlugin.cpp
+index 824de5c..fb58d22 100644
+--- a/cpp/plugins/vitAttentionPlugin/vitAttentionPlugin.cpp
++++ b/cpp/plugins/vitAttentionPlugin/vitAttentionPlugin.cpp
+@@ -106,7 +106,8 @@ ViTAttentionPlugin::ViTAttentionPlugin(
+             mHeadSize, mSMVersion, mDataType, AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::PADDING);
+         if (canImplementFMHA)
+         {
+-            ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
++            ContextFMHARunner::loadContextFMHAKernels(
++                mSMVersion, mDataType, ContextAttentionMaskType::PADDING);
+         }
+     }
+ 
+@@ -147,7 +148,7 @@ ViTAttentionPlugin::ViTAttentionPlugin(std::string const& name, PluginFieldColle
+     if (!mUseCuteDslFMHA)
+ #endif
+     {
+-        ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
++        ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType, ContextAttentionMaskType::PADDING);
+     }
+ }
+ 
+diff --git a/unittests/contextAttentionTest.cpp b/unittests/contextAttentionTest.cpp
+index 3251e2c..906a84b 100755
+--- a/unittests/contextAttentionTest.cpp
++++ b/unittests/contextAttentionTest.cpp
+@@ -114,7 +114,7 @@ void TestContextAttentionAccuracy(std::vector<int32_t> const& cuSeqlens, int32_t
+         cudaMemcpy(outReference.data(), oTensorRef.rawPointer(), outSize * sizeof(half), cudaMemcpyDeviceToHost));
+ 
+     // Load context FMHA kernels
+-    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
++    EXPECT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF, maskType));
+ 
+     // Create context FMHA runner
+     ContextFMHARunner runner(DataType::kHALF, batchSize, maxSeqLen, numQHeads, numKVHeads, headSize, smVersion,
+diff --git a/unittests/visionPackedMaskFMHATest.cpp b/unittests/visionPackedMaskFMHATest.cpp
+index 8a556f8..21347be 100644
+--- a/unittests/visionPackedMaskFMHATest.cpp
++++ b/unittests/visionPackedMaskFMHATest.cpp
+@@ -362,7 +362,8 @@ TEST_P(VisionFMHACustomMaskParityTest, MatchesVisionBlockReferenceOracle)
+     // Establish the CUDA primary context before the driver-API cubin loads
+     // below (needed when this test is the first CUDA user in the process).
+     CUDA_CHECK(cudaFree(nullptr));
+-    ASSERT_TRUE(ContextFMHARunner::loadContextFMHAKernels(smVersion, DataType::kHALF));
++    ASSERT_TRUE(ContextFMHARunner::loadContextFMHAKernels(
++        smVersion, DataType::kHALF, ContextAttentionMaskType::CUSTOM_MASK));
+     ContextFMHARunner runner(DataType::kHALF, /*batchSize=*/1, seqLen, numQHeads, numKVHeads, headDim, smVersion,
+         inputLayout, ContextAttentionMaskType::CUSTOM_MASK);
+     ASSERT_TRUE(runner.isKernelAvailable())
+-- 
+2.50.1 (Apple Git-155)
+

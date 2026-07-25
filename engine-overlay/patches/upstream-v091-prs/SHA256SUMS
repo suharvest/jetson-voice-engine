@@ -1,0 +1,7 @@
+77971917058d0d962d0a6e3f8dd7623b2c139f358225e2c2c391f5aa182ce37a  0001-pr118-respect-explicit-cuda-architectures.patch
+7ebcabf0144a8077f37c4207d5434f1b5b251c63cf42fd5c995f092a0bdfbaf8  0002-pr118-propagate-cute-shim.patch
+eea296abfa5c5e08649d5ff83669312dc95a117ac1390c9c2b0b0172961d9d38  0003-pr145-trt-fp4-guard.patch
+0d9212c647271ace05d9e3396a9bf75d2a8b258f28ac8b1508c024c71edffcb5  0004-pr146-normalize-linear-mrope.patch
+44a3a2a6aa19a6f4e78eea4b6de6f05a7646a6b1d19716c9a21cb640a9a416d0  0005-pr147-trt-stream-reader.patch
+60dec06803c6fe4eeef179d85b0c3a34c0e1370976fac6c0b9a271a3f4304a0c  0006-pr148-fmha-mask-scoped-load.patch
+80746ecd5660f798e217459899c3e9eef961fbe92b58d1321adbf2ec2f6a7d7a  0007-pr149-checkpoint-dtype.patch

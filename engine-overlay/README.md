@@ -11,20 +11,22 @@ vendoring the full NVIDIA source tree**.
 voxedge-engine/
   UPSTREAM_PIN       # exact NVIDIA commit (= tag v0.9.1, 7f061f21…)
   upstream.remote    # https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+  patches/upstream-v091-prs/
+                     # 7 byte-locked exact commits from PR #118/#145–149
   addon/             # new files (upstream does not have these), original relative paths
-  patches/           # v091-candidate/0001..0040 is the active apply series;
-                     # v090/v080 material remains rollback/history.
-  build.sh           # clone upstream@pin → copy addon → apply patches → build (Jetson host)
+  patches/v091-candidate/
+                     # explicit sparse 36-patch product series
+  build.sh           # pin → upstream PR patches → addon → product patches → build
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a)/(b) classification + upstream-PR / retirement plan
 ```
 
-> **v0.9.1 active migration (2026-07-24):** the active base is pure NVIDIA
-> tag v0.9.1, `7f061f21`. `build.sh` copies `addon/`, validates that
-> `patches/v091-candidate/` is exactly the contiguous `0001..0040` series, and
-> applies it in order. The old v0.9.0 microbenchmark add/drop pair was removed;
-> all other product behavior was conservatively rebased. Patches `0037..0040`
-> are isolated JetPack 6.2 compatibility fixes. See
+> **v0.9.1 normalized migration (2026-07-25):** the active base is pure
+> NVIDIA tag v0.9.1, `7f061f21`. Seven exact commits from PR #118 and
+> #145–149 are vendored with commit/tree/patch-id/SHA-256 provenance, then the
+> 36-entry sparse product series is applied. Generic local duplicates `0033`,
+> `0034`, `0037`, `0038`, and `0040` were retired; mixed `0009` and `0039`
+> retain only their product/residual hunks. See
 > `patches/v091-candidate/PATCH-STATE.md`. Old v0.8/v0.9.0 files are retained
 > as rollback/history and are never mixed into v0.9.1 images.
 
@@ -35,12 +37,13 @@ Two mutually exclusive cmake configurations, per artifact family:
 | build | `ENABLE_CUTE_DSL` | notes |
 |---|---|---|
 | **Voice workers** | `OFF` (fallback) or qualified local SM87 artifact | The local GEMM/GEMV path remains until fresh-engine quality/performance gates show that CuTe can replace it. |
-| **GDN LLM engine** | `ALL` | On Orin/JP6.2 regenerate SM87 with the device-qualified cutlass-dsl 4.5.1 toolchain. The packaged v0.9.1 archive was generated with CUDA 13.2 and is not usable with CUDA 12.6. Configure with `AARCH64_BUILD=ON`, SM87, and `EMBEDDED_TARGET=jetson-orin`; candidate `0039` propagates the shim/driver/wrap requirements. |
+| **GDN LLM engine** | `ALL` | On Orin/JP6.2 regenerate SM87 with the device-qualified cutlass-dsl 4.5.1 toolchain. The packaged v0.9.1 archive was generated with CUDA 13.2 and is not usable with CUDA 12.6. Configure with `AARCH64_BUILD=ON`, SM87, and `EMBEDDED_TARGET=jetson-orin`; PR #118 propagates shim/wrap requirements and residual local `0039` temporarily propagates the CUDA driver edge. |
 
 Never mix the two configurations in one build dir.
 
 The full source tree is **reconstructed at build time**: clone upstream at
-`UPSTREAM_PIN`, copy `addon/` over it, apply `patches/*.patch` in order, build.
+`UPSTREAM_PIN`, verify/apply the locked upstream series, copy `addon/`, apply
+the explicit local `series`, then build.
 
 ## addon vs patch discipline
 
@@ -86,8 +89,8 @@ commit history so not cleanly base-splittable on the read-only fork).
 
 ## Build-verify status
 
-The complete 40-patch source has built on Orin NX in both fallback and
-device-generated CuTe configurations. Release qualification still requires
-fresh v0.9.1 engines and the model/concurrency gates; old v0.9.0 engine ABI
-smoke does not satisfy that requirement. `build.sh` refuses to compile on
-non-aarch64 and supports `--apply-only` for source-chain verification.
+The predecessor 41-patch source built on Orin NX in both fallback and
+device-generated CuTe configurations. The normalized 7+36 identity has clean
+offline replay and must be rebuilt on Orin before its own artifacts are
+published. `build.sh` refuses to compile on non-aarch64 and supports
+`--apply-only` for source-chain verification.

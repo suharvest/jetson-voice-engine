@@ -1,0 +1,41 @@
+From b406116a27957f11b18210989460429c7327973f Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 19:21:43 +0800
+Subject: [PATCH] fix: Propagate CuTe DSL shim through static libraries
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cmake/CuteDsl.cmake | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index a10e632..862b8b7 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -1043,7 +1043,8 @@ function(cute_dsl_setup)
+   foreach(_tgt ${ARG_LINK_TARGETS})
+     get_target_property(_tgt_type ${_tgt} TYPE)
+     if(_tgt_type STREQUAL "STATIC_LIBRARY")
+-      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
++      target_link_libraries(${_tgt} PUBLIC ${_link_libs}
++                                           trt_edgellm_cutedsl_cudart_shim)
+     else()
+       target_link_libraries(${_tgt} PRIVATE ${_link_libs}
+                                             trt_edgellm_cutedsl_cudart_shim)
+@@ -1056,7 +1057,12 @@ function(cute_dsl_setup)
+     if(NOT _cute_dsl_cuda_ver STREQUAL ""
+        AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+        AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
+-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_options(${_tgt} INTERFACE
++                            "-Wl,--wrap=_cudaLaunchKernelEx")
++      else()
++        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      endif()
+     endif()
+   endforeach()
+ 
+-- 
+2.50.1 (Apple Git-155)
+

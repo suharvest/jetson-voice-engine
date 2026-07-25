@@ -2,8 +2,8 @@
 # voxedge-engine build wrapper (overlay reproduction contract)
 #
 # CONTRACT
-#   inputs : UPSTREAM_PIN, upstream.remote, addon/, patches/v091-candidate/,
-#            a build manifest
+#   inputs : UPSTREAM_PIN, upstream.remote, patches/upstream-v091-prs/,
+#            addon/, patches/v091-candidate/, a build manifest
 #            (manifests/*.toml), target sm (e.g. sm_87 Orin), CUDA/TRT version, model src ref.
 #   outputs: worker binaries  (qwen3_asr_worker [N>1] / qwen3_tts_worker / moss_tts_nano_worker)
 #            plugin .so       (libNvInfer_edgellm_plugin.so)
@@ -12,10 +12,11 @@
 #
 # REPRODUCTION FLOW
 #   1. clone/fetch upstream.remote @ UPSTREAM_PIN into a clean workdir
-#   2. copy addon/  over the checkout (new files, exec bits preserved)
-#   3. validate + apply v091-candidate/0001..0041 in numeric order
-#   4. configure + build via the upstream CMake entry for the target sm
-#   5. emit + verify artifact checksums against the chosen manifest
+#   2. verify + apply the 7 exact proposed-upstream commits
+#   3. copy addon/ over the checkout (new files, exec bits preserved)
+#   4. validate + apply the explicit 36-patch local product series
+#   5. configure + build via the upstream CMake entry for the target sm
+#   6. emit + verify artifact checksums against the chosen manifest
 #
 # ============================================================================
 #  BUILD-VERIFY IS DEFERRED — REQUIRES A JETSON CUDA/TRT HOST.
@@ -66,18 +67,11 @@ else
   echo "==> --apply-only: skipping 3rdParty submodule initialization"
 fi
 
-# --- 2. copy addon/ over the checkout ----------------------------------------
-echo "==> copying addon/ (new files)"
-# -a preserves exec bits; addon mirrors upstream relative paths
-( cd "${HERE}/addon" && find . -type f -print0 | while IFS= read -r -d '' f; do
-    dst="${WORKDIR}/${f#./}"
-    mkdir -p "$(dirname "${dst}")"
-    cp -p "${f}" "${dst}"
-  done )
-
-# --- 3. apply the active v0.9.1 patch series in order -------------------------
-# v0.8/v0.9.0 patch files remain on disk solely as rollback/history.
-echo "==> applying patches"
+# --- 2. validate/apply exact upstream PR commits ------------------------------
+# These are byte-locked `git format-patch` exports from NVIDIA's PR refs. They
+# are applied before addon/product patches so the latter contain no duplicate
+# generic bug fixes.
+echo "==> verifying and applying proposed-upstream patches"
 apply_one() {
   local p="$1"
   echo "    - $(basename "${p}")"
@@ -96,33 +90,87 @@ apply_one() {
     return 1
   fi
 }
-PATCH_DIR="${HERE}/patches/v091-candidate"
-shopt -s nullglob
-PATCHES=("${PATCH_DIR}"/[0-9][0-9][0-9][0-9]-*.patch)
-shopt -u nullglob
-if [ "${#PATCHES[@]}" -eq 0 ]; then
-  echo "ERROR: v0.9.1 patch series is empty: ${PATCH_DIR}" >&2
-  exit 5
-fi
-expected=1
-for p in "${PATCHES[@]}"; do
-  actual="$(basename "${p}" | cut -c1-4)"
-  printf -v wanted '%04d' "${expected}"
-  if [ "${actual}" != "${wanted}" ]; then
-    echo "ERROR: non-contiguous v0.9.1 patch series: expected ${wanted}, found ${actual}" >&2
+
+load_series() {
+  local dir="$1"
+  local series_file="$2"
+  local expected_count="$3"
+  local label="$4"
+  local line
+  SERIES=()
+  if [ ! -f "${series_file}" ]; then
+    echo "ERROR: missing ${label} series file: ${series_file}" >&2
     exit 5
   fi
-  expected=$((expected + 1))
-done
-if [ "${#PATCHES[@]}" -ne 41 ]; then
-  echo "ERROR: expected 41 v0.9.1 patches, found ${#PATCHES[@]}" >&2
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      ""|\#*) continue ;;
+      */*) echo "ERROR: ${label} series entry must be a basename: ${line}" >&2; exit 5 ;;
+    esac
+    if [ ! -f "${dir}/${line}" ]; then
+      echo "ERROR: ${label} series entry is missing: ${dir}/${line}" >&2
+      exit 5
+    fi
+    SERIES+=("${dir}/${line}")
+  done < "${series_file}"
+  if [ "${#SERIES[@]}" -ne "${expected_count}" ]; then
+    echo "ERROR: expected ${expected_count} ${label} patches, found ${#SERIES[@]}" >&2
+    exit 5
+  fi
+  local listed actual
+  listed="$(mktemp)"
+  actual="$(mktemp)"
+  printf '%s\n' "${SERIES[@]##*/}" | sort > "${listed}"
+  find "${dir}" -maxdepth 1 -type f -name '*.patch' -exec basename {} \; | sort > "${actual}"
+  if ! diff -u "${actual}" "${listed}"; then
+    echo "ERROR: ${label} patch directory and explicit series differ" >&2
+    rm -f "${listed}" "${actual}"
+    exit 5
+  fi
+  rm -f "${listed}" "${actual}"
+}
+
+UPSTREAM_PATCH_DIR="${HERE}/patches/upstream-v091-prs"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "${UPSTREAM_PATCH_DIR}" && sha256sum -c SHA256SUMS)
+elif command -v shasum >/dev/null 2>&1; then
+  (cd "${UPSTREAM_PATCH_DIR}" && shasum -a 256 -c SHA256SUMS)
+else
+  echo "ERROR: sha256sum or shasum is required to verify vendored upstream patches" >&2
   exit 5
 fi
-for p in "${PATCHES[@]}"; do
+load_series "${UPSTREAM_PATCH_DIR}" "${UPSTREAM_PATCH_DIR}/series" 7 "proposed-upstream"
+UPSTREAM_PATCHES=("${SERIES[@]}")
+for p in "${UPSTREAM_PATCHES[@]}"; do
+  apply_one "${p}"
+done
+
+# --- 3. copy addon/ over the checkout ----------------------------------------
+echo "==> copying addon/ (new files)"
+# -a preserves exec bits; addon mirrors upstream relative paths
+( cd "${HERE}/addon" && find . -type f -print0 | while IFS= read -r -d '' f; do
+    dst="${WORKDIR}/${f#./}"
+    mkdir -p "$(dirname "${dst}")"
+    cp -p "${f}" "${dst}"
+  done )
+
+# --- 4. apply the sparse local product series --------------------------------
+# v0.8/v0.9.0 patch files remain on disk solely as rollback/history.
+echo "==> applying local product patches"
+PATCH_DIR="${HERE}/patches/v091-candidate"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "${PATCH_DIR}" && sha256sum -c SHA256SUMS)
+else
+  (cd "${PATCH_DIR}" && shasum -a 256 -c SHA256SUMS)
+fi
+load_series "${PATCH_DIR}" "${PATCH_DIR}/series" 36 "local-product"
+LOCAL_PATCHES=("${SERIES[@]}")
+for p in "${LOCAL_PATCHES[@]}"; do
   apply_one "${p}"
 done
 echo "==> patched source tree ready at ${WORKDIR}"
-echo "    v0.9.1 base (7f061f21) + v091-candidate/0001..0041."
+echo "    v0.9.1 base (7f061f21) + 7 exact proposed-upstream commits +"
+echo "    36 sparse local product patches."
 echo "    streaming worker (v0.9.1 native streaming API) + slot-pool +"
 echo "    shared-engine ctors + external speaker-embedding + 9-row CV runtime-if"
 echo "    (langId) + SparkTTS mixed-precision/int4 opt-ins + MOSS (in-series)."
@@ -209,7 +257,8 @@ echo "==> target: SM=${TARGET_SM} platform=${TARGET_PLATFORM} arch=${CUDA_ARCH} 
 #          python kernelSrcs/build_cutedsl.py --gpu_arch sm_87
 #          (the packaged v0.9.1 SM87 archive was built with CUDA 13.2 and is
 #          incompatible with JP6.2 CUDA 12.6);
-#       2. candidate 0039's shim/driver/wrap propagation;
+#       2. PR #118's shim/wrap propagation plus residual 0039 CUDA-driver
+#          propagation (pending final-link A/B retirement);
 #       3. -DAARCH64_BUILD=ON -DEMBEDDED_TARGET=jetson-orin and
 #          -DCMAKE_CUDA_ARCHITECTURES=87.
 #     Do NOT mix (A) and (B) artifacts in one build dir.

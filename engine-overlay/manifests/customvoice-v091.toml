@@ -4,11 +4,21 @@ version = "v0.9.1"
 pin = "7f061f21f0a581ba234a1e233c9315b89d8e47d6"
 remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
 
+[proposed_upstream_patches]
+directory = "patches/upstream-v091-prs"
+series = "patches/upstream-v091-prs/series"
+lock = "patches/upstream-v091-prs/LOCK"
+count = 7
+series_sha256 = "9fe8677a4c6886a4b7d8d253a245b6d95509d26a7fe8072eb0de6ed83633c733"
+lock_sha256 = "b0801bf42906734054bb5fe9213f216d580da663192e9db178ca423e9cb90fd2"
+
 [patches]
 directory = "patches/v091-candidate"
-first = "0001"
-last = "0041"
-count = 41
+series = "patches/v091-candidate/series"
+count = 36
+sparse_numbering = true
+series_sha256 = "6da94187e947354381fc0d0a9ecf944fe59e922bb0112e7e598b4a5dbc98bc88"
+checksums_sha256 = "38b0283dcc8733c00e35733887853981372417e987d7b47861ae02f4998ebbe2"
 
 [target]
 device = "jetson-orin-nx"

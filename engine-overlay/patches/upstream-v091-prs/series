@@ -1,0 +1,7 @@
+0001-pr118-respect-explicit-cuda-architectures.patch
+0002-pr118-propagate-cute-shim.patch
+0003-pr145-trt-fp4-guard.patch
+0004-pr146-normalize-linear-mrope.patch
+0005-pr147-trt-stream-reader.patch
+0006-pr148-fmha-mask-scoped-load.patch
+0007-pr149-checkpoint-dtype.patch

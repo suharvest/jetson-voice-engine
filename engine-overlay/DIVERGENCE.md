@@ -3,15 +3,29 @@
 ```text
 upstream:       github.com/NVIDIA/TensorRT-Edge-LLM (Apache 2.0)
 UPSTREAM_PIN:   7f061f21f0a581ba234a1e233c9315b89d8e47d6   (= tag v0.9.1, pure NVIDIA)
-patch series:   v091-candidate/0001..0040
-repin:          2026-07-24 production migration — see patches/v091-candidate/PATCH-STATE.md
+upstream set:   upstream-v091-prs/series (7 exact commits; PR #118/#145–149)
+local series:   v091-candidate/series (36 sparse product/residual patches)
+normalized:     2026-07-25 — see patches/v091-candidate/PATCH-STATE.md
 ```
 
-> ⚠️ Active chain 现以 `v091-candidate/PATCH-STATE.md` 为准。以下逐主题条目
-> 保留历史分类与上游化依据；旧编号来自 v0.7.1/v0.9.0，不能作为 active
-> apply 编号。通用兼容候选为 0037 streamed reader、0038 kFP4 guard、
-> 0039 CuTe link propagation、0040 mask-scoped FMHA load。产品专属的
-> ASR/TTS lane、worker、模型条件与 W4A16 路径继续自留。
+> ⚠️ Active chain 以 `v091-candidate/PATCH-STATE.md` 和两个 `series` 文件
+> 为准。以下逐主题条目保留历史分类与上游化依据；旧编号来自
+> v0.7.1/v0.9.0，不能作为 active apply 编号。通用兼容修复现在以 exact
+> PR commit 先应用；产品专属的 ASR/TTS lane、worker、模型条件、MOSS、
+> Spark 与 W4A16 路径继续自留。
+>
+> Upstream replacement ledger:
+>
+> - PR #118: explicit CUDA architectures + CuTe shim/wrap propagation;
+> - PR #145: pre-TRT-10.8 FP4 guard (retired local `0038`);
+> - PR #146: linear+MRoPE normalization (retired local `0034`);
+> - PR #147: pre-TRT-10.7 stream reader (retired local `0037`);
+> - PR #148: mask-scoped FMHA cubin load (retired local `0040`);
+> - PR #149: destination checkpoint dtype (retired local `0033`, reduced
+>   local `0009` to its BF16Linear tied-weight hunk).
+>
+> Local `0039` is reduced to CUDA driver PUBLIC propagation only and remains
+> pending final-link A/B validation. Do not retire it from documentation alone.
 >
 > 2026-07-04 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
 > fork v071/customvoice-product),patch 编号/scope 以 PATCH-STATE-v090.md

@@ -1,8 +1,9 @@
-From a30fd0ed8b082843a6317fc19dbeef3e2a1a2909 Mon Sep 17 00:00:00 2001
-From: Codex Validation <codex@local.invalid>
-Date: Fri, 24 Jul 2026 17:15:17 +0800
-Subject: [PATCH 38/40] fix(plugins): guard FP4 data type before TensorRT 10.8
+From 169cd99e3689f44cef7f334004eeb737a02b233b Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 19:52:46 +0800
+Subject: [PATCH] fix: guard FP4 data type for TensorRT before 10.8
 
+Signed-off-by: suharvest <suharvest@gmail.com>
 ---
  .../fusedNvfp4GemmAllReducePlugin.cpp                     | 8 ++++++++
  1 file changed, 8 insertions(+)
@@ -31,3 +32,6 @@ index 6e9866e..279b2bf 100644
      }
      if (pos == kFP4_ACT_SCALE_IDX)
      {
+-- 
+2.50.1 (Apple Git-155)
+
