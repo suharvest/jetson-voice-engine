@@ -18,8 +18,8 @@ Claude-Session: https://claude.ai/code/session_01MHEXK41deYx6375K4q3MQb
  cpp/workers/build_moss_worker.sh              |   64 +
  cpp/workers/moss_tts_nano_worker.cpp          |  701 +++++++++
  unittests/mossLinearKvKernelsTests.cu         |  161 +++
- unittests/mossTtsNanoSmokeMain.cpp            |  120 ++
- 8 files changed, 2719 insertions(+)
+ unittests/mossTtsNanoSmokeMain.cpp            |  123 ++
+ 8 files changed, 2722 insertions(+)
  create mode 100644 cpp/kernels/kvCacheUtilKernels/mossLinearKvKernels.cu
  create mode 100644 cpp/kernels/kvCacheUtilKernels/mossLinearKvKernels.h
  create mode 100644 cpp/runtime/mossTtsNanoRuntime.cpp
@@ -2675,7 +2675,7 @@ new file mode 100644
 index 0000000..0e2bc0b
 --- /dev/null
 +++ b/unittests/mossTtsNanoSmokeMain.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,123 @@
 +/*
 + * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 + * SPDX-License-Identifier: Apache-2.0
@@ -2683,7 +2683,7 @@ index 0000000..0e2bc0b
 + * MOSS-TTS-Nano end-to-end smoke driver. Loads a TRT engine bundle, runs
 + * generate() with dummy zero token IDs, writes a 48kHz stereo float WAV.
 + *
-+ * usage: moss_tts_nano_smoke <engine_dir> <output.wav>
++ * usage: moss_tts_nano_smoke <engine_dir_with_codec_subdir> <output.wav>
 + */
 +
 +#include "runtime/mossTtsNanoRuntime.h"
@@ -2692,6 +2692,7 @@ index 0000000..0e2bc0b
 +#include <cstdint>
 +#include <cstdio>
 +#include <exception>
++#include <filesystem>
 +#include <fstream>
 +#include <iostream>
 +#include <string>
@@ -2739,14 +2740,16 @@ index 0000000..0e2bc0b
 +    {
 +        if (argc != 3)
 +        {
-+            std::fprintf(stderr, "usage: %s <engine_dir> <output.wav>\n", argv[0]);
++            std::fprintf(stderr, "usage: %s <engine_dir_with_codec_subdir> <output.wav>\n", argv[0]);
 +            return 1;
 +        }
 +        std::string const engineDir = argv[1];
 +        std::string const outputWav = argv[2];
 +
 +        std::cout << "MOSS smoke: loading engines from " << engineDir << "\n";
-+        MossTtsNanoRuntime runtime(engineDir, /*maxSlots=*/1, /*maxSeqLen=*/512);
++        MossTtsNanoRuntime runtime(engineDir,
++            (std::filesystem::path(engineDir) / "codec").string(),
++            /*maxSlots=*/1, /*maxSeqLen=*/512);
 +        std::cout << "MOSS smoke: runtime ready, codec sr=" << runtime.codecSampleRate()
 +                  << " ch=" << runtime.codecChannels() << " ds=" << runtime.codecDownsampleRate()
 +                  << " n_vq=" << runtime.numVq() << "\n";

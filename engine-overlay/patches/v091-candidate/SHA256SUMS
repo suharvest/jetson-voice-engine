@@ -28,8 +28,8 @@ d16958dcbee7abd89782e0204460774ca6849e3c36a7df628748ba5602277d7b  0023-feat-omni
 9f4d7c7039d9d409d3b82b6ac44f1c3b3b8913f6f7bfe7f8ad72ffe5713115dc  0028-feat-qwen3-tts-cooperative-cancel-shouldCancel-per-f.patch
 9619a76f804ae017980353fd516aa88af9df20ecc49b2388433b5e4bad4158cc  0029-feat-qwen3-tts-shared-engine-ctors-slot-pool-reuses-.patch
 399187058be9719a782326a1de1765678589acba1d9b3d6bfb98a3a6ac4d96f7  0030-feat-qwen3-tts-worker-side-differentiated-chunking-f.patch
-d951af3445ef80c88a9231486c9254107d0d5ea8cda6fb26f78100d7c9c4559a  0031-feat-moss-tts-nano-re-port-C-TRT-runtime-worker-as-i.patch
+27fb636b1a11118c5b5b279026f0d929e623846fb9afd93d5159c80ac8f3a36e  0031-feat-moss-tts-nano-re-port-C-TRT-runtime-worker-as-i.patch
 6f0b12f7efd708d2c174fdf73367c17c2efe11282ebea2a780758ba2799a0e8a  0032-build-moss-tts-nano-wire-worker-into-v0.9.0-CMake-ex.patch
 afcb0afe003a85f5027132b6bd1ed4238dcc420855da0e59e1775210b19f2c11  0035-fix-export-demote-Qwen3-TTS-non-CustomVoice-guard-to.patch
 e37dd5a4a9ccd5855e436b8c86d2f7adacda97963abe6a233c2276d085a28d17  0036-fix-export-carry-codec_language_id-into-the-exported.patch
-5c34422d15b40cef3733fa8a1f6f9782e5fda23ba880787f0151d1863d588825  0041-feat-moss-worker-concurrent-dispatch-cancel.patch
+a9a401046d3d2f55d43bce48d9646165142eba4b4eb35426517fdd7a3843a94e  0041-feat-moss-worker-concurrent-dispatch-cancel.patch
