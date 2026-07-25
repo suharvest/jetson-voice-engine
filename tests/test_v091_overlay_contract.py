@@ -119,6 +119,16 @@ def test_voice_build_contracts_fail_loud_and_keep_production_asr_shape():
     assert asr_manifest["model"]["max_kv_cache_capacity"] == 1536
     assert asr_manifest["model"]["long_context_opt_in_env"] == "ASR_LONG_CONTEXT"
 
+    assert 'tts_batch="${TTS_MAX_BATCH_SIZE:-1}"' in engines
+    assert 'tts_max_input="${TTS_MAX_INPUT_LEN:-1024}"' in engines
+    assert 'tts_max_kv="${TTS_MAX_KV_CACHE_CAPACITY:-1536}"' in engines
+    assert 'tts_engine_suffix="-b2"' in engines
+    assert "--maxBatchSize 2 --maxInputLen 4096 --maxKVCacheCapacity 4096" not in engines
+    assert tts_manifest["build"]["max_batch_size"] == 1
+    assert tts_manifest["build"]["max_input_len"] == 1024
+    assert tts_manifest["build"]["max_kv_cache_capacity"] == 1536
+    assert tts_manifest["build"]["n2_opt_in_env"] == "TTS_MAX_BATCH_SIZE=2"
+
     assert "--target audio_build" in build
     assert 'build/examples/multimodal/audio_build" ]; then' in build
     assert 'examples/multimodal/audio_build"; do' in engines

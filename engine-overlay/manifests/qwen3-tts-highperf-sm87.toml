@@ -22,7 +22,10 @@ aarch64_build = true
 type = "Release"
 enable_cute_dsl = "OFF"
 worker = "qwen3_tts_streaming_worker"
-max_batch_size = 2
+max_batch_size = 1
+max_input_len = 1024
+max_kv_cache_capacity = 1536
+n2_opt_in_env = "TTS_MAX_BATCH_SIZE=2"
 
 [model.customvoice]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"

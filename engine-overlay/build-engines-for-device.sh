@@ -133,7 +133,27 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision(int4_awq|fp16)
 
 build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
   local m="$1" repo="$2" prec="${3:-int4}" src out
+  local tts_batch tts_max_input tts_max_kv tts_engine_suffix
   src="$(_dl "${repo}")"; out="${EXPORT_ROOT}/${m}"
+  # Product defaults are the v0.8 Base limits already validated on Jetson.
+  # Concurrency is a separate artifact choice: the default build is the
+  # low-footprint N=1 engine; opt-in N=2 builds use distinct directories so
+  # they cannot overwrite the production rollback.
+  tts_batch="${TTS_MAX_BATCH_SIZE:-1}"
+  tts_max_input="${TTS_MAX_INPUT_LEN:-1024}"
+  tts_max_kv="${TTS_MAX_KV_CACHE_CAPACITY:-1536}"
+  case "${tts_batch}" in
+    1) tts_engine_suffix="" ;;
+    2) tts_engine_suffix="-b2" ;;
+    *)
+      echo "ERROR: TTS_MAX_BATCH_SIZE must be 1 or 2 (got ${tts_batch})" >&2
+      exit 13
+      ;;
+  esac
+  if [ "${tts_max_input}" != "1024" ] || [ "${tts_max_kv}" != "1536" ]; then
+    echo "ERROR: TTS context is frozen at input=1024/KV=1536; rebuild only after updating the validated product contract" >&2
+    exit 13
+  fi
   echo "==> [tts:${m}] talker(${prec}) + code_predictor + code2wav (fp16)"
   ( cd "${UPSTREAM}"
     if [ "${m}" = "qwen3-tts-base" ]; then
@@ -185,16 +205,22 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
       tensorrt-edgellm-export "${src}" "${out}/onnx" --components talker,code_predictor,code2wav
     fi )
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
-      --engineDir "${out}/talker" --maxBatchSize 2 --maxInputLen 4096 --maxKVCacheCapacity 4096
+      --engineDir "${out}/talker${tts_engine_suffix}" \
+      --maxBatchSize "${tts_batch}" \
+      --maxInputLen "${tts_max_input}" \
+      --maxKVCacheCapacity "${tts_max_kv}"
   if [ "${prec}" = "int4" ]; then
-    cp -p "${out}/onnx/llm/DRIVER_REVISION" "${out}/talker/DRIVER_REVISION"
-    cp -p "${out}/onnx/llm/PROVENANCE.md" "${out}/talker/PROVENANCE.md"
+    cp -p "${out}/onnx/llm/DRIVER_REVISION" "${out}/talker${tts_engine_suffix}/DRIVER_REVISION"
+    cp -p "${out}/onnx/llm/PROVENANCE.md" "${out}/talker${tts_engine_suffix}/PROVENANCE.md"
   elif [ "${m}" = "qwen3-tts-base" ]; then
-    cp -p "${out}/onnx/DRIVER_REVISION" "${out}/talker/DRIVER_REVISION"
-    cp -p "${out}/onnx/PROVENANCE.md" "${out}/talker/PROVENANCE.md"
+    cp -p "${out}/onnx/DRIVER_REVISION" "${out}/talker${tts_engine_suffix}/DRIVER_REVISION"
+    cp -p "${out}/onnx/PROVENANCE.md" "${out}/talker${tts_engine_suffix}/PROVENANCE.md"
   fi
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/code_predictor" \
-      --engineDir "${out}/code_predictor" --maxBatchSize 2 --maxInputLen 4096 --maxKVCacheCapacity 4096
+      --engineDir "${out}/code_predictor${tts_engine_suffix}" \
+      --maxBatchSize "${tts_batch}" \
+      --maxInputLen "${tts_max_input}" \
+      --maxKVCacheCapacity "${tts_max_kv}"
   # Production default: maxCodeLen=512 (~41 s at 12.5 Hz). The upstream
   # audio_build default of 2000 reserves about 2.95 GiB of activation memory
   # and OOMs a 16GB Orin NX when GDN is resident. Operators can still request
