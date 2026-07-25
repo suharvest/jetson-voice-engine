@@ -5,10 +5,10 @@
     "repo_type": "model",
     "revision": "main",
     "artifact_sets": {
-        "orin-nano-highperf-2026-05-10": {
+    "orin-nano-highperf-2026-05-10": {
             "device": "Jetson Orin Nano 8GB",
             "profile": "highperf",
-      "published_to_hf": false,
+      "published_to_hf": true,
             "root": "/opt/models/qwen3-edgellm",
             "required_files": [
                 "engines/orin-nano/highperf/asr_thinker_full_fp8embed/llm.engine",
@@ -145,10 +145,10 @@
                 "engines/orin-nano/official/code2wav/config.json"
             ]
         },
-        "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725": {
+    "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725": {
             "device": "Jetson Orin NX 16GB",
             "profile": "TensorRT-Edge-LLM v0.9.1 full runtime",
-            "published_to_hf": true,
+      "published_to_hf": false,
             "root": "/opt/edgellm-v091",
             "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725/v091",
             "upstream_repo": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
