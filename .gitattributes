@@ -1,0 +1,4 @@
+# Byte-exact `git format-patch` mail files intentionally contain diff context
+# prefixes and the conventional "-- " signature separator. Do not reinterpret
+# those payload bytes as whitespace errors in the containing repository.
+engine-overlay/patches/upstream-v091-prs/*.patch -whitespace
