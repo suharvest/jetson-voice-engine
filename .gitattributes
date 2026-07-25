@@ -7,3 +7,8 @@ engine-overlay/patches/upstream-v091-prs/SHA256SUMS -text
 engine-overlay/patches/v091-candidate/*.patch -text
 engine-overlay/patches/v091-candidate/series -text
 engine-overlay/patches/v091-candidate/SHA256SUMS -text
+
+# Release gates must remain executable in autocrlf-enabled checkouts.
+engine-overlay/build.sh text eol=lf
+engine-overlay/validate-manifest.py text eol=lf
+engine-overlay/tests/*.sh text eol=lf
