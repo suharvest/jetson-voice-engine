@@ -145,16 +145,19 @@
                 "engines/orin-nano/official/code2wav/config.json"
             ]
         },
-    "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725": {
+    "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725-r2": {
             "device": "Jetson Orin NX 16GB",
             "profile": "TensorRT-Edge-LLM v0.9.1 full runtime",
       "published_to_hf": false,
             "root": "/opt/edgellm-v091",
-            "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725/v091",
+            "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260725-r2/v091",
             "upstream_repo": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
             "upstream_sha": "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
-            "overlay_patch_count": 41,
-            "overlay_series_sha256": "aea49a0efc1acafd8ac18e0a4e6606fb4f7398be3b28fd9bee912bf613b90610",
+            "proposed_upstream_patch_count": 7,
+            "proposed_upstream_series_sha256": "9fe8677a4c6886a4b7d8d253a245b6d95509d26a7fe8072eb0de6ed83633c733",
+            "overlay_patch_count": 35,
+            "overlay_series_sha256": "a358dcafc5d3fc70468a01e21c97236a1a6664644d26f635ed6ee6934d3be3d5",
+            "overlay_checksums_sha256": "7bd4ec4fe0c291bec7d9699b7563900de94d257047d6bef222bcd76e092389c9",
             "required_files": [
                 "manifest.json",
                 "SHA256SUMS",
