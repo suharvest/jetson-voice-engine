@@ -98,6 +98,11 @@ commit's real parent, tree, and patch-id. Provenance inputs are marked
 `-text`; exact upstream mail patches are also `-whitespace`, so
 `core.autocrlf=true` cannot change release bytes.
 
+Replay materialization uses the source's read-only common object store and
+the exact PIN index/tree rather than archive or clone-all-refs. This preserves
+the three v0.9.1 gitlinks plus executable/symlink modes and fails unless
+`write-tree` equals the PIN tree before apply and after reverse.
+
 ## Device and release gate
 
 The former 41-patch chain passed Orin NX fallback/CuTe builds and the complete

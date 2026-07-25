@@ -181,13 +181,25 @@ trap cleanup EXIT
 REPLAY="${TMP_ROOT}/repo"
 mkdir -p "${REPLAY}"
 git -C "${REPLAY}" init -q
-# Consume only the exact locked base tree. Cloning/fetching the source would
-# enumerate every source ref and can fail on an unrelated broken/partial ref
-# even when PIN and all seven locked commits are present.
-git -C "${REPLAY_SOURCE}" archive "${PIN}" | tar -x -C "${REPLAY}"
-git -C "${REPLAY}" add -A
-git -C "${REPLAY}" -c user.name=overlay-replay \
-  -c user.email=overlay-replay@invalid commit -q -m "exact v0.9.1 replay base"
+# Consume only the source's exact object store through a read-only alternate.
+# This avoids enumerating unrelated refs while preserving the complete Git
+# index/tree, including gitlinks, executable bits, and symlinks.
+SOURCE_COMMON_DIR="$(git -C "${REPLAY_SOURCE}" rev-parse --git-common-dir)"
+case "${SOURCE_COMMON_DIR}" in
+  /*) ;;
+  *) SOURCE_COMMON_DIR="$(cd "${REPLAY_SOURCE}/${SOURCE_COMMON_DIR}" && pwd -P)" ;;
+esac
+SOURCE_OBJECTS="${SOURCE_COMMON_DIR}/objects"
+[ -d "${SOURCE_OBJECTS}" ] || die "source object directory is missing: ${SOURCE_OBJECTS}"
+mkdir -p "${REPLAY}/.git/objects/info"
+printf '%s\n' "${SOURCE_OBJECTS}" > "${REPLAY}/.git/objects/info/alternates"
+git -C "${REPLAY}" read-tree "${PIN}"
+git -C "${REPLAY}" checkout-index -a
+EXPECTED_BASE_TREE="$(git -C "${REPLAY_SOURCE}" rev-parse "${PIN}^{tree}")"
+ACTUAL_BASE_TREE="$(git -C "${REPLAY}" write-tree)"
+[ "${ACTUAL_BASE_TREE}" = "${EXPECTED_BASE_TREE}" ] \
+  || die "replay baseline tree differs from ${PIN}: ${ACTUAL_BASE_TREE}"
+echo "exact replay baseline tree: ${ACTUAL_BASE_TREE}"
 
 for file in "${UPSTREAM_SERIES[@]}"; do
   git -C "${REPLAY}" apply --check "${UPSTREAM_DIR}/${file}"
@@ -218,7 +230,10 @@ for ((index=${#UPSTREAM_SERIES[@]} - 1; index >= 0; index--)); do
   git -C "${REPLAY}" apply --reverse "${UPSTREAM_DIR}/${file}"
 done
 
-git -C "${REPLAY}" diff --quiet || die "tracked tree differs after reverse replay"
+git -C "${REPLAY}" diff --quiet || die "tracked worktree differs after reverse replay"
+REVERSED_BASE_TREE="$(git -C "${REPLAY}" write-tree)"
+[ "${REVERSED_BASE_TREE}" = "${EXPECTED_BASE_TREE}" ] \
+  || die "replay index tree differs from ${PIN} after reverse replay"
 expected_addon="$(mktemp)"
 actual_addon="$(mktemp)"
 (cd "${HERE}/addon" && find . -type f | sed 's#^./##' | sort) > "${expected_addon}"

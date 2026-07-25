@@ -146,6 +146,19 @@ check_sums "${AUTOCLONE}/engine-overlay/patches/upstream-v091-prs"
 check_sums "${AUTOCLONE}/engine-overlay/patches/v091-candidate"
 
 if [ -n "${OFFICIAL_CHECKOUT}" ]; then
+  gitlink_count="$(git -C "${OFFICIAL_CHECKOUT}" ls-tree -r "${PIN}" \
+    | awk '$1 == "160000" {count++} END {print count + 0}')"
+  [ "${gitlink_count}" -eq 3 ] \
+    || { echo "ERROR: expected three v0.9.1 gitlink fixtures, found ${gitlink_count}" >&2; exit 1; }
+  echo "exact-tree fixture: ${gitlink_count} gitlinks"
+
+  MISSING_OBJECT_CLONE="${TMP_ROOT}/missing-object-clone"
+  git clone --no-local "${OFFICIAL_CHECKOUT}" \
+    "${MISSING_OBJECT_CLONE}" >/dev/null
+  expect_fail missing_locked_object \
+    bash "${HERE}/tests/verify-patch-stack.sh" \
+    "${MISSING_OBJECT_CLONE}"
+
   OFFICIAL_CLONE="${TMP_ROOT}/official-clone"
   git clone --no-local "${OFFICIAL_CHECKOUT}" "${OFFICIAL_CLONE}" >/dev/null
   while IFS='|' read -r file pr commit parent tree patch_id expected_sha; do

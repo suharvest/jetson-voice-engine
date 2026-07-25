@@ -101,7 +101,10 @@ tests/test-provenance-negative.sh /path/to/official-checkout-with-locked-objects
 The replay source may be a normal clone or a standard linked Git worktree;
 validation uses Git plumbing and does not assume `.git` is a directory. The
 temporary replay tree is materialized from the exact PIN only, so unrelated
-broken/partial refs in the source cannot poison the gate.
+broken/partial refs in the source cannot poison the gate. A read-only object
+alternate plus `read-tree`/`checkout-index` preserves gitlinks, executable
+bits, and symlinks; `write-tree` must equal the PIN tree before apply and
+again after reverse replay.
 
 ## Build-verify status
 
