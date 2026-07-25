@@ -1,0 +1,47 @@
+From 6c28b1bf0717eea676c974da734a614173f21276 Mon Sep 17 00:00:00 2001
+From: Codex Validation <codex@local.invalid>
+Date: Fri, 24 Jul 2026 17:15:36 +0800
+Subject: [PATCH 39/40] fix(cmake): propagate CuTe shim driver and wrap
+ requirements
+
+---
+ cmake/CuteDsl.cmake | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index a10e632..89e9a40 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -1043,20 +1043,29 @@ function(cute_dsl_setup)
+   foreach(_tgt ${ARG_LINK_TARGETS})
+     get_target_property(_tgt_type ${_tgt} TYPE)
+     if(_tgt_type STREQUAL "STATIC_LIBRARY")
+-      target_link_libraries(${_tgt} PUBLIC ${_link_libs})
++      target_link_libraries(${_tgt} PUBLIC ${_link_libs}
++                                           trt_edgellm_cutedsl_cudart_shim)
+     else()
+       target_link_libraries(${_tgt} PRIVATE ${_link_libs}
+                                             trt_edgellm_cutedsl_cudart_shim)
+     endif()
+     if(CUDA_DRIVER_LIB AND NOT CUDA_DRIVER_LIB MATCHES "-NOTFOUND$")
+-      target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_libraries(${_tgt} PUBLIC "${CUDA_DRIVER_LIB}")
++      else()
++        target_link_libraries(${_tgt} PRIVATE "${CUDA_DRIVER_LIB}")
++      endif()
+     endif()
+     # CUDA 12.0–12.6: wrap _cudaLaunchKernelEx (cudaKernel_t → CUfunction, e.g.
+     # JetPack 6). CUDA 11.x artifacts use CUmodule ABI instead.
+     if(NOT _cute_dsl_cuda_ver STREQUAL ""
+        AND _cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0
+        AND _cute_dsl_cuda_ver VERSION_LESS 12.8)
+-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_options(${_tgt} INTERFACE "-Wl,--wrap=_cudaLaunchKernelEx")
++      else()
++        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      endif()
+     endif()
+   endforeach()
+ 

@@ -1,3 +1,4 @@
+# Active CustomVoice v0.9.1 build contract.
 [upstream]
 version = "v0.9.1"
 pin = "7f061f21f0a581ba234a1e233c9315b89d8e47d6"
@@ -24,21 +25,10 @@ enable_cute_dsl = "OFF"
 worker = "qwen3_tts_streaming_worker"
 max_batch_size = 2
 
-[model.customvoice]
+[model]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
 precision = "int4"
 components = ["talker", "code_predictor", "code2wav"]
-required_driver_env = "EDGELLM_TTS_INT4_DRIVER"
-required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md"]
-
-[model.base]
-id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-precision = "int4"
-components = ["talker", "code_predictor", "code2wav", "speaker_encoder"]
-required_driver_env = "EDGELLM_TTS_BASE_DRIVER"
-required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md", "SHA256SUMS"]
-required_model_revision_env = "TTS_BASE_MODEL_REVISION"
-required_int4_stage2_env = ["TTS_BASE_STAGE2_CHECKPOINT", "TTS_BASE_STAGE2_REVISION"]
 
 [artifacts]
 root = "/opt/edgellm-v091"
@@ -50,10 +40,6 @@ required = [
   "engines/tts_customvoice_int4/talker/PROVENANCE.md",
   "engines/tts_customvoice_fp16/code_predictor/llm.engine",
   "engines/tts_customvoice_fp16/code2wav/code2wav/code2wav.engine",
-  "engines/tts_base_talker/llm.engine",
-  "engines/tts_base_code_predictor/llm.engine",
-  "engines/tts_base_code2wav_512/code2wav.engine",
-  "engines/tts_base_spk_encoder/speaker_encoder/spk_encoder.engine",
 ]
 provenance_required = true
 sha256_required = true

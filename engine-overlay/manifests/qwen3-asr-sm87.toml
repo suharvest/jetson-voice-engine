@@ -1,35 +1,45 @@
-# voxedge-engine build manifest — qwen3-asr-sm87
-# PLACEHOLDER: fill on Jetson build host (build-verify DEFERRED).
 [upstream]
-pin    = "364769036fc83351d9d0aac4cc064a8e56a83178"  # TensorRT-Edge-LLM v0.7.1
+version = "v0.9.1"
+pin = "7f061f21f0a581ba234a1e233c9315b89d8e47d6"
 remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
 
 [patches]
-# applied in order by build.sh
-order = [
-  "0001-orin-tegra-build-compat.patch",
-  "0002-weight-streaming-budget.patch",
-  "0003-asr-streaming-session.patch",
-  "0004-tts-slotpool-concurrency.patch",
-  "0005-customvoice-language-conditioning.patch",
-  "0006-server-sse-disconnect-and-openai-api.patch",
-  "0007-server-openai-api-docs.patch",
-  "0008-build-misc-example-registration.patch",
-]
+directory = "patches/v091-candidate"
+first = "0001"
+last = "0041"
+count = 41
 
 [target]
-device  = "jetson-orin"   # sm_87
-cuda    = ""              # TODO fill on build host
-tensorrt= ""              # TODO
+device = "jetson-orin-nx"
+sm = "87"
+cuda = "12.6"
+tensorrt = "10.3"
+l4t = "36.4.3"
+embedded_target = "jetson-orin"
+aarch64_build = true
 
-[addon]
-digest  = ""              # TODO: sha256 of addon/ tree
+[build]
+type = "Release"
+enable_cute_dsl = "OFF"
+worker = "qwen3_asr_worker"
 
-[export]
-# TODO: export/quant params (ONNX ref, W8A16/AWQ flags, etc.)
+[model]
+id = "Qwen/Qwen3-ASR-0.6B"
+precision = "int4_awq"
+components = ["thinker", "audio_encoder"]
+batch_sizes = [1, 2]
+max_input_len = 1024
+max_kv_cache_capacity = 1536
+long_context_opt_in_env = "ASR_LONG_CONTEXT"
 
 [artifacts]
-# TODO: produced binary/.so/.engine names + md5
-
-[hf]
-repo = ""                 # TODO: HF repo/rev/SHA
+root = "/opt/edgellm-v091"
+required = [
+  "libNvInfer_edgellm_plugin.so",
+  "bin/qwen3_asr_worker",
+  "engines/asr_thinker_full_int4_b1/llm.engine",
+  "engines/asr_thinker_full_int4_b2/llm.engine",
+  "engines/asr_audio_encoder/audio/audio_encoder.engine",
+]
+provenance_required = true
+sha256_required = true

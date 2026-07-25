@@ -2,12 +2,18 @@
 
 ```text
 upstream:       github.com/NVIDIA/TensorRT-Edge-LLM (Apache 2.0)
-UPSTREAM_PIN:   1ac0f2b99642045125e1c5ac7b109434ba3b36c7   (= tag v0.9.0, pure NVIDIA)
-patch series:   v090-sparktts-0001..0038 (= fork integration/v090-sparktts @ e8c59c1)
-repin:          2026-07-04 P4-1 v0.9.0 re-pin — see patches/PATCH-STATE-v090.md
+UPSTREAM_PIN:   7f061f21f0a581ba234a1e233c9315b89d8e47d6   (= tag v0.9.1, pure NVIDIA)
+patch series:   v091-candidate/0001..0040
+repin:          2026-07-24 production migration — see patches/v091-candidate/PATCH-STATE.md
 ```
 
-> ⚠️ 2026-07-04 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
+> ⚠️ Active chain 现以 `v091-candidate/PATCH-STATE.md` 为准。以下逐主题条目
+> 保留历史分类与上游化依据；旧编号来自 v0.7.1/v0.9.0，不能作为 active
+> apply 编号。通用兼容候选为 0037 streamed reader、0038 kFP4 guard、
+> 0039 CuTe link propagation、0040 mask-scoped FMHA load。产品专属的
+> ASR/TTS lane、worker、模型条件与 W4A16 路径继续自留。
+>
+> 2026-07-04 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
 > fork v071/customvoice-product),patch 编号/scope 以 PATCH-STATE-v090.md
 > 处置表为准:v080-sparktts-0001..0030 已删除(由 v090-sparktts-0001..0038 取代);
 > 0001 重基到 v0.9.0(上游未吸收:Tegra autodetect/aarch64 arch guard/静态库

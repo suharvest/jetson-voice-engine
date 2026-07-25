@@ -1,0 +1,183 @@
+From e567aadea8674cad45f1b97607f0e871f2333e55 Mon Sep 17 00:00:00 2001
+From: Codex Validation <codex@local.invalid>
+Date: Fri, 24 Jul 2026 17:16:14 +0800
+Subject: [PATCH 40/40] fix(attention): scope FMHA cubin loading by mask type
+
+---
+ .../contextFMHARunner.cpp                     | 34 ++++++++++++-------
+ .../contextFMHARunner.h                       |  3 +-
+ .../attentionPlugin/attentionPlugin.cpp       | 10 ++++--
+ 3 files changed, 30 insertions(+), 17 deletions(-)
+
+diff --git a/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp b/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp
+index ee98381..e236cb8 100644
+--- a/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp
++++ b/cpp/kernels/contextAttentionKernels/contextFMHARunner.cpp
+@@ -126,10 +126,11 @@ struct FMHAKernelLoadHashKey
+ {
+     FMHADataType data_type;
+     int32_t sm;
++    int32_t attention_mask_type;
+ 
+     bool operator==(FMHAKernelLoadHashKey const& other) const noexcept
+     {
+-        return data_type == other.data_type && sm == other.sm;
++        return data_type == other.data_type && sm == other.sm && attention_mask_type == other.attention_mask_type;
+     }
+ };
+ 
+@@ -137,7 +138,7 @@ struct FMHAKernelLoadHasher
+ {
+     size_t operator()(FMHAKernelLoadHashKey const& s) const noexcept
+     {
+-        size_t key = s.data_type;
++        size_t key = static_cast<size_t>(s.data_type) ^ (static_cast<size_t>(s.attention_mask_type) << 8);
+         key <<= 16;
+         key ^= s.sm;
+         return key;
+@@ -195,9 +196,10 @@ class FMHAKernelList
+     using TKernelMetaInfo = fmha_v2::FusedMultiHeadAttentionKernelMetaInfoV2;
+ 
+ public:
+-    FMHAKernelList(FMHADataType type, int32_t sm) noexcept
++    FMHAKernelList(FMHADataType type, int32_t sm, int32_t attentionMaskType) noexcept
+         : mDataType(type)
+         , mSMVersion(sm)
++        , mAttentionMaskType(attentionMaskType)
+     {
+         mKernelMeta = &(fmha_v2::sMhaKernelMetaInfosV2[0]);
+         mKernelMetaCount = sizeof(fmha_v2::sMhaKernelMetaInfosV2) / sizeof(fmha_v2::sMhaKernelMetaInfosV2[0]);
+@@ -214,7 +216,8 @@ public:
+         {
+             auto const& kernelMeta = mKernelMeta[i];
+             if (kernelMeta.mDataTypeIn != mDataType || kernelMeta.mDataTypeOut != mDataType
+-                || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr)
++                || kernelMeta.mSM != mSMVersion || kernelMeta.mCubin == nullptr
++                || kernelMeta.mAttentionMaskType != mAttentionMaskType)
+             {
+                 continue;
+             }
+@@ -269,6 +272,7 @@ protected:
+     int32_t mKernelMetaCount;
+     FMHADataType mDataType;
+     uint32_t mSMVersion;
++    int32_t mAttentionMaskType;
+     std::unordered_map<unsigned char const*, CUmodule> mModules;
+ 
+     std::unordered_map<FMHAKernelHashKey, FMHAKernelFuncInfo, FMHAKernelHasher> mFunctions;
+@@ -279,17 +283,18 @@ class FMHAKernelLoader
+ 
+ public:
+     //! @throws std::runtime_error if a CUDA driver error occurs
+-    FMHAKernelList* getFMHAKernelList(FMHADataType type, int32_t sm)
++    FMHAKernelList* getFMHAKernelList(FMHADataType type, int32_t sm, int32_t attentionMaskType)
+     {
+         static std::mutex s_mutex;
+         std::lock_guard<std::mutex> lg(s_mutex);
+ 
+-        FMHAKernelLoadHashKey hash_key{type, sm};
++        FMHAKernelLoadHashKey hash_key{type, sm, attentionMaskType};
+ 
+         auto findIter = mKernels.find(hash_key);
+         if (findIter == mKernels.end())
+         {
+-            std::unique_ptr<FMHAKernelList> newKernel = std::make_unique<FMHAKernelList>(type, sm);
++            std::unique_ptr<FMHAKernelList> newKernel
++                = std::make_unique<FMHAKernelList>(type, sm, attentionMaskType);
+             newKernel->loadFMHAKernels();
+             mKernels.insert(std::make_pair(hash_key, std::move(newKernel)));
+             findIter = mKernels.find(hash_key);
+@@ -310,9 +315,9 @@ private:
+ };
+ 
+ //! @throws std::runtime_error if a CUDA driver error occurs
+-inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm)
++inline FMHAKernelList* getFMHAKernels(FMHADataType type, int32_t sm, ContextAttentionMaskType maskType)
+ {
+-    return FMHAKernelLoader::Get().getFMHAKernelList(type, sm);
++    return FMHAKernelLoader::Get().getFMHAKernelList(type, sm, attentionMaskTypeToInt(maskType));
+ }
+ 
+ }; // namespace
+@@ -491,9 +496,10 @@ bool ContextFMHARunner::canImplement(int32_t headSize, [[maybe_unused]] int32_t
+     return false;
+ }
+ 
+-bool ContextFMHARunner::loadContextFMHAKernels(int32_t smVersion, nvinfer1::DataType dataType)
++bool ContextFMHARunner::loadContextFMHAKernels(
++    int32_t smVersion, nvinfer1::DataType dataType, ContextAttentionMaskType maskType)
+ {
+-    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion);
++    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(dataType), smVersion, maskType);
+     return fmhaKernelList != nullptr;
+ }
+ 
+@@ -505,7 +511,8 @@ bool ContextFMHARunner::isKernelAvailable() const noexcept
+             mLaunchParams.force_unroll, mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
+             attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,
+             attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
+-        FMHAKernelList const* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
++        FMHAKernelList const* fmhaKernelList
++            = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion, mLaunchParams.attention_mask_type);
+         return fmhaKernelList != nullptr && fmhaKernelList->findKernelFunction(hashKey).mSharedMemBytes != 0;
+     }
+     catch (std::exception const&)
+@@ -528,7 +535,8 @@ void ContextFMHARunner::dispatchFMHAKernel(FusedMultiheadAttentionParamsV2& para
+         mLaunchParams.force_fp32_acc, mLaunchParams.flash_attention,
+         attentionMaskTypeToInt(mLaunchParams.attention_mask_type), mLaunchParams.use_granular_tiling,
+         attentionInputLayoutToInt(mLaunchParams.attention_input_layout)};
+-    FMHAKernelList* fmhaKernelList = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion);
++    FMHAKernelList* fmhaKernelList
++        = getFMHAKernels(trtToFMHADataType(mDataType), mSmVersion, mLaunchParams.attention_mask_type);
+     FMHAKernelFuncInfo kernelInfo = fmhaKernelList->findKernelFunction(hashKey);
+     check::check(kernelInfo.mSharedMemBytes != 0, "There must be one kernel to implement the MHA");
+ 
+diff --git a/cpp/kernels/contextAttentionKernels/contextFMHARunner.h b/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
+index 59c21a5..72c3f71 100644
+--- a/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
++++ b/cpp/kernels/contextAttentionKernels/contextFMHARunner.h
+@@ -134,7 +134,8 @@ public:
+      * @return True if successful
+      * @throws std::runtime_error if a CUDA driver error occurs
+      */
+-    static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType);
++    static bool loadContextFMHAKernels(int32_t sm, nvinfer1::DataType dataType,
++        ContextAttentionMaskType maskType = ContextAttentionMaskType::CAUSAL);
+ 
+ private:
+     nvinfer1::DataType mDataType; //!< Data type
+diff --git a/cpp/plugins/attentionPlugin/attentionPlugin.cpp b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
+index 8d5ae1a..8821bef 100644
+--- a/cpp/plugins/attentionPlugin/attentionPlugin.cpp
++++ b/cpp/plugins/attentionPlugin/attentionPlugin.cpp
+@@ -177,7 +177,9 @@ bool loadFMHAKernels(
+             useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL : ContextAttentionMaskType::CAUSAL);
+         if (canImplementFMHA)
+         {
+-            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType))
++            auto const maskType = useSlidingWindow ? ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
++                                                   : ContextAttentionMaskType::CAUSAL;
++            if (!ContextFMHARunner::loadContextFMHAKernels(smVersion, dataType, maskType))
+             {
+                 LOG_ERROR("Failed to load FMHA_v2 cubins for SM%d", smVersion);
+                 canImplementFMHA = false;
+@@ -407,7 +409,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, int32_t numQHeads, int
+         // Availability is discovered from the cubin metadata table.
+         mCanImplementCustomMaskFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType,
+                                           AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CUSTOM_MASK)
+-            && ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
++            && ContextFMHARunner::loadContextFMHAKernels(
++                mSMVersion, mDataType, ContextAttentionMaskType::CUSTOM_MASK);
+ 
+         enforceVisionBlockKernelSupport();
+ 
+@@ -511,7 +514,8 @@ AttentionPlugin::AttentionPlugin(std::string const& name, PluginFieldCollection
+     {
+         mCanImplementCustomMaskFMHA = ContextFMHARunner::canImplement(mHeadSize, mSMVersion, mDataType,
+                                           AttentionInputLayout::SEPARATE_Q_K_V, ContextAttentionMaskType::CUSTOM_MASK)
+-            && ContextFMHARunner::loadContextFMHAKernels(mSMVersion, mDataType);
++            && ContextFMHARunner::loadContextFMHAKernels(
++                mSMVersion, mDataType, ContextAttentionMaskType::CUSTOM_MASK);
+ 
+         enforceVisionBlockKernelSupport();
+     }

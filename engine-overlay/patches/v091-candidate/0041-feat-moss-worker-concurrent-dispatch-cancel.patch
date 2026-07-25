@@ -1,0 +1,274 @@
+diff --git a/examples/omni/moss_tts_nano_worker.cpp b/examples/omni/moss_tts_nano_worker.cpp
+index c3d1fac..220bf80 100644
+--- a/examples/omni/moss_tts_nano_worker.cpp
++++ b/examples/omni/moss_tts_nano_worker.cpp
+@@ -18,22 +18,28 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cmath>
++#include <condition_variable>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <cstring>
++#include <deque>
+ #include <exception>
+ #include <filesystem>
+ #include <fstream>
+ #include <getopt.h>
+ #include <iostream>
+ #include <memory>
++#include <mutex>
+ #include <nlohmann/json.hpp>
+ #include <onnxruntime_cxx_api.h>
+ #include <sentencepiece_processor.h>
+ #include <stdexcept>
+ #include <string>
++#include <thread>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -141,8 +147,11 @@ int64_t elapsedMs(std::chrono::steady_clock::time_point a, std::chrono::steady_c
+     return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+ }
+ 
++std::mutex gEmitMutex;
++
+ void emit(Json payload)
+ {
++    std::lock_guard<std::mutex> lock(gEmitMutex);
+     std::cout << payload.dump() << '\n' << std::flush;
+ }
+ 
+@@ -509,8 +518,14 @@ bool parseArgs(int argc, char** argv, Args& args)
+ 
+ // ─── Request handler ─────────────────────────────────────────────────────────
+ 
++struct RequestControl
++{
++    std::atomic<bool> cancelled{false};
++};
++
+ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
+-    sentencepiece::SentencePieceProcessor& sp, CodecEncodeRunner& codec, TtsConfig const& cfg)
++    sentencepiece::SentencePieceProcessor& sp, CodecEncodeRunner& codec, TtsConfig const& cfg,
++    std::mutex& preprocessMutex, std::shared_ptr<RequestControl> const& control)
+ {
+     std::string const id = item.value("id", std::string("__request__"));
+     auto const requestStart = std::chrono::steady_clock::now();
+@@ -525,32 +540,43 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
+     std::string const text = item.value("text", std::string(""));
+     if (text.empty()) throw std::runtime_error("text must not be empty");
+ 
++    if (control->cancelled.load(std::memory_order_acquire))
++    {
++        emit(Json{{"event", "cancelled"}, {"id", id}, {"ok", true},
++            {"reason", "cancelled_before_start"}});
++        return;
++    }
++
+     emit(Json{{"event", "ready"}, {"id", id}, {"ok", true},
+         {"sample_rate", runtime.codecSampleRate()}, {"channels", runtime.codecChannels()}});
+ 
+     std::vector<std::vector<int32_t>> refAudioCodes;
+-    if (item.contains("ref_audio_b64") && item["ref_audio_b64"].is_string()
+-        && !item["ref_audio_b64"].get<std::string>().empty())
++    std::vector<int32_t> textIds;
+     {
+-        try {
+-            refAudioCodes = encodeReferenceAudio(codec, item["ref_audio_b64"].get<std::string>(),
+-                item.value("ref_audio_sample_rate", codec.sampleRate));
+-            std::fprintf(stderr, "[moss_worker] encoded ref audio → %zu code rows (codec.available=%d)\n",
+-                refAudioCodes.size(), int(codec.available()));
+-        } catch (std::exception const& e) {
+-            std::fprintf(stderr, "[moss_worker] ref audio encode failed: %s\n", e.what());
+-            refAudioCodes.clear();
++        std::lock_guard<std::mutex> lock(preprocessMutex);
++        if (item.contains("ref_audio_b64") && item["ref_audio_b64"].is_string()
++            && !item["ref_audio_b64"].get<std::string>().empty())
++        {
++            try {
++                refAudioCodes = encodeReferenceAudio(codec, item["ref_audio_b64"].get<std::string>(),
++                    item.value("ref_audio_sample_rate", codec.sampleRate));
++                std::fprintf(stderr, "[moss_worker] encoded ref audio → %zu code rows (codec.available=%d)\n",
++                    refAudioCodes.size(), int(codec.available()));
++            } catch (std::exception const& e) {
++                std::fprintf(stderr, "[moss_worker] ref audio encode failed: %s\n", e.what());
++                refAudioCodes.clear();
++            }
+         }
+-    }
+-    if (refAudioCodes.empty())
+-    {
+-        // Either no ref_audio_b64 in request, OR encode returned empty (codec unavailable / failed).
+-        // Fall back to default voice conditioning — match Python infer_onnx behavior.
+-        refAudioCodes = cfg.defaultVoiceAudioCodes;
+-        std::fprintf(stderr, "[moss_worker] using default voice → %zu code rows\n", refAudioCodes.size());
++        if (refAudioCodes.empty())
++        {
++            // Either no ref_audio_b64 in request, OR encode returned empty.
++            refAudioCodes = cfg.defaultVoiceAudioCodes;
++            std::fprintf(stderr, "[moss_worker] using default voice → %zu code rows\n",
++                refAudioCodes.size());
++        }
++        textIds = tokenize(sp, text);
+     }
+ 
+-    std::vector<int32_t> textIds = tokenize(sp, text);
+     std::vector<int32_t> inputIds = buildInputIds(textIds, refAudioCodes, cfg);
+     std::vector<int32_t> attentionMask(inputIds.size() / static_cast<size_t>(cfg.rowWidth), 1);
+ 
+@@ -610,6 +636,7 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
+ 
+     for (frameIdx = 0; frameIdx < maxNewFrames; ++frameIdx)
+     {
++        if (control->cancelled.load(std::memory_order_acquire)) break;
+         std::vector<int32_t> frameTokens;
+         bool const cont = runtime.sampleFrame(slot, globalHidden, frameTokens);
+         if (!cont) break;
+@@ -623,6 +650,14 @@ void handleRequest(Json const& item, MossTtsNanoRuntime& runtime,
+         globalHidden = runtime.decodeStep(slot, nextRow, globalHidden);
+     }
+ 
++    if (control->cancelled.load(std::memory_order_acquire))
++    {
++        emit(Json{{"event", "cancelled"}, {"id", id}, {"ok", true},
++            {"reason", "cancelled"}, {"frames", frameIdx}, {"chunks", chunkIdx},
++            {"wall_ms", elapsedMs(requestStart, std::chrono::steady_clock::now())}});
++        return;
++    }
++
+     flushBuffer(true);
+ 
+     auto doneAt = std::chrono::steady_clock::now();
+@@ -657,12 +692,65 @@ int main(int argc, char** argv)
+ 
+         CodecEncodeRunner codec(args.codecOnnxDir);
+         MossTtsNanoRuntime runtime(args.engineDir, args.maxSlots, args.maxSeqLen);
++        std::mutex preprocessMutex;
++
++        struct Task
++        {
++            Json item;
++            std::shared_ptr<RequestControl> control;
++        };
++        std::mutex queueMutex;
++        std::condition_variable queueCv;
++        std::deque<Task> queue;
++        bool stopping = false;
++        std::mutex controlsMutex;
++        std::unordered_map<std::string, std::shared_ptr<RequestControl>> controls;
+ 
+         emit(Json{{"event", "worker_ready"}, {"ok", true},
+             {"sample_rate", runtime.codecSampleRate()}, {"channels", runtime.codecChannels()},
+             {"engine_dir", args.engineDir},
+             {"voice_clone_enabled", codec.available()},
+-            {"prompt_template_loaded", !cfg.userPromptPrefixTokenIds.empty()}});
++            {"prompt_template_loaded", !cfg.userPromptPrefixTokenIds.empty()},
++            {"max_slots", args.maxSlots}, {"concurrent_dispatch", true},
++            {"cooperative_cancel", true}});
++
++        std::vector<std::thread> workers;
++        workers.reserve(static_cast<size_t>(args.maxSlots));
++        for (int32_t workerIndex = 0; workerIndex < args.maxSlots; ++workerIndex)
++        {
++            workers.emplace_back([&] {
++                while (true)
++                {
++                    Task task;
++                    {
++                        std::unique_lock<std::mutex> lock(queueMutex);
++                        queueCv.wait(lock, [&] { return stopping || !queue.empty(); });
++                        if (stopping && queue.empty()) return;
++                        task = std::move(queue.front());
++                        queue.pop_front();
++                    }
++                    std::string const id = task.item.value("id", std::string("__request__"));
++                    try
++                    {
++                        handleRequest(
++                            task.item, runtime, sp, codec, cfg, preprocessMutex, task.control);
++                    }
++                    catch (std::exception const& e)
++                    {
++                        emit(Json{{"event", "error"}, {"id", id}, {"ok", false},
++                            {"error", e.what()}});
++                    }
++                    catch (...)
++                    {
++                        emit(Json{{"event", "error"}, {"id", id}, {"ok", false},
++                            {"error", "unknown exception"}});
++                    }
++                    std::lock_guard<std::mutex> lock(controlsMutex);
++                    auto it = controls.find(id);
++                    if (it != controls.end() && it->second == task.control) controls.erase(it);
++                }
++            });
++        }
+ 
+         std::string line;
+         while (std::getline(std::cin, line))
+@@ -673,7 +761,45 @@ int main(int argc, char** argv)
+             {
+                 Json item = Json::parse(line);
+                 id = item.value("id", id);
+-                handleRequest(item, runtime, sp, codec, cfg);
++                if (item.is_object() && item.value("type", std::string("")) == "cancel")
++                {
++                    bool tripped = false;
++                    {
++                        std::lock_guard<std::mutex> lock(controlsMutex);
++                        auto it = controls.find(id);
++                        if (it != controls.end())
++                        {
++                            it->second->cancelled.store(true, std::memory_order_release);
++                            tripped = true;
++                        }
++                    }
++                    emit(Json{{"event", "cancel_ack"}, {"id", id}, {"tripped", tripped}});
++                    continue;
++                }
++
++                auto control = std::make_shared<RequestControl>();
++                {
++                    std::lock_guard<std::mutex> lock(controlsMutex);
++                    if (controls.find(id) != controls.end())
++                    {
++                        emit(Json{{"event", "error"}, {"id", id}, {"ok", false},
++                            {"error", "duplicate_request_id"}, {"status", 409}});
++                        continue;
++                    }
++                    if (controls.size() >= static_cast<size_t>(args.maxSlots))
++                    {
++                        emit(Json{{"event", "error"}, {"id", id}, {"ok", false},
++                            {"error", "pool_saturated"}, {"status", 4429},
++                            {"max_slots", args.maxSlots}});
++                        continue;
++                    }
++                    controls.emplace(id, control);
++                }
++                {
++                    std::lock_guard<std::mutex> lock(queueMutex);
++                    queue.push_back(Task{std::move(item), std::move(control)});
++                }
++                queueCv.notify_one();
+             }
+             catch (std::exception const& e)
+             {
+@@ -685,6 +811,13 @@ int main(int argc, char** argv)
+                     {"error", "unknown exception"}});
+             }
+         }
++        {
++            std::lock_guard<std::mutex> lock(queueMutex);
++            stopping = true;
++        }
++        queueCv.notify_all();
++        for (auto& worker : workers)
++            if (worker.joinable()) worker.join();
+         return 0;
+     }
+     catch (std::exception const& e)

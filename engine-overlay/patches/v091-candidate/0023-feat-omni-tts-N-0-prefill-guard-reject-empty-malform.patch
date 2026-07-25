@@ -1,0 +1,71 @@
+From 227891a0761059f9db11c55f075c50f3e6e6cbaf Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 3 Jul 2026 20:54:59 +0800
+Subject: [PATCH 23/40] =?UTF-8?q?feat(omni-tts):=20N<=3D0=20prefill=20guar?=
+ =?UTF-8?q?d=20=E2=80=94=20reject=20empty/malformed=20text=20before=20Talk?=
+ =?UTF-8?q?er=20(re-port=208de933f)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add a defensive early-return when the effective synthesizable text-token count
+(N) is <= 0 on both v0.9.0 Talker prefill paths:
+
+- projectToTalkerInput (standalone TTS): N = seqLen - prefix - suffix
+- buildTalkerPrefillFromSegments (Omni segments): N = assistantSegLen - offset
+
+When N <= 0 the request carried no real assistant text after stripping the
+fixed role prefix/suffix; such a prefill makes the Talker emit garbage audio
+rather than silence. LOG_ERROR and return false (no Talker decode); the caller
+drops the batch. Normal paths (N > 0) are byte-identical to upstream.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MHEXK41deYx6375K4q3MQb
+---
+ cpp/runtime/qwen3OmniTTSRuntime.cpp | 26 ++++++++++++++++++++++++++
+ 1 file changed, 26 insertions(+)
+
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 64b7225..877e484 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -823,6 +823,17 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(
+     LOG_INFO("projectToTalkerInput: seqLen=%ld, N=%ld (stripped prefix=%d suffix=%d), outputSeqLen=%ld, speakerId=%d",
+         seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId);
+ 
++    // Defensive guard: N <= 0 means the request carried no synthesizable assistant text after
++    // stripping the fixed role prefix/suffix (e.g. an empty / malformed prompt, or a wrong-tokenizer
++    // chat template that collapses the assistant turn). Feeding such a prefill into the Talker
++    // produces garbage audio rather than silence. Reject early instead of decoding nonsense.
++    if (N <= 0)
++    {
++        LOG_ERROR("projectToTalkerInput: no synthesizable text (N=%ld <= 0, seqLen=%ld); skipping Talker prefill", N,
++            seqLen);
++        return false;
++    }
++
+     // Project all tokens via text_projection MLP
+     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
+     check::check(mMLPWorkspace.reshape({seqLen, thinkerHiddenSize}), "Tensor reshape failed");
+@@ -2390,6 +2401,21 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
+ 
+     // Step 6: Fill trailing text hidden states
+     int64_t const assistantSegLen = assistantSeg.endPos - assistantSeg.startPos;
++
++    // Defensive guard: the effective synthesizable text-token count is
++    // (assistantSegLen - kAssistantTrailingOffset). When it is <= 0 the assistant turn carried no
++    // real text after the fixed role prefix (empty / malformed prompt, or a wrong-tokenizer chat
++    // template that collapses the assistant content). Decoding such a prefill produces garbage audio
++    // instead of silence, so reject early and let the caller drop this batch.
++    int64_t const effectiveTextN = assistantSegLen - kAssistantTrailingOffset;
++    if (effectiveTextN <= 0)
++    {
++        LOG_ERROR("buildTalkerPrefillFromSegments: no synthesizable text (effective N=%ld <= 0, assistantSegLen=%ld, "
++                  "offset=%d); skipping Talker prefill",
++            effectiveTextN, assistantSegLen, kAssistantTrailingOffset);
++        return false;
++    }
++
+     trailingCount = std::min(static_cast<int32_t>(assistantSegLen - kAssistantTrailingOffset),
+         static_cast<int32_t>(trailingTextHidden.getShape()[0]) - 1);
+     if (trailingCount > 0)

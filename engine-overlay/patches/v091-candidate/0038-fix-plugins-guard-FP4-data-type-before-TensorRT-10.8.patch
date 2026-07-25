@@ -1,0 +1,33 @@
+From a30fd0ed8b082843a6317fc19dbeef3e2a1a2909 Mon Sep 17 00:00:00 2001
+From: Codex Validation <codex@local.invalid>
+Date: Fri, 24 Jul 2026 17:15:17 +0800
+Subject: [PATCH 38/40] fix(plugins): guard FP4 data type before TensorRT 10.8
+
+---
+ .../fusedNvfp4GemmAllReducePlugin.cpp                     | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp b/cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp
+index 6e9866e..279b2bf 100644
+--- a/cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp
++++ b/cpp/plugins/fusedNvfp4GemmAllReducePlugin/fusedNvfp4GemmAllReducePlugin.cpp
+@@ -215,11 +215,19 @@ bool FusedNvfp4GemmAllReducePlugin::supportsFormatCombination(
+     }
+     if (pos == kFP4_ACT_IDX)
+     {
++#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+         return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
++#else
++        return desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
++#endif
+     }
+     if (pos == kFP4_WEIGHT_IDX)
+     {
++#if NV_TENSORRT_MAJOR >= 11 || (NV_TENSORRT_MAJOR == 10 && NV_TENSORRT_MINOR >= 8)
+         return desc.type == DataType::kFP4 || desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
++#else
++        return desc.type == DataType::kINT8 || desc.type == DataType::kFP8;
++#endif
+     }
+     if (pos == kFP4_ACT_SCALE_IDX)
+     {

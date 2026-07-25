@@ -9,8 +9,48 @@ Matches the official Qwen3-TTS extract_speaker_embedding mel pipeline:
   - hop=256, win=1024, n_fft=1024, n_mels=128, fmin=0, fmax=12000, sr=24000
 """
 import sys, base64, wave, numpy as np
-import librosa
 import onnxruntime as ort
+
+
+def hz_to_mel(frequencies):
+    frequencies = np.asarray(frequencies)
+    f_min, f_sp = 0.0, 200.0 / 3
+    mels = (frequencies - f_min) / f_sp
+    min_log_hz, min_log_mel = 1000.0, 15.0
+    logstep = np.log(6.4) / 27.0
+    return np.where(
+        frequencies >= min_log_hz,
+        min_log_mel + np.log(np.maximum(frequencies, min_log_hz) / min_log_hz) / logstep,
+        mels,
+    )
+
+
+def mel_to_hz(mels):
+    mels = np.asarray(mels)
+    f_min, f_sp = 0.0, 200.0 / 3
+    frequencies = f_min + f_sp * mels
+    min_log_hz, min_log_mel = 1000.0, 15.0
+    logstep = np.log(6.4) / 27.0
+    return np.where(
+        mels >= min_log_mel,
+        min_log_hz * np.exp(logstep * (mels - min_log_mel)),
+        frequencies,
+    )
+
+
+def slaney_mel_filter(sr, n_fft, n_mels, fmin, fmax):
+    fftfreqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    mel_f = mel_to_hz(
+        np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2)
+    )
+    fdiff = np.diff(mel_f)
+    ramps = mel_f[:, None] - fftfreqs[None, :]
+    weights = np.maximum(
+        0.0,
+        np.minimum(-ramps[:-2] / fdiff[:-1, None], ramps[2:] / fdiff[1:, None]),
+    )
+    weights *= (2.0 / (mel_f[2:n_mels + 2] - mel_f[:n_mels]))[:, None]
+    return weights.astype(np.float32)
 
 wav_path = sys.argv[1]
 onnx_path = sys.argv[2]
@@ -22,7 +62,12 @@ with wave.open(wav_path, "rb") as w:
     raw = w.readframes(n)
 audio = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
 if sr_orig != 24000:
-    audio = librosa.resample(audio.astype(np.float32), orig_sr=sr_orig, target_sr=24000)
+    target = int(round(len(audio) * 24000 / sr_orig))
+    audio = np.interp(
+        np.linspace(0.0, 1.0, target, endpoint=False),
+        np.linspace(0.0, 1.0, len(audio), endpoint=False),
+        audio,
+    ).astype(np.float32)
 sr = 24000
 print(f"audio: sr={sr} samples={len(audio)} dur={len(audio)/sr:.2f}s min={audio.min():.3f} max={audio.max():.3f}")
 
@@ -30,8 +75,9 @@ print(f"audio: sr={sr} samples={len(audio)} dur={len(audio)/sr:.2f}s min={audio.
 N_FFT, HOP, WIN, N_MEL = 1024, 256, 1024, 128
 FMIN, FMAX = 0, 12000
 
-# librosa slaney-norm mel filter (matches official librosa_mel_fn call)
-mel_basis = librosa.filters.mel(sr=sr, n_fft=N_FFT, n_mels=N_MEL, fmin=FMIN, fmax=FMAX, htk=False, norm='slaney')  # [n_mels, n_fft/2+1]
+# Slaney-normalized mel filter, equivalent to librosa.filters.mel(...,
+# htk=False, norm="slaney"), without requiring librosa on the target device.
+mel_basis = slaney_mel_filter(sr, N_FFT, N_MEL, FMIN, FMAX)
 hann = np.hanning(WIN).astype(np.float32)
 
 # Reflective pad matching torch: (n_fft - hop_size) // 2

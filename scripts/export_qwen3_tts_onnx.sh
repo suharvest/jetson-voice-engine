@@ -39,8 +39,8 @@ Options:
   --export-project PATH  uv export env created by setup_trt_export_env.sh. Default: /tmp/trt-export
   --trt-src PATH         TensorRT-Edge-LLM fork checkout. Default: ~/project/tensorrt-edge-llm
   --setup-env            Run scripts/setup_trt_export_env.sh before exporting.
-  --device DEVICE        cuda, cuda:0, or cpu. Default: cuda
-  --dtype DTYPE          Audio export dtype. Default: fp16
+  --device DEVICE        Compatibility option; v0.9.1 supports only cuda here.
+  --dtype DTYPE          Visual/audio export dtype. Default: fp16
   --official-only        Skip high-performance post-processing.
   --no-fp8-text-embedding
   --no-w8a16-talker
@@ -48,13 +48,14 @@ Options:
   --qwen-tts-root PATH   qwen_tts Python package root for stateful Code2Wav export.
   --code2wav-codes PATH  safetensors file containing rvq_codes [T,Q] for Code2Wav validation.
                          If omitted, a tiny synthetic file is generated.
-  --extra-llm-arg ARG    Append one raw argument to tensorrt-edgellm-export-llm. Repeatable.
-  --extra-audio-arg ARG  Append one raw argument to tensorrt-edgellm-export-audio. Repeatable.
+  --extra-llm-arg ARG    Compatibility alias: append to tensorrt-edgellm-export.
+  --extra-audio-arg ARG  Compatibility alias: append to tensorrt-edgellm-export.
   --dry-run              Print commands without executing.
 
 Output layout:
-  <out>/official/llm                 EdgeLLM talker + code_predictor official ONNX export
-  <out>/official/audio               EdgeLLM tokenizer_decoder/code2wav official ONNX export
+  <out>/official/llm                 EdgeLLM Talker ONNX export
+  <out>/official/code_predictor      EdgeLLM CodePredictor ONNX export
+  <out>/official/code2wav            EdgeLLM Code2Wav ONNX export
   <out>/highperf/talker_w8a16        Optional W8A16 + output-k talker ONNX
   <out>/highperf/code_predictor      Optional optimized/pretransposed CP ONNX
   <out>/highperf/code2wav_stateful   Optional stateful Code2Wav ONNX
@@ -169,23 +170,23 @@ PY
 }
 
 OFFICIAL_DIR="$OUT_DIR/official"
-LLM_OUT="$OFFICIAL_DIR/llm"
-AUDIO_OUT="$OFFICIAL_DIR/audio"
-mkdir -p "$LLM_OUT" "$AUDIO_OUT"
+mkdir -p "$OFFICIAL_DIR"
 
-LLM_CMD=(uv run tensorrt-edgellm-export-llm --model_dir "$MODEL_DIR" --output_dir "$LLM_OUT" --export_models talker,code_predictor --device "$DEVICE")
-if [[ ${#EXTRA_LLM_ARGS[@]} -gt 0 ]]; then LLM_CMD+=("${EXTRA_LLM_ARGS[@]}"); fi
-AUDIO_CMD=(uv run tensorrt-edgellm-export-audio --model_dir "$MODEL_DIR" --output_dir "$AUDIO_OUT" --export_models tokenizer_decoder --dtype "$DTYPE" --device "$DEVICE")
-if [[ ${#EXTRA_AUDIO_ARGS[@]} -gt 0 ]]; then AUDIO_CMD+=("${EXTRA_AUDIO_ARGS[@]}"); fi
+if [[ "$DEVICE" != "cuda" ]]; then
+  echo "TensorRT Edge-LLM v0.9.1 unified export no longer accepts --device; this wrapper supports cuda only." >&2
+  exit 6
+fi
+EXPORT_CMD=(uv run tensorrt-edgellm-export "$MODEL_DIR" "$OFFICIAL_DIR" \
+  --components talker,code_predictor,code2wav --dtype "$DTYPE")
+if [[ ${#EXTRA_LLM_ARGS[@]} -gt 0 ]]; then EXPORT_CMD+=("${EXTRA_LLM_ARGS[@]}"); fi
+if [[ ${#EXTRA_AUDIO_ARGS[@]} -gt 0 ]]; then EXPORT_CMD+=("${EXTRA_AUDIO_ARGS[@]}"); fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  run_cmd "${LLM_CMD[@]}"
-  run_cmd "${AUDIO_CMD[@]}"
+  run_cmd "${EXPORT_CMD[@]}"
 else
   (
     cd "$EXPORT_PROJECT"
-    run_cmd "${LLM_CMD[@]}"
-    run_cmd "${AUDIO_CMD[@]}"
+    run_cmd "${EXPORT_CMD[@]}"
   )
 fi
 
@@ -194,14 +195,9 @@ if [[ "$HIGH_PERF" == "1" ]]; then
   mkdir -p "$HIGHPERF_DIR"
 
   TALKER_ONNX="$(find_first "talker ONNX" \
-    "$LLM_OUT/talker/model.onnx" \
-    "$LLM_OUT/talker/talker_decode.onnx" \
-    "$LLM_OUT/onnx/talker/model.onnx" \
-    "$LLM_OUT/onnx/talker_decode.onnx")" || exit 4
+    "$OFFICIAL_DIR/llm/model.onnx")" || exit 4
   CP_ONNX="$(find_first "code_predictor ONNX" \
-    "$LLM_OUT/code_predictor/model.onnx" \
-    "$LLM_OUT/code_predictor/cp_single_head_nopast.onnx" \
-    "$LLM_OUT/onnx/code_predictor/model.onnx")" || exit 4
+    "$OFFICIAL_DIR/code_predictor/model.onnx")" || exit 4
 
   if [[ "$W8A16_TALKER" == "1" ]]; then
     QUANT_SCRIPT="$TRT_SRC/scripts/quantize_onnx_matmul_w8a16.py"
@@ -231,9 +227,8 @@ if [[ "$HIGH_PERF" == "1" ]]; then
 
   if [[ "$FP8_TEXT_EMBEDDING" == "1" ]]; then
     TEXT_EMBED="$(find_first "text embedding safetensors" \
-      "$LLM_OUT/talker/text_embedding.safetensors" \
-      "$LLM_OUT/text_embedding.safetensors" \
-      "$LLM_OUT/talker/embedding.safetensors")" || exit 4
+      "$OFFICIAL_DIR/llm/text_embedding.safetensors" \
+      "$OFFICIAL_DIR/llm/embedding.safetensors")" || exit 4
     run_cmd python3 "$SCRIPT_DIR/quantize_embedding_safetensors_fp8.py" \
       "$TEXT_EMBED" "$HIGHPERF_DIR/talker/text_embedding.safetensors" \
       --tensor-name text_embedding \
@@ -251,9 +246,7 @@ if [[ "$HIGH_PERF" == "1" ]]; then
       fi
     fi
     CODE2WAV_DIR="$(find_first_dir "tokenizer decoder ONNX dir" \
-      "$AUDIO_OUT/tokenizer_decoder" \
-      "$AUDIO_OUT/onnx/tokenizer_decoder" \
-      "$AUDIO_OUT/code2wav")" || exit 4
+      "$OFFICIAL_DIR/code2wav")" || exit 4
     run_cmd python3 "$SCRIPT_DIR/qwen3_tts_code2wav_stateful_export.py" \
       --onnx-dir "$CODE2WAV_DIR" \
       --codes "$CODE2WAV_CODES" \
@@ -278,8 +271,9 @@ cat > "$OUT_DIR/export_manifest.json" <<EOF
   "model_dir": "$MODEL_DIR",
   "device": "$DEVICE",
   "dtype": "$DTYPE",
-  "official_llm_dir": "$LLM_OUT",
-  "official_audio_dir": "$AUDIO_OUT",
+  "official_talker_dir": "$OFFICIAL_DIR/llm",
+  "official_code_predictor_dir": "$OFFICIAL_DIR/code_predictor",
+  "official_code2wav_dir": "$OFFICIAL_DIR/code2wav",
   "highperf_enabled": $HIGHPERF_JSON
 }
 EOF

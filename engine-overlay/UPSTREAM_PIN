@@ -1,37 +1,14 @@
-1ac0f2b99642045125e1c5ac7b109434ba3b36c7
-# = NVIDIA TensorRT-Edge-LLM tag v0.9.0 ("Merge pull request #122 from
-#   jhalabi-nv/dev-release/0.9.0"). PURE NVIDIA commit — no fork content.
+7f061f21f0a581ba234a1e233c9315b89d8e47d6
+# = NVIDIA TensorRT-Edge-LLM tag v0.9.1. PURE NVIDIA commit; no fork content.
 #
-# P4-1 v0.9.0 re-pin (2026-07-04): pin moved v0.8.0 (f9cc7462) -> v0.9.0 tag.
-# ALL fork content travels as overlay patches:
+# Active production migration chain (2026-07-24):
+#   addon/ + patches/v091-candidate/0001..0040, in numeric order.
 #
-#   patches/v090-sparktts-0001..0038  =  git format-patch --no-stat
-#       1ac0f2b9..integration/v090-sparktts        (fork HEAD e8c59c1)
+# The candidate removes the old v0.9.0 development-only microbenchmark add/drop
+# pair and otherwise preserves product behavior while rebasing onto v0.9.1.
+# Patches 0037..0040 are narrow JetPack 6.2 compatibility fixes discovered
+# during the Orin NX audit. See patches/v091-candidate/PATCH-STATE.md.
 #
-# The 38-commit series is the v0.9.0 rebase of the previous v080-sparktts
-# series (0001..0030) PLUS the v0.9.0-specific re-ports and export fixes:
-#   0001..0003  sm_87 build/perf (cudart shim link, cuBLAS-free tiled GEMM,
-#               warp-per-column M=1 GEMV)                     (d18bfa3 e024b2c 07d3f4f)
-#   0004..0005  ASR SessionLaneManager + maxSessionBatchSize() (d87bf38 ab54e31)
-#   0006..0023  SparkTTS mixed-precision + INT4-AWQ opt-in set, incl.
-#               mixed_precision -> bf16_residual rename        (eb03efd..d74e35b)
-#   0024        streaming worker RE-PORTED to the v0.9.0 native streaming API
-#               (slot-pool, examples/omni)                     (bc3540e)
-#   0025..0032  omni-TTS features on the new worker: N<=0 guard, CV 9-row
-#               langId, external speaker-embedding, FP8 text_embedding,
-#               language+speaker_embedding_b64 wiring, cooperative cancel,
-#               shared-engine ctors, differentiated chunking   (dcf47de..6f0fbfc)
-#   0033..0034  MOSS-TTS-Nano re-port + CMake target (examples/omni) — MOSS is
-#               now IN-SERIES; its files were REMOVED from addon/ (were
-#               addon-only on v0.8.0)                          (2a48e62 d18ddd2)
-#   0035..0038  checkpoint/export fixes (fp32 cast, ASR mrope, base-export
-#               guard demotion, codec_language_id)             (13be473..e8c59c1)
-#
-# Apply chain (build.sh): addon/ + v090-sparktts-0001..0038 (in order)
-#                         + 0001-orin-tegra-build-compat (REBASED onto v0.9.0).
-# Dry-run verified 2026-07-04 (Mac, git apply --check + apply): full chain
-# CLEAN on 1ac0f2b9; resulting tracked tree == integration/v090-sparktts
-# (diff shows only addon files + 0001's 3 build-compat files).
-#
-# upstream remote: https://github.com/NVIDIA/TensorRT-Edge-LLM.git (this SHA
-# is the public NVIDIA v0.9.0 tag; the suharvest fork also carries it).
+# v0.8.0/v0.9.0 profiles, manifests, patches, images, and engine directories are
+# retained as rollback/history. Never combine their plugin, worker, or engine
+# binaries with this v0.9.1 chain.

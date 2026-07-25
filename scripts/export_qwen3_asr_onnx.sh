@@ -37,21 +37,21 @@ Required:
 Options:
   --export-project PATH  uv export env created by setup_trt_export_env.sh. Default: /tmp/trt-export
   --setup-env            Run scripts/setup_trt_export_env.sh before exporting.
-  --device DEVICE        cuda, cuda:0, or cpu. Default: cuda
+  --device DEVICE        Compatibility option; v0.9.1 supports only cuda here.
   --dtype DTYPE          Audio export dtype. Default: fp16
-  --export-models LIST   Optional LLM export filter, e.g. thinker. Default: EdgeLLM default.
+  --export-models LIST   Compatibility option for LLM components. Default: thinker.
   --reduced-vocab-dir P  Optional EdgeLLM reduced vocab dir.
-  --chat-template P      Optional chat template JSON.
+  --chat-template P      Removed by v0.9.1 unified export; using it fails.
   --fp8-embedding        Export LLM embedding sidecar as FP8 when supported.
-  --trt-native-ops       Request TRT native ops during LLM export.
-  --audio-quantization Q Optional audio quantization, currently EdgeLLM accepts fp8.
-  --extra-llm-arg ARG    Append one raw argument to tensorrt-edgellm-export-llm. Repeatable.
-  --extra-audio-arg ARG  Append one raw argument to tensorrt-edgellm-export-audio. Repeatable.
+  --trt-native-ops       Removed by v0.9.1 unified export; using it fails.
+  --audio-quantization Q Removed by v0.9.1 unified export; using it fails.
+  --extra-llm-arg ARG    Compatibility alias: append to tensorrt-edgellm-export.
+  --extra-audio-arg ARG  Compatibility alias: append to tensorrt-edgellm-export.
   --dry-run              Print commands without executing.
 
 Output layout:
-  <out>/llm      Qwen3-ASR thinker/LLM ONNX + sidecars from tensorrt-edgellm-export-llm
-  <out>/audio    Qwen3-ASR audio_encoder ONNX + config from tensorrt-edgellm-export-audio
+  <out>/llm      Qwen3-ASR thinker ONNX + sidecars
+  <out>/audio    Qwen3-ASR audio encoder ONNX + config
 EOF
 }
 
@@ -105,28 +105,29 @@ run_cmd() {
 
 LLM_OUT="$OUT_DIR/llm"
 AUDIO_OUT="$OUT_DIR/audio"
-mkdir -p "$LLM_OUT" "$AUDIO_OUT"
 
-LLM_CMD=(uv run tensorrt-edgellm-export-llm --model_dir "$MODEL_DIR" --output_dir "$LLM_OUT" --device "$DEVICE")
-if [[ -n "$EXPORT_MODELS" ]]; then LLM_CMD+=(--export_models "$EXPORT_MODELS"); fi
-if [[ -n "$REDUCED_VOCAB_DIR" ]]; then LLM_CMD+=(--reduced_vocab_dir "$REDUCED_VOCAB_DIR"); fi
-if [[ -n "$CHAT_TEMPLATE" ]]; then LLM_CMD+=(--chat_template "$CHAT_TEMPLATE"); fi
-if [[ "$FP8_EMBEDDING" == "1" ]]; then LLM_CMD+=(--fp8_embedding); fi
-if [[ "$TRT_NATIVE_OPS" == "1" ]]; then LLM_CMD+=(--trt_native_ops); fi
-if [[ ${#EXTRA_LLM_ARGS[@]} -gt 0 ]]; then LLM_CMD+=("${EXTRA_LLM_ARGS[@]}"); fi
-
-AUDIO_CMD=(uv run tensorrt-edgellm-export-audio --model_dir "$MODEL_DIR" --output_dir "$AUDIO_OUT" --export_models audio_encoder --dtype "$DTYPE" --device "$DEVICE")
-if [[ -n "$AUDIO_QUANTIZATION" ]]; then AUDIO_CMD+=(--quantization "$AUDIO_QUANTIZATION"); fi
-if [[ ${#EXTRA_AUDIO_ARGS[@]} -gt 0 ]]; then AUDIO_CMD+=("${EXTRA_AUDIO_ARGS[@]}"); fi
+if [[ "$DEVICE" != "cuda" ]]; then
+  echo "TensorRT Edge-LLM v0.9.1 unified export no longer accepts --device; this wrapper supports cuda only." >&2
+  exit 6
+fi
+if [[ -n "$CHAT_TEMPLATE" || "$TRT_NATIVE_OPS" == "1" || -n "$AUDIO_QUANTIZATION" ]]; then
+  echo "One or more requested legacy export options do not exist in TensorRT Edge-LLM v0.9.1." >&2
+  exit 6
+fi
+LLM_COMPONENTS="${EXPORT_MODELS:-thinker}"
+EXPORT_CMD=(uv run tensorrt-edgellm-export "$MODEL_DIR" "$OUT_DIR" \
+  --components "${LLM_COMPONENTS},audio" --dtype "$DTYPE")
+if [[ -n "$REDUCED_VOCAB_DIR" ]]; then EXPORT_CMD+=(--reduced-vocab-dir "$REDUCED_VOCAB_DIR"); fi
+if [[ "$FP8_EMBEDDING" == "1" ]]; then EXPORT_CMD+=(--fp8-embedding); fi
+if [[ ${#EXTRA_LLM_ARGS[@]} -gt 0 ]]; then EXPORT_CMD+=("${EXTRA_LLM_ARGS[@]}"); fi
+if [[ ${#EXTRA_AUDIO_ARGS[@]} -gt 0 ]]; then EXPORT_CMD+=("${EXTRA_AUDIO_ARGS[@]}"); fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  run_cmd "${LLM_CMD[@]}"
-  run_cmd "${AUDIO_CMD[@]}"
+  run_cmd "${EXPORT_CMD[@]}"
 else
   (
     cd "$EXPORT_PROJECT"
-    run_cmd "${LLM_CMD[@]}"
-    run_cmd "${AUDIO_CMD[@]}"
+    run_cmd "${EXPORT_CMD[@]}"
   )
 fi
 

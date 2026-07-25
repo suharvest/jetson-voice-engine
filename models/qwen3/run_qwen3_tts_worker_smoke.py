@@ -36,7 +36,19 @@ def main() -> None:
     parser.add_argument("--cp-dir", required=True)
     parser.add_argument("--plugin-path", required=True)
     parser.add_argument("--text", default="你好")
+    parser.add_argument(
+        "--text-base64",
+        default="",
+        help="UTF-8 request text encoded as Base64; overrides --text.",
+    )
     parser.add_argument("--language", default="chinese")
+    parser.add_argument("--speaker", default="serena")
+    parser.add_argument(
+        "--speaker-embedding-b64-file",
+        default="",
+        help="Base-model external speaker embedding. When set, omit the named speaker.",
+    )
+    parser.add_argument("--max-slots", type=int, default=1)
     parser.add_argument("--max-audio-length", type=int, default=50)
     parser.add_argument("--min-audio-length", type=int, default=10)
     parser.add_argument("--first-chunk-frames", type=int, default=25)
@@ -62,33 +74,56 @@ def main() -> None:
     parser.add_argument("--predictor-top-p", type=float, default=0.8)
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     args = parser.parse_args()
+    if args.text_base64:
+        args.text = base64.b64decode(args.text_base64, validate=True).decode("utf-8")
+    speaker_embedding_b64 = ""
+    if args.speaker_embedding_b64_file:
+        with open(args.speaker_embedding_b64_file, encoding="utf-8") as embedding_file:
+            speaker_embedding_b64 = embedding_file.read().strip()
+        if not speaker_embedding_b64:
+            parser.error("--speaker-embedding-b64-file is empty")
 
     env = os.environ.copy()
     env["EDGELLM_PLUGIN_PATH"] = args.plugin_path
     env["EDGE_LLM_TTS_LAZY_CODE2WAV"] = "0" if args.preload_code2wav else "1"
     env["EDGE_LLM_TTS_CUDA_GRAPH"] = "1" if args.cuda_graph else "0"
 
+    help_result = subprocess.run(
+        [args.worker, "--help"],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    worker_help = help_result.stdout + help_result.stderr
     cmd = [
         args.worker,
         "--talkerEngineDir",
         args.talker_dir,
-        "--qwen3TtsTalkerBackend",
-        "qwen3_tts_explicit_kv",
-        "--qwen3TtsTalkerEngine",
-        args.talker_engine,
         "--tokenizerDir",
         args.tokenizer_dir,
         "--code2wavEngineDir",
         args.code2wav_dir,
         "--codePredictorEngineDir",
         args.cp_dir,
-        "--codePredictorBackend",
-        "qwen3_tts_native",
-        "--qwen3TtsTextProjection",
-        "host_fp32",
-        "--qwen3TtsPromptKvCache",
-        "0",
+        "--max_slots",
+        str(args.max_slots),
     ]
+    if "--qwen3TtsTalkerBackend" in worker_help:
+        cmd.extend(
+            [
+                "--qwen3TtsTalkerBackend",
+                "qwen3_tts_explicit_kv",
+                "--qwen3TtsTalkerEngine",
+                args.talker_engine,
+                "--codePredictorBackend",
+                "qwen3_tts_native",
+                "--qwen3TtsTextProjection",
+                "host_fp32",
+                "--qwen3TtsPromptKvCache",
+                "0",
+            ]
+        )
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
@@ -141,6 +176,10 @@ def main() -> None:
             "repetition_penalty": args.repetition_penalty,
             "codec_eos_logit_offset": 0.0,
         }
+        if speaker_embedding_b64:
+            req["speaker_embedding_b64"] = speaker_embedding_b64
+        else:
+            req["speaker"] = args.speaker
         start = time.time()
         proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         proc.stdin.flush()

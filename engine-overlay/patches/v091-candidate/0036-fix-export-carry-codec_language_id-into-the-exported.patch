@@ -1,0 +1,76 @@
+From 9f2e7dbd80558db29d0df25011dbd34183a832ec Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 4 Jul 2026 01:35:41 +0800
+Subject: [PATCH 36/40] fix(export): carry codec_language_id into the exported
+ Talker config at the factory
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The CustomVoice checkpoint stores the language-name -> codec-token map as
+codec_language_id, and the C++ runtime (qwen3OmniTTSRuntime.cpp::loadConfig)
+reads it from the exported talker/config.json to build the 9-row
+language-conditioned prefill. _patch_tts_config — the single choke point
+where both the fp16 direct export and the int4 stage2 quantization export
+assemble the talker config — carried every codec_* scalar except this map,
+so quantized exports shipped without it, the runtime loaded 0 entries, and
+CustomVoice language conditioning silently degraded to the 8-row
+no-language prefix. The equivalent v0.7.1 fix (1668470) landed in the old
+experimental/llm_loader/export_all_cli.py and never reached this branch's
+tensorrt_edgellm export chain.
+
+Forward codec_language_id through the existing talker_cfg -> root_config
+pick chain (covers both the nested HF layout and the stage2 verbatim root
+copy), and add codec_language_id + codec_think_id to
+_write_standalone_talker_config so the standalone quant-talker extraction
+does not drop them before the downstream patch step. Carry-if-present only:
+non-CustomVoice checkpoints get no key injected, and re-patching an
+already-correct config is byte-identical, so the fp16 path and other model
+types are unaffected.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MHEXK41deYx6375K4q3MQb
+---
+ tensorrt_edgellm/quantization/qwen3_omni.py |  2 ++
+ tensorrt_edgellm/scripts/export.py          | 11 +++++++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/tensorrt_edgellm/quantization/qwen3_omni.py b/tensorrt_edgellm/quantization/qwen3_omni.py
+index f5e8b7e..1136704 100644
+--- a/tensorrt_edgellm/quantization/qwen3_omni.py
++++ b/tensorrt_edgellm/quantization/qwen3_omni.py
+@@ -432,10 +432,12 @@ def _write_standalone_talker_config(talker_text_dict: dict, talker_dict: dict,
+         "vision_start_token_id",
+         "codec_bos_id",
+         "codec_eos_token_id",
++        "codec_language_id",
+         "codec_nothink_id",
+         "codec_pad_id",
+         "codec_think_bos_id",
+         "codec_think_eos_id",
++        "codec_think_id",
+         "num_code_groups",
+         "speaker_id",
+         "thinker_hidden_size",
+diff --git a/tensorrt_edgellm/scripts/export.py b/tensorrt_edgellm/scripts/export.py
+index 9ae4d33..d3539e6 100644
+--- a/tensorrt_edgellm/scripts/export.py
++++ b/tensorrt_edgellm/scripts/export.py
+@@ -1845,6 +1845,17 @@ def _patch_tts_config(model_dir: str, out_dir: str) -> None:
+         if v is not None:
+             cfg[key] = v
+ 
++    # CustomVoice language conditioning map: language name -> codec token id.
++    # The C++ runtime (qwen3OmniTTSRuntime.cpp::loadConfig) reads this dict to
++    # build the 9-row language-conditioned Talker prefill; when the map is
++    # missing it loads 0 entries and silently degrades to the 8-row
++    # no-language prefix. The fp16 direct export and the int4 stage2 export
++    # both assemble the talker config here, so carrying it here fixes both.
++    # Optional for non-CustomVoice models (absent key -> nothing written).
++    lang_map = pick("codec_language_id")
++    if isinstance(lang_map, dict) and lang_map:
++        cfg["codec_language_id"] = lang_map
++
+     # tts_model_type (only present in root config, not talker_config).
+     if "tts_model_type" in root_config:
+         cfg["tts_model_type"] = root_config["tts_model_type"]

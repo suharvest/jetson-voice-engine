@@ -10,9 +10,8 @@
 # After setup, activate with:
 #   cd /tmp/trt-export && uv run <export-command>
 #
-# Export commands:
-#   uv run tensorrt-edgellm-export-llm --model_dir <HF_SNAP> --output_dir <OUT> [--export_models talker] --device cuda
-#   uv run tensorrt-edgellm-export-audio --model_dir <HF_SNAP> --output_dir <OUT> [--export_models audio_encoder|tokenizer_decoder|speaker_encoder] --device cuda
+# v0.9.1 unified export command:
+#   uv run tensorrt-edgellm-export <HF_SNAP> <OUT> [--components thinker,audio]
 
 set -euo pipefail
 
@@ -152,5 +151,5 @@ echo "Environment ready at: $PROJECT_DIR"
 echo ""
 echo "Usage examples:"
 echo "  cd $PROJECT_DIR"
-echo "  uv run tensorrt-edgellm-export-llm --model_dir <HF_SNAP> --output_dir <OUT> --device cuda"
-echo "  uv run tensorrt-edgellm-export-audio --model_dir <HF_SNAP> --output_dir <OUT> --export_models tokenizer_decoder --device cuda"
+echo "  uv run tensorrt-edgellm-export <HF_SNAP> <OUT> --components thinker,audio"
+echo "  uv run tensorrt-edgellm-export <HF_SNAP> <OUT> --components talker,code_predictor,code2wav"

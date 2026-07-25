@@ -177,21 +177,19 @@ full patched source tree at build time instead of vendoring it:
 
 ```
 engine-overlay/
-  UPSTREAM_PIN       # exact NVIDIA commit (364769036… = tag v0.7.1)
+  UPSTREAM_PIN       # exact NVIDIA commit (7f061f21… = tag v0.9.1)
   upstream.remote    # https://github.com/NVIDIA/TensorRT-Edge-LLM.git
-  addon/             # 40 new files upstream does not have, at original relative paths
-  patches/           # 8 theme patches (0001..0008) applied over the pin → 27 modified files
+  addon/             # additive product files at original relative paths
+  patches/           # active v091-candidate/0001..0040 plus rollback history
   build.sh           # clone upstream@pin → copy addon → apply patches → build (Jetson host)
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a) upstreamable / (b) carried classification + PR/retirement plan
   README.md          # overlay model, addon-vs-patch discipline, reproduction
 ```
 
-Patches `0001..0008` cover: Orin/Tegra build compat, weight-streaming budget,
-ASR streaming session, TTS slot-pool concurrency, CustomVoice language
-conditioning, server SSE-disconnect + OpenAI API, OpenAI API docs, and misc
-example registration. Manifests pin reproducible builds for `qwen3-tts-highperf-sm87`,
-`qwen3-asr-sm87`, and `customvoice-v071`.
+The active v0.9.1 series conservatively carries the voice/product features and
+adds four isolated JP6.2 compatibility fixes. Manifests pin reproducible builds
+for `qwen3-tts-highperf-sm87`, `qwen3-asr-sm87`, and `customvoice-v091`.
 
 Reproduce the patched tree (no CUDA needed) or do a full Jetson build:
 
@@ -201,8 +199,9 @@ cd engine-overlay
 ./build.sh manifests/qwen3-tts-highperf-sm87.toml    # full build on Orin / sm_87
 ```
 
-> **Build-verify is DEFERRED** until run on a Jetson CUDA/TensorRT host (Orin,
-> sm_87). `build.sh` refuses to compile on non-aarch64. See
+> The complete source chain has built on Orin NX for fallback and local-SM87
+> CuTe variants. Fresh-engine runtime qualification remains required.
+> `build.sh` refuses to compile on non-aarch64. See
 > `engine-overlay/README.md` and `engine-overlay/DIVERGENCE.md` for details,
 > including the **SSE/client-disconnect fix (patch `0006`) which is
 > PR-pending — do NOT auto-submit**.

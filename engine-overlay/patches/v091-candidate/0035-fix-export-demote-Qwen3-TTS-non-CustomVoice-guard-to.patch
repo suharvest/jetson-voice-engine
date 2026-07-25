@@ -1,0 +1,39 @@
+From 8c94d82690b18a98d447c52d47c775e19fbf6e3c Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 4 Jul 2026 01:09:27 +0800
+Subject: [PATCH 35/40] feat(export): allow Qwen3-TTS Base components
+
+The hard p.error() in main() blocked exporting Qwen3-TTS Base
+checkpoints even though the Talker, CodePredictor, and Code2Wav
+exporters already handle them. Allow the known "base" type, retain a
+fail-loud error for unknown TTS variants, and state explicitly that the
+component export does not include a speaker encoder.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MHEXK41deYx6375K4q3MQb
+---
+ tensorrt_edgellm/scripts/export.py | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/tensorrt_edgellm/scripts/export.py b/tensorrt_edgellm/scripts/export.py
+index e2e8df7..9ae4d33 100644
+--- a/tensorrt_edgellm/scripts/export.py
++++ b/tensorrt_edgellm/scripts/export.py
+@@ -2621,8 +2621,13 @@ def main() -> None:
+ 
+-    if (model_type == "qwen3_tts"
+-            and config.get("tts_model_type") != "custom_voice"):
+-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
+-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
++    if model_type == "qwen3_tts":
++        tts_model_type = config.get("tts_model_type")
++        if tts_model_type not in ("custom_voice", "base"):
++            p.error("Only Qwen3-TTS CustomVoice and Base checkpoints are "
++                    f"supported. Got tts_model_type={tts_model_type!r}.")
++        if tts_model_type == "base":
++            logger.warning(
++                "Qwen3-TTS Base component export does not include a speaker "
++                "encoder; provide one separately for voice cloning.")
+ 
+     if args.eagle_base and args.mtp:
+         p.error("--eagle-base and --mtp cannot be enabled together")

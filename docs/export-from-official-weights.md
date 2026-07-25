@@ -4,17 +4,20 @@ This repo does not require users to download our ONNX files. A user can start
 from the official Qwen3 ASR/TTS Hugging Face snapshots, export ONNX with the
 TensorRT-Edge-LLM fork, then build device-specific TensorRT engines on Jetson.
 
-## 1. Prepare the EdgeLLM fork
+## 1. Prepare TensorRT Edge-LLM v0.9.1
 
 ```bash
-git clone https://github.com/suharvest/TensorRT-Edge-LLM.git
+git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git
 cd TensorRT-Edge-LLM
-git checkout qwen3-tts-highperf-runtime-w8a16
+git checkout 7f061f21f0a581ba234a1e233c9315b89d8e47d6
 git submodule update --init --recursive
 ```
 
-Use `official-qwen3-tts-upstream-runtime` instead if you only want the
-minimal-diff upstream-review path.
+CustomVoice uses this official exporter directly. Qwen3-TTS Base remains a
+local extension because the official CLI rejects `tts_model_type=base` and the
+official runtime has no external speaker-embedding request field. Apply the
+reviewed v0.9.1 overlay only for Base; do not relabel old v0.8/v0.9 ONNX as a
+v0.9.1 export.
 
 ## 2. Create the WSL2/x86 export uv environment
 
@@ -73,7 +76,10 @@ Optional knobs:
 
 - `--export-models thinker` if you want to force the LLM export filter.
 - `--reduced-vocab-dir <dir>` for vocab-pruned experiments.
-- `--audio-quantization fp8` for audio encoder quantization experiments.
+
+The old `--audio-quantization`, `--trt-native-ops`, and `--chat-template`
+wrapper options are rejected because the v0.9.1 unified exporter does not
+provide those flags.
 
 Production default for our current profile is full vocab; pruning is not
 enabled by default.
@@ -94,8 +100,9 @@ scripts/export_qwen3_tts_onnx.sh \
 
 Output:
 
-- `/tmp/qwen3-tts-onnx/official/llm`: official Talker + CodePredictor ONNX.
-- `/tmp/qwen3-tts-onnx/official/audio`: official tokenizer decoder ONNX.
+- `/tmp/qwen3-tts-onnx/official/llm`: official Talker ONNX and sidecars.
+- `/tmp/qwen3-tts-onnx/official/code_predictor`: official CodePredictor ONNX.
+- `/tmp/qwen3-tts-onnx/official/code2wav`: official Code2Wav ONNX.
 - `/tmp/qwen3-tts-onnx/highperf/talker_w8a16`: W8A16 Talker ONNX variants.
 - `/tmp/qwen3-tts-onnx/highperf/code_predictor`: optimized/pretransposed CP ONNX.
 - `/tmp/qwen3-tts-onnx/highperf/code2wav_stateful`: stateful Code2Wav ONNX.
@@ -109,6 +116,24 @@ Stateful Code2Wav export validates against RVQ codes. If `--code2wav-codes` is
 not provided, the wrapper creates a tiny synthetic `rvq_codes` safetensors file
 for interface export. For quality validation, pass real RVQ codes captured from
 Talker output.
+
+For the Base extension, use the fail-loud driver rather than this general
+wrapper:
+
+```bash
+TTS_BASE_UPSTREAM=/path/to/patched-v0.9.1 \
+TTS_BASE_MODEL=/models/Qwen3-TTS-12Hz-0.6B-Base \
+TTS_BASE_MODEL_REVISION=<immutable-hf-revision> \
+TTS_BASE_OUTPUT=/tmp/qwen3-tts-base-v091 \
+TTS_BASE_PRECISION=int4 \
+TTS_BASE_STAGE2_CHECKPOINT=/models/base-int4-stage2 \
+TTS_BASE_STAGE2_REVISION=<driver-commit> \
+  engine-overlay/drivers/export-qwen3-tts-base-v091.sh
+```
+
+The driver verifies the exact official v0.9.1 base SHA, refuses an unpatched
+CustomVoice-only exporter, loads all ONNX external data, runs
+`onnx.checker`, and writes complete checksums and provenance.
 
 ## 5. Build TensorRT engines on Jetson
 

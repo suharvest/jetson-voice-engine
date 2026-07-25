@@ -1,0 +1,45 @@
+[upstream]
+version = "v0.9.1"
+pin = "7f061f21f0a581ba234a1e233c9315b89d8e47d6"
+remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
+
+[patches]
+directory = "patches/v091-candidate"
+first = "0001"
+last = "0041"
+count = 41
+
+[target]
+device = "jetson-orin-nx"
+sm = "87"
+cuda = "12.6"
+tensorrt = "10.3"
+l4t = "36.4.3"
+
+[driver]
+required_env = "EDGELLM_SPARK_LLM_DRIVER"
+required_outputs = ["llm.engine", "token-gate.json", "DRIVER_REVISION", "PROVENANCE.md"]
+token_gate_global_count = 32
+
+[model.bf16]
+mode = "bf16"
+artifact_root = "engines/sparktts-bf16"
+
+[model.w4a16]
+mode = "w4a16"
+artifact_root = "engines/sparktts-w4a16"
+
+[artifacts]
+root = "/opt/edgellm-v091"
+required = [
+  "engines/sparktts-bf16/llm.engine",
+  "engines/sparktts-bf16/token-gate.json",
+  "engines/sparktts-bf16/DRIVER_REVISION",
+  "engines/sparktts-bf16/PROVENANCE.md",
+  "engines/sparktts-w4a16/llm.engine",
+  "engines/sparktts-w4a16/token-gate.json",
+  "engines/sparktts-w4a16/DRIVER_REVISION",
+  "engines/sparktts-w4a16/PROVENANCE.md",
+]
+provenance_required = true
+sha256_required = true
