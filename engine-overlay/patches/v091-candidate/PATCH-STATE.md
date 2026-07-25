@@ -89,6 +89,15 @@ post-reverse untracked tree:           addon/ only
 optionally replay against a supplied clean upstream checkout. `build.sh
 --apply-only` exercises the complete materialization contract.
 
+For release builds, `build.sh` additionally parses the selected TOML manifest
+and verifies the recorded hashes for upstream `series`, `LOCK`,
+`SHA256SUMS`, local `series`, and local `SHA256SUMS` before any clone/build
+work. The integrity test binds LOCK and both checksum files to the exact
+series order/set and, when official objects are supplied, verifies every
+commit's real parent, tree, and patch-id. Provenance inputs are marked
+`-text`; exact upstream mail patches are also `-whitespace`, so
+`core.autocrlf=true` cannot change release bytes.
+
 ## Device and release gate
 
 The former 41-patch chain passed Orin NX fallback/CuTe builds and the complete

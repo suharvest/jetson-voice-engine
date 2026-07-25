@@ -41,6 +41,25 @@ MANIFEST="${1:-}"
 APPLY_ONLY=0
 [ "${MANIFEST}" = "--apply-only" ] && { APPLY_ONLY=1; MANIFEST=""; }
 
+if [ "${APPLY_ONLY}" -eq 0 ]; then
+  if [ -z "${MANIFEST}" ]; then
+    echo "ERROR: build manifest required (manifests/*.toml). Usage: build.sh manifests/<name>.toml" >&2
+    exit 2
+  fi
+  if [ ! -f "${MANIFEST}" ] && [ -f "${HERE}/${MANIFEST}" ]; then
+    MANIFEST="${HERE}/${MANIFEST}"
+  fi
+  if [ ! -f "${MANIFEST}" ]; then
+    echo "ERROR: build manifest does not exist: ${MANIFEST}" >&2
+    exit 2
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 is required to parse and verify the build manifest" >&2
+    exit 2
+  fi
+  python3 "${HERE}/validate-manifest.py" "${HERE}" "${MANIFEST}" "${PIN}"
+fi
+
 echo "==> UPSTREAM_PIN : ${PIN}"
 echo "==> upstream     : ${REMOTE}"
 echo "==> workdir      : ${WORKDIR}"
@@ -181,11 +200,7 @@ if [ "${APPLY_ONLY}" -eq 1 ]; then
   exit 0
 fi
 
-# --- 4. build (JETSON ONLY) ---------------------------------------------------
-if [ -z "${MANIFEST}" ]; then
-  echo "ERROR: build manifest required (manifests/*.toml). Usage: build.sh manifests/<name>.toml" >&2
-  exit 2
-fi
+# --- 5. build (JETSON ONLY) ---------------------------------------------------
 case "$(uname -m)" in
   aarch64) ;;  # Jetson/Orin OK
   *) echo "ERROR: compile step requires aarch64 Jetson host (sm_87 + CUDA/TRT). Aborting on $(uname -m)." >&2

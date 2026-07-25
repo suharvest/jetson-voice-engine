@@ -1,4 +1,9 @@
-# Byte-exact `git format-patch` mail files intentionally contain diff context
-# prefixes and the conventional "-- " signature separator. Do not reinterpret
-# those payload bytes as whitespace errors in the containing repository.
-engine-overlay/patches/upstream-v091-prs/*.patch -whitespace
+# Patch/provenance files are byte-addressed release inputs. Never apply Git
+# newline conversion to them, including in core.autocrlf=true checkouts.
+engine-overlay/patches/upstream-v091-prs/*.patch -text -whitespace
+engine-overlay/patches/upstream-v091-prs/series -text
+engine-overlay/patches/upstream-v091-prs/LOCK -text
+engine-overlay/patches/upstream-v091-prs/SHA256SUMS -text
+engine-overlay/patches/v091-candidate/*.patch -text
+engine-overlay/patches/v091-candidate/series -text
+engine-overlay/patches/v091-candidate/SHA256SUMS -text

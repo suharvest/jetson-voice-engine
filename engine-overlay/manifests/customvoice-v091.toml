@@ -8,13 +8,16 @@ remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
 directory = "patches/upstream-v091-prs"
 series = "patches/upstream-v091-prs/series"
 lock = "patches/upstream-v091-prs/LOCK"
+checksums = "patches/upstream-v091-prs/SHA256SUMS"
 count = 7
 series_sha256 = "9fe8677a4c6886a4b7d8d253a245b6d95509d26a7fe8072eb0de6ed83633c733"
 lock_sha256 = "b0801bf42906734054bb5fe9213f216d580da663192e9db178ca423e9cb90fd2"
+checksums_sha256 = "01024e81bc571215e9fb19a897d1012eb90fd3f7b2c27e7a69c2f97de42a085d"
 
 [patches]
 directory = "patches/v091-candidate"
 series = "patches/v091-candidate/series"
+checksums = "patches/v091-candidate/SHA256SUMS"
 count = 36
 sparse_numbering = true
 series_sha256 = "6da94187e947354381fc0d0a9ecf944fe59e922bb0112e7e598b4a5dbc98bc88"

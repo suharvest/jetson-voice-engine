@@ -87,6 +87,17 @@ commit history so not cleanly base-splittable on the read-only fork).
 ./build.sh manifests/qwen3-tts-highperf-sm87.toml
 ```
 
+Full builds parse the TOML manifest and verify its pinned upstream/local
+series, LOCK, and SHA256SUMS hashes before clone, submodule initialization, or
+compilation. `--apply-only` intentionally has no artifact manifest.
+
+Offline provenance gates:
+
+```bash
+tests/verify-patch-stack.sh /path/to/official-checkout-with-locked-objects
+tests/test-provenance-negative.sh /path/to/official-checkout-with-locked-objects
+```
+
 ## Build-verify status
 
 The predecessor 41-patch source built on Orin NX in both fallback and
