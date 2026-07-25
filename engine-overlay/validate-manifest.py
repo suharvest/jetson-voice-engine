@@ -163,8 +163,8 @@ def main() -> None:
                 "[patches].checksums_sha256")
     local_entries = series_entries(local_series)
     local_count = value(local, "patches", "count", int)
-    if local_count != 36 or local_count != len(local_entries):
-        fail("[patches].count must be 36 and match series")
+    if local_count != 35 or local_count != len(local_entries):
+        fail("[patches].count must be 35 and match series")
     if local.get("sparse_numbering") is not True:
         fail("[patches].sparse_numbering must be true")
 

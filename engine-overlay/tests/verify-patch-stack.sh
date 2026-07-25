@@ -51,7 +51,7 @@ read_series() {
 
 read_series "${UPSTREAM_DIR}" "${UPSTREAM_DIR}/series" 7 "proposed-upstream"
 UPSTREAM_SERIES=("${SERIES[@]}")
-read_series "${LOCAL_DIR}" "${LOCAL_DIR}/series" 36 "local-product"
+read_series "${LOCAL_DIR}" "${LOCAL_DIR}/series" 35 "local-product"
 LOCAL_SERIES=("${SERIES[@]}")
 
 verify_sums() {
@@ -122,7 +122,7 @@ done
 verify_sums "${LOCAL_DIR}" "${LOCAL_DIR}/SHA256SUMS" \
   "local-product" "${LOCAL_SERIES[@]}"
 
-for retired in 0033 0034 0037 0038 0040; do
+for retired in 0033 0034 0037 0038 0039 0040; do
   if find "${LOCAL_DIR}" -maxdepth 1 -type f -name "${retired}-*.patch" | grep -q .; then
     die "retired local patch ${retired} is still present"
   fi
@@ -134,14 +134,7 @@ if grep -q '_set_tensor' "${patch_0009}"; then
   die "0009 still duplicates upstream checkpoint dtype behavior"
 fi
 
-patch_0039="${LOCAL_DIR}/0039-fix-cmake-propagate-CuTe-shim-driver-and-wrap-requir.patch"
-grep -q 'PUBLIC "${CUDA_DRIVER_LIB}"' "${patch_0039}" \
-  || die "0039 lost residual CUDA driver propagation"
-if grep -q 'cudart_shim\|wrap=_cudaLaunchKernelEx' "${patch_0039}"; then
-  die "0039 still duplicates PR #118 shim/wrap propagation"
-fi
-
-echo "integrity: 7 exact proposed-upstream + 36 sparse local patches PASS"
+echo "integrity: 7 exact proposed-upstream + 35 sparse local patches PASS"
 
 if [ -z "${REPLAY_SOURCE}" ]; then
   echo "replay: SKIP (pass a clean upstream checkout or set EDGELLM_UPSTREAM_CHECKOUT)"
@@ -217,7 +210,7 @@ for file in "${LOCAL_SERIES[@]}"; do
   git -C "${REPLAY}" apply "${LOCAL_DIR}/${file}"
 done
 git -C "${REPLAY}" diff --check
-echo "forward replay: 7/7 + 36/36 PASS"
+echo "forward replay: 7/7 + 35/35 PASS"
 
 for ((index=${#LOCAL_SERIES[@]} - 1; index >= 0; index--)); do
   file="${LOCAL_SERIES[index]}"
@@ -242,4 +235,4 @@ diff -u "${expected_addon}" "${actual_addon}" \
   || die "post-reverse untracked tree is not addon-only"
 rm -f "${expected_addon}" "${actual_addon}"
 
-echo "reverse replay: 36/36 + 7/7; official tracked tree + addon-only PASS"
+echo "reverse replay: 35/35 + 7/7; official tracked tree + addon-only PASS"

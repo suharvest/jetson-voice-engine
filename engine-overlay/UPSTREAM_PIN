@@ -4,7 +4,7 @@
 # Active normalized migration chain (2026-07-25):
 #   patches/upstream-v091-prs/series (7 exact proposed-upstream commits)
 #   + addon/
-#   + patches/v091-candidate/series (36 sparse product patches).
+#   + patches/v091-candidate/series (35 sparse product patches).
 #
 # The candidate removes the old v0.9.0 development-only microbenchmark add/drop
 # pair and retires generic local duplicates now carried byte-exact from PR

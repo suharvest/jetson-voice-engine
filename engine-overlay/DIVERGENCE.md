@@ -4,7 +4,7 @@
 upstream:       github.com/NVIDIA/TensorRT-Edge-LLM (Apache 2.0)
 UPSTREAM_PIN:   7f061f21f0a581ba234a1e233c9315b89d8e47d6   (= tag v0.9.1, pure NVIDIA)
 upstream set:   upstream-v091-prs/series (7 exact commits; PR #118/#145–149)
-local series:   v091-candidate/series (36 sparse product/residual patches)
+local series:   v091-candidate/series (35 sparse product patches)
 normalized:     2026-07-25 — see patches/v091-candidate/PATCH-STATE.md
 ```
 
@@ -24,8 +24,11 @@ normalized:     2026-07-25 — see patches/v091-candidate/PATCH-STATE.md
 > - PR #149: destination checkpoint dtype (retired local `0033`, reduced
 >   local `0009` to its BF16Linear tied-weight hunk).
 >
-> Local `0039` is reduced to CUDA driver PUBLIC propagation only and remains
-> pending final-link A/B validation. Do not retire it from documentation alone.
+> Local `0039` is retired and is not an upstream candidate. Normalized Orin
+> product A/B removed its CUDA driver PUBLIC edge while plugin,
+> `llm_inference`, Qwen3 TTS, MOSS, ASR, and Spark worker builds all passed;
+> final link retained wrap/CuTe/shim/libcuda and `ldd -r` passed. PR #118's
+> generic shim/wrap propagation remains the upstreamable fix.
 >
 > 2026-07-04 起本文件的逐主题条目部分基于 v0.7.1 提取(UPSTREAM_PIN 364769,
 > fork v071/customvoice-product),patch 编号/scope 以 PATCH-STATE-v090.md

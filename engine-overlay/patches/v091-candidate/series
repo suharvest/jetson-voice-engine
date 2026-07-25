@@ -32,5 +32,4 @@
 0032-build-moss-tts-nano-wire-worker-into-v0.9.0-CMake-ex.patch
 0035-fix-export-demote-Qwen3-TTS-non-CustomVoice-guard-to.patch
 0036-fix-export-carry-codec_language_id-into-the-exported.patch
-0039-fix-cmake-propagate-CuTe-shim-driver-and-wrap-requir.patch
 0041-feat-moss-worker-concurrent-dispatch-cancel.patch

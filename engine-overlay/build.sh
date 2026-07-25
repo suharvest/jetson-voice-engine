@@ -14,7 +14,7 @@
 #   1. clone/fetch upstream.remote @ UPSTREAM_PIN into a clean workdir
 #   2. verify + apply the 7 exact proposed-upstream commits
 #   3. copy addon/ over the checkout (new files, exec bits preserved)
-#   4. validate + apply the explicit 36-patch local product series
+#   4. validate + apply the explicit 35-patch local product series
 #   5. configure + build via the upstream CMake entry for the target sm
 #   6. emit + verify artifact checksums against the chosen manifest
 #
@@ -182,14 +182,14 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
   (cd "${PATCH_DIR}" && shasum -a 256 -c SHA256SUMS)
 fi
-load_series "${PATCH_DIR}" "${PATCH_DIR}/series" 36 "local-product"
+load_series "${PATCH_DIR}" "${PATCH_DIR}/series" 35 "local-product"
 LOCAL_PATCHES=("${SERIES[@]}")
 for p in "${LOCAL_PATCHES[@]}"; do
   apply_one "${p}"
 done
 echo "==> patched source tree ready at ${WORKDIR}"
 echo "    v0.9.1 base (7f061f21) + 7 exact proposed-upstream commits +"
-echo "    36 sparse local product patches."
+echo "    35 sparse local product patches."
 echo "    streaming worker (v0.9.1 native streaming API) + slot-pool +"
 echo "    shared-engine ctors + external speaker-embedding + 9-row CV runtime-if"
 echo "    (langId) + SparkTTS mixed-precision/int4 opt-ins + MOSS (in-series)."
@@ -272,8 +272,10 @@ echo "==> target: SM=${TARGET_SM} platform=${TARGET_PLATFORM} arch=${CUDA_ARCH} 
 #          python kernelSrcs/build_cutedsl.py --gpu_arch sm_87
 #          (the packaged v0.9.1 SM87 archive was built with CUDA 13.2 and is
 #          incompatible with JP6.2 CUDA 12.6);
-#       2. PR #118's shim/wrap propagation plus residual 0039 CUDA-driver
-#          propagation (pending final-link A/B retirement);
+#       2. PR #118's shim/wrap propagation. Orin product A/B proved the former
+#          local 0039 CUDA-driver PUBLIC edge redundant: plugin, inference,
+#          Qwen3 TTS, MOSS, ASR, and Spark all build without it; final link
+#          retains wrap/CuTe/shim/libcuda and `ldd -r` passes;
 #       3. -DAARCH64_BUILD=ON -DEMBEDDED_TARGET=jetson-orin and
 #          -DCMAKE_CUDA_ARCHITECTURES=87.
 #     Do NOT mix (A) and (B) artifacts in one build dir.

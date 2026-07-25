@@ -32,5 +32,4 @@ b50f3beecddd665d9fd230a80349b3dffb5ee461c441136064fee8ccbf89a113  0031-feat-moss
 6f0b12f7efd708d2c174fdf73367c17c2efe11282ebea2a780758ba2799a0e8a  0032-build-moss-tts-nano-wire-worker-into-v0.9.0-CMake-ex.patch
 afcb0afe003a85f5027132b6bd1ed4238dcc420855da0e59e1775210b19f2c11  0035-fix-export-demote-Qwen3-TTS-non-CustomVoice-guard-to.patch
 e37dd5a4a9ccd5855e436b8c86d2f7adacda97963abe6a233c2276d085a28d17  0036-fix-export-carry-codec_language_id-into-the-exported.patch
-0cd65d73b580f776df62da5b69ef635c8a2381e4dcfd78117c1ab3536f4c4a30  0039-fix-cmake-propagate-CuTe-shim-driver-and-wrap-requir.patch
 5c34422d15b40cef3733fa8a1f6f9782e5fda23ba880787f0151d1863d588825  0041-feat-moss-worker-concurrent-dispatch-cancel.patch

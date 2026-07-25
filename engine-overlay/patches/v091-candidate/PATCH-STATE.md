@@ -1,6 +1,6 @@
 # TensorRT Edge-LLM v0.9.1 patch state
 
-Status: **shrunk local stack; clean replay qualified; device rebuild pending**
+Status: **shrunk local stack; clean replay and Orin product A/B qualified**
 
 Date: 2026-07-25
 
@@ -14,7 +14,7 @@ The active source is reconstructed in this order:
 1. official NVIDIA v0.9.1;
 2. seven exact commits proposed to NVIDIA in PR #118 and #145–149;
 3. additive product files from `addon/`;
-4. the explicit sparse 36-patch product series in `series`.
+4. the explicit sparse 35-patch product series in `series`.
 
 The proposed-upstream patches are byte-locked in
 `../upstream-v091-prs/{series,LOCK,SHA256SUMS}`. The local patch bytes are
@@ -37,19 +37,21 @@ applied first from the proposed-upstream set:
 | `0034` ASR MRoPE normalization | PR #146 / upstream patch `0004` |
 | `0037` TensorRT stream reader compatibility | PR #147 / upstream patch `0005` |
 | `0038` pre-10.8 FP4 guard | PR #145 / upstream patch `0003` |
+| `0039` CUDA driver PUBLIC propagation | Retired by normalized Orin product A/B; PR #118 already supplies the required generic shim/wrap propagation |
 | `0040` mask-scoped FMHA cubin load | PR #148 / upstream patch `0006` |
 
-Two mixed patches were reduced instead of removed:
+One mixed patch was reduced instead of removed:
 
 - local `0009` now contains only the BF16Linear tied-weight product extension;
   generic destination-dtype preservation comes from PR #149;
-- local `0039` now contains only CUDA driver-library propagation through a
-  static CuTe consumer. PR #118 supplies the shim and
-  `_cudaLaunchKernelEx` wrap propagation.
 
-Local `0039` remains pending a final-link A/B test. Retire it only when both
-link-map inspection and a real GDN kernel launch prove that the PUBLIC driver
-edge is unnecessary.
+Local `0039` is not an upstream candidate. It was a downstream link-interface
+workaround, not a generic functional fix. In the normalized Orin product A/B,
+the variant without `0039` built the plugin, `llm_inference`, Qwen3 TTS, MOSS,
+ASR, and Spark workers. Final link still retained wrap/CuTe/shim/libcuda and
+`ldd -r` passed, proving the residual PUBLIC driver edge redundant. PR #118's
+generic CuTe shim and `_cudaLaunchKernelEx` wrap propagation remains in the
+locked proposed-upstream series.
 
 ## Product capability retained
 
@@ -62,8 +64,7 @@ All model/product behavior remains local:
   shared-engine slots, cancellation, and chunk policy;
 - `0031`–`0032`, `0041`: MOSS runtime/kernel/worker plus true concurrent
   dispatch and cooperative cancellation;
-- `0035`–`0036`: Base export guard and CustomVoice language-id export;
-- `0039`: temporary final-link CUDA driver propagation.
+- `0035`–`0036`: Base export guard and CustomVoice language-id export.
 
 NVIDIA v0.9.1 does not provide the MOSS or Spark model integrations, the Base
 speaker-conditioning extension, or these ASR/TTS worker concurrency policies.
@@ -77,9 +78,9 @@ The stack was tested against a clean checkout of the exact official base:
 vendored format-patch byte comparison: 7/7 exact
 vendored SHA-256 verification:          7/7 pass
 proposed-upstream forward replay:       7/7 clean
-local sparse forward replay:           36/36 clean
+local sparse forward replay:           35/35 clean
 git diff --check after forward replay: clean
-local reverse replay:                  36/36 clean
+local reverse replay:                  35/35 clean
 proposed-upstream reverse replay:       7/7 clean
 post-reverse tracked tree:             official v0.9.1
 post-reverse untracked tree:           addon/ only
@@ -107,12 +108,11 @@ the three v0.9.1 gitlinks plus executable/symlink modes and fails unless
 
 The former 41-patch chain passed Orin NX fallback/CuTe builds and the complete
 model/concurrency matrix. That is strong behavior-preservation evidence, but
-it is not attributed to this normalized 7+36 source identity.
+it is not attributed to this normalized 7+35 source identity.
 
 Before publishing a new artifact set, the normalized chain must pass:
 
 - Orin NX CUDA 12.6 / TensorRT 10.3 build and focused bug gates;
-- final-link A/B decision for residual `0039`;
 - fresh engine/model, N=1 baseline, supported N=2, cancellation/recovery, and
   ASR+TTS+LLM co-residency regression;
 - a new immutable artifact prefix and manifest. The existing 41-patch artifact

@@ -15,7 +15,7 @@ voxedge-engine/
                      # 7 byte-locked exact commits from PR #118/#145–149
   addon/             # new files (upstream does not have these), original relative paths
   patches/v091-candidate/
-                     # explicit sparse 36-patch product series
+                     # explicit sparse 35-patch product series
   build.sh           # pin → upstream PR patches → addon → product patches → build
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a)/(b) classification + upstream-PR / retirement plan
@@ -24,9 +24,10 @@ voxedge-engine/
 > **v0.9.1 normalized migration (2026-07-25):** the active base is pure
 > NVIDIA tag v0.9.1, `7f061f21`. Seven exact commits from PR #118 and
 > #145–149 are vendored with commit/tree/patch-id/SHA-256 provenance, then the
-> 36-entry sparse product series is applied. Generic local duplicates `0033`,
-> `0034`, `0037`, `0038`, and `0040` were retired; mixed `0009` and `0039`
-> retain only their product/residual hunks. See
+> 35-entry sparse product series is applied. Generic local duplicates `0033`,
+> `0034`, `0037`, `0038`, and `0040` were retired; mixed `0009` retains only
+> its product hunk. Residual local `0039` was also retired after normalized
+> Orin product A/B proved its CUDA-driver PUBLIC edge redundant. See
 > `patches/v091-candidate/PATCH-STATE.md`. Old v0.8/v0.9.0 files are retained
 > as rollback/history and are never mixed into v0.9.1 images.
 
@@ -37,7 +38,7 @@ Two mutually exclusive cmake configurations, per artifact family:
 | build | `ENABLE_CUTE_DSL` | notes |
 |---|---|---|
 | **Voice workers** | `OFF` (fallback) or qualified local SM87 artifact | The local GEMM/GEMV path remains until fresh-engine quality/performance gates show that CuTe can replace it. |
-| **GDN LLM engine** | `ALL` | On Orin/JP6.2 regenerate SM87 with the device-qualified cutlass-dsl 4.5.1 toolchain. The packaged v0.9.1 archive was generated with CUDA 13.2 and is not usable with CUDA 12.6. Configure with `AARCH64_BUILD=ON`, SM87, and `EMBEDDED_TARGET=jetson-orin`; PR #118 propagates shim/wrap requirements and residual local `0039` temporarily propagates the CUDA driver edge. |
+| **GDN LLM engine** | `ALL` | On Orin/JP6.2 regenerate SM87 with the device-qualified cutlass-dsl 4.5.1 toolchain. The packaged v0.9.1 archive was generated with CUDA 13.2 and is not usable with CUDA 12.6. Configure with `AARCH64_BUILD=ON`, SM87, and `EMBEDDED_TARGET=jetson-orin`; PR #118 propagates the required shim/wrap edges. Product A/B without local `0039` retained wrap/CuTe/shim/libcuda at final link and passed `ldd -r`. |
 
 Never mix the two configurations in one build dir.
 
@@ -109,7 +110,9 @@ again after reverse replay.
 ## Build-verify status
 
 The predecessor 41-patch source built on Orin NX in both fallback and
-device-generated CuTe configurations. The normalized 7+36 identity has clean
-offline replay and must be rebuilt on Orin before its own artifacts are
-published. `build.sh` refuses to compile on non-aarch64 and supports
+device-generated CuTe configurations. The normalized product A/B built the
+plugin, `llm_inference`, Qwen3 TTS, MOSS, ASR, and Spark workers after removing
+`0039`; final-link and `ldd -r` checks passed. The resulting 7+35 identity has
+clean offline replay and still requires the remaining runtime/release gates
+before publication. `build.sh` refuses to compile on non-aarch64 and supports
 `--apply-only` for source-chain verification.

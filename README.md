@@ -183,15 +183,15 @@ engine-overlay/
                      # exact commits from PR #118/#145–149 + lock/checksums
   addon/             # additive product files at original relative paths
   patches/v091-candidate/
-                     # explicit sparse 36-patch product series
-  build.sh           # pin → 7 upstream patches → addon → 36 local patches → build
+                     # explicit sparse 35-patch product series
+  build.sh           # pin → 7 upstream patches → addon → 35 local patches → build
   manifests/         # build-reproduction manifests (qwen3-tts / qwen3-asr / customvoice)
   DIVERGENCE.md      # per-topic (a) upstreamable / (b) carried classification + PR/retirement plan
   README.md          # overlay model, addon-vs-patch discipline, reproduction
 ```
 
 The active v0.9.1 source contract applies seven exact proposed-upstream bug
-fixes before the reduced 36-patch product stack. MOSS, Spark, Base/CustomVoice,
+fixes before the reduced 35-patch product stack. MOSS, Spark, Base/CustomVoice,
 ASR/TTS concurrency, cancellation, and service-facing worker behavior remain
 local. Manifests pin reproducible builds for `qwen3-tts-highperf-sm87`,
 `qwen3-asr-sm87`, and `customvoice-v091`.
@@ -205,8 +205,10 @@ cd engine-overlay
 ```
 
 > The predecessor 41-patch chain built on Orin NX for fallback and local-SM87
-> CuTe variants. The normalized 7+36 identity must complete its own Orin
-> rebuild and runtime qualification before publication.
+> CuTe variants. Normalized Orin product A/B retired redundant local `0039`
+> after all product targets built and final-link/`ldd -r` checks passed. The
+> resulting 7+35 identity must complete its runtime qualification before
+> publication.
 > `build.sh` refuses to compile on non-aarch64. See
 > `engine-overlay/README.md` and `engine-overlay/DIVERGENCE.md` for details,
 > including the **SSE/client-disconnect fix (patch `0006`) which is
