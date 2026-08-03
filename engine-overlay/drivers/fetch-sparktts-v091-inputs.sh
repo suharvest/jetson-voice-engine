@@ -45,11 +45,13 @@ fi
 actual_source="$(git -C "${source_dir}" rev-parse HEAD 2>/dev/null || true)"
 if [ "${actual_source}" != "${SPARK_SOURCE_SHA}" ]; then
   git -C "${source_dir}" fetch --filter=blob:none origin "${SPARK_SOURCE_SHA}"
-  if [ "${source_created}" = 1 ]; then
-    git -C "${source_dir}" checkout --detach "${SPARK_SOURCE_SHA}"
-  fi
-  actual_source="$(git -C "${source_dir}" rev-parse HEAD)"
 fi
+if [ "${source_created}" = 1 ]; then
+  # A --no-checkout clone can already report the requested commit as HEAD while
+  # leaving the worktree empty. Always materialize a newly-created checkout.
+  git -C "${source_dir}" checkout --detach "${SPARK_SOURCE_SHA}"
+fi
+actual_source="$(git -C "${source_dir}" rev-parse HEAD)"
 if [ "${actual_source}" != "${SPARK_SOURCE_SHA}" ]; then
   echo "ERROR: ${source_dir} is at ${actual_source}; expected ${SPARK_SOURCE_SHA}" >&2
   echo "       refusing to reset or overwrite an existing checkout" >&2

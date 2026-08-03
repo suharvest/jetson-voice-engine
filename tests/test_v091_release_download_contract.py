@@ -35,3 +35,14 @@ def test_spark_fetcher_pins_source_and_uses_mirror_with_resume_cache():
     assert "BiCodec/config.yaml" in text
     assert "BiCodec/model.safetensors" in text
     assert "rm -" not in text
+
+
+def test_spark_fetcher_materializes_a_new_no_checkout_clone_even_at_pinned_head():
+    text = SPARK_FETCH.read_text()
+
+    fetch_guard = 'if [ "${actual_source}" != "${SPARK_SOURCE_SHA}" ]; then'
+    checkout_guard = 'if [ "${source_created}" = 1 ]; then'
+    checkout = 'git -C "${source_dir}" checkout --detach "${SPARK_SOURCE_SHA}"'
+
+    assert text.index(fetch_guard) < text.index(checkout_guard) < text.index(checkout)
+    assert text.index(checkout) < text.index('actual_source="$(git -C "${source_dir}" rev-parse HEAD)"')
