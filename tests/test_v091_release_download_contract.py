@@ -18,6 +18,9 @@ def test_engine_builder_requires_hugging_face_mirror():
 def test_spark_shared_engines_both_receive_release_sidecars():
     text = ENGINE_BUILDER.read_text()
 
+    assert "--minShapes=semantic_tokens:1x1,d_vector:1x1024" in text
+    assert "--maxShapes=semantic_tokens:1x600,d_vector:1x1024" in text
+    assert "--minShapes=semantic_tokens:1x50" not in text
     assert '_meta "${eng}/bicodec_decoder_dynT.fp16.engine"' in text
     assert '_meta "${eng}/sparktts_speaker_decoder.fp32.engine"' in text
 

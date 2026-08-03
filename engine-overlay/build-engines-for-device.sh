@@ -403,7 +403,7 @@ build_sparktts() { # $1 model_id  $2 (unused)  $3 mode(bf16|w4a16)
     python3 "${scripts}/export_sparktts_speaker_decoder.py"
   echo "==> [sparktts:${m}] trtexec bicodec fp16 (dyn-T) + speaker fp32"
   "${trtexec}" --onnx="${eng}/bicodec_decoder_dynT.onnx" --fp16 \
-    --minShapes=semantic_tokens:1x50,d_vector:1x1024 \
+    --minShapes=semantic_tokens:1x1,d_vector:1x1024 \
     --optShapes=semantic_tokens:1x200,d_vector:1x1024 \
     --maxShapes=semantic_tokens:1x600,d_vector:1x1024 \
     --saveEngine="${eng}/bicodec_decoder_dynT.fp16.engine" 2>&1 | tail -3
