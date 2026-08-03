@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 ENGINE_BUILDER = ROOT / "engine-overlay/build-engines-for-device.sh"
 SPARK_FETCH = ROOT / "engine-overlay/drivers/fetch-sparktts-v091-inputs.sh"
 ARTIFACT_MANIFEST = ROOT / "deploy/artifacts/qwen3_manifest.json"
-FINAL_ARTIFACT_SET = "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r4"
+FINAL_ARTIFACT_SET = "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5"
 
 
 def test_engine_builder_requires_hugging_face_mirror():
@@ -62,6 +62,7 @@ def test_final_v091_artifact_set_is_deployable_with_streaming_spark_engines():
     assert artifact_set["root"] == "/opt/edgellm-v091"
     assert artifact_set["hf_prefix"] == f"{FINAL_ARTIFACT_SET}/v091"
     assert artifact_set["capabilities"]["sparktts_max_slots"] == 2
+    assert artifact_set["capabilities"]["sparktts_http_cancel_rounds"] == 10
     assert artifact_set["capabilities"]["moss_max_slots"] == 1
     assert {
         "manifest.json",

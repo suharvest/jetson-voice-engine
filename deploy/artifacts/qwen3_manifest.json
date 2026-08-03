@@ -232,12 +232,12 @@
                 "GDN native simultaneous contexts remain guarded by service singleflight."
             ]
         },
-        "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r4": {
+        "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5": {
             "device": "Jetson Orin NX 16GB",
             "profile": "TensorRT-Edge-LLM v0.9.1 full runtime",
             "published_to_hf": false,
             "root": "/opt/edgellm-v091",
-            "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r4/v091",
+            "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5/v091",
             "upstream_repo": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
             "upstream_sha": "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
             "capabilities": {
@@ -251,7 +251,8 @@
                 "moss_useful_overlap": false,
                 "sparktts_max_slots": 2,
                 "sparktts_n2_interleaved": true,
-                "sparktts_cancel_stress_rounds": 20
+                "sparktts_cancel_stress_rounds": 20,
+                "sparktts_http_cancel_rounds": 10
             },
             "required_files": [
                 "manifest.json",
