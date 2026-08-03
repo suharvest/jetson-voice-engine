@@ -425,6 +425,7 @@ build_sparktts() { # $1 model_id  $2 (unused)  $3 mode(bf16|w4a16)
   python3 "${HERE}/validate-spark-token-gate.py" \
     "${out}/token-gate.json" "${mode}"
   _meta "${eng}/bicodec_decoder_dynT.fp16.engine"
+  _meta "${eng}/sparktts_speaker_decoder.fp32.engine"
   _meta "${out}/llm.engine"
 }
 
