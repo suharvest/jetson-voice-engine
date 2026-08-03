@@ -37,7 +37,12 @@ MODEL_ROOT="${MODEL_ROOT:-${UPSTREAM}/../models}"
 BUILD="${UPSTREAM}/build"                 # voice-worker build (ENABLE_CUTE_DSL=OFF)
 BUILD_GDN="${UPSTREAM}/build-gdn"         # GDN build (ENABLE_CUTE_DSL=fmha;gdn) — for llm
 PLUGIN="${BUILD}/libNvInfer_edgellm_plugin.so"
-HF="${HF_ENDPOINT:-https://huggingface.co}"
+HF="${HF_ENDPOINT:-}"
+if [ "${HF}" != "https://hf-mirror.com" ]; then
+  echo "ERROR: model downloads require HF_ENDPOINT=https://hf-mirror.com" >&2
+  echo "       provision the device with: fleet bootstrap <device> --profile edge-mirror" >&2
+  exit 4
+fi
 
 # Quantization/export imports torch before any engine is built. Reject a
 # CUDA-13 torch environment on the JP6.2 CUDA-12.6 driver instead of failing
