@@ -24,6 +24,10 @@ import hashlib
 import numpy as np
 import torch
 
+from sparktts_export_compat import install_unused_torchaudio_stub_if_missing
+
+install_unused_torchaudio_stub_if_missing(torch)
+
 ap = argparse.ArgumentParser(description="Export SparkTTS BiCodec decoder to ONNX")
 ap.add_argument("--model-dir", default=os.environ.get("SPARKTTS_MODEL_DIR"),
                 help="dir containing BiCodec/ (env SPARKTTS_MODEL_DIR)")
