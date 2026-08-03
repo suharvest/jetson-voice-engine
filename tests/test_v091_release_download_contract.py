@@ -1,9 +1,12 @@
+import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_BUILDER = ROOT / "engine-overlay/build-engines-for-device.sh"
 SPARK_FETCH = ROOT / "engine-overlay/drivers/fetch-sparktts-v091-inputs.sh"
+ARTIFACT_MANIFEST = ROOT / "deploy/artifacts/qwen3_manifest.json"
+FINAL_ARTIFACT_SET = "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r4"
 
 
 def test_engine_builder_requires_hugging_face_mirror():
@@ -49,3 +52,23 @@ def test_spark_fetcher_materializes_a_new_no_checkout_clone_even_at_pinned_head(
 
     assert text.index(fetch_guard) < text.index(checkout_guard) < text.index(checkout)
     assert text.index(checkout) < text.index('actual_source="$(git -C "${source_dir}" rev-parse HEAD)"')
+
+
+def test_final_v091_artifact_set_is_deployable_with_streaming_spark_engines():
+    manifest = json.loads(ARTIFACT_MANIFEST.read_text())
+    artifact_set = manifest["artifact_sets"][FINAL_ARTIFACT_SET]
+    required = set(artifact_set["required_files"])
+
+    assert artifact_set["root"] == "/opt/edgellm-v091"
+    assert artifact_set["hf_prefix"] == f"{FINAL_ARTIFACT_SET}/v091"
+    assert artifact_set["capabilities"]["sparktts_max_slots"] == 2
+    assert artifact_set["capabilities"]["moss_max_slots"] == 1
+    assert {
+        "manifest.json",
+        "SHA256SUMS",
+        "bin/spark_tts_worker",
+        "engines/sparktts-shared/bicodec_decoder_dynT.fp16.engine",
+        "engines/sparktts-shared/bicodec_decoder_dynT.fp16.engine.meta.json",
+        "engines/sparktts-shared/sparktts_speaker_decoder.fp32.engine",
+        "engines/sparktts-shared/sparktts_speaker_decoder.fp32.engine.meta.json",
+    } <= required
