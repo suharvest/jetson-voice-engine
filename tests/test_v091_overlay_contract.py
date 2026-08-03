@@ -23,23 +23,43 @@ GDN_MTP_FILES = (
 )
 
 
-def test_active_pin_and_patch_series_are_exact_and_contiguous():
+def _series_entries(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def test_active_pin_and_sparse_patch_series_are_exact():
     pin = next(
         line.strip()
         for line in (OVERLAY / "UPSTREAM_PIN").read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     )
     assert pin == PIN
-    patches = sorted((OVERLAY / "patches" / "v091-candidate").glob("*.patch"))
-    assert len(patches) == 41
-    assert [int(p.name[:4]) for p in patches] == list(range(1, 42))
+    patch_dir = OVERLAY / "patches" / "v091-candidate"
+    patches = sorted(path.name for path in patch_dir.glob("*.patch"))
+    series = _series_entries(patch_dir / "series")
+    assert len(series) == 35
+    assert sorted(series) == patches
+
+    upstream_dir = OVERLAY / "patches" / "upstream-v091-prs"
+    upstream_patches = sorted(path.name for path in upstream_dir.glob("*.patch"))
+    upstream_series = _series_entries(upstream_dir / "series")
+    assert len(upstream_series) == 7
+    assert sorted(upstream_series) == upstream_patches
 
 
 def test_build_wrapper_uses_only_active_series():
     text = (OVERLAY / "build.sh").read_text()
     assert 'PATCH_DIR="${HERE}/patches/v091-candidate"' in text
-    assert "expected 41 v0.9.1 patches" in text
-    active = text[text.index("# --- 3. apply the active") :]
+    assert 'load_series "${PATCH_DIR}" "${PATCH_DIR}/series" 35 "local-product"' in text
+    assert (
+        'load_series "${UPSTREAM_PATCH_DIR}" "${UPSTREAM_PATCH_DIR}/series" 7 '
+        '"proposed-upstream"'
+    ) in text
+    active = text[text.index("# --- 2. validate/apply exact upstream PR commits") :]
     assert "patches/v090-sparktts-00*.patch" not in active
     assert 'apply_one "${HERE}/patches/0001-orin' not in active
 
@@ -48,7 +68,8 @@ def test_manifests_pin_v091_and_require_provenance():
     for path in sorted((OVERLAY / "manifests").glob("*.toml")):
         data = tomllib.loads(path.read_text())
         assert data["upstream"]["pin"] == PIN, path
-        assert data["patches"]["count"] == 41, path
+        assert data["patches"]["count"] == 35, path
+        assert data["proposed_upstream_patches"]["count"] == 7, path
         assert data["artifacts"]["provenance_required"] is True, path
         assert data["artifacts"]["sha256_required"] is True, path
 
