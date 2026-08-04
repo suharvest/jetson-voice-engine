@@ -78,6 +78,29 @@ def verify_hash(actual_path: Path, expected_hash: str, field: str) -> None:
         fail(f"{field} stale: expected {expected_hash}, got {actual_hash}")
 
 
+def verify_release_target(data: dict[str, Any]) -> None:
+    """Bind release manifests to the only qualified Jetson toolchain."""
+    target = table(data, "target")
+    expected: dict[str, Any] = {
+        "device": "jetson-orin-nx",
+        "sm": "87",
+        "jetpack": "6.2",
+        "l4t": "36.4.3",
+        "cuda": "12.6",
+        "tensorrt": "10.3",
+        "embedded_target": "jetson-orin",
+        "aarch64_build": True,
+    }
+    for key, wanted in expected.items():
+        actual = target.get(key)
+        if actual != wanted:
+            fail(f"[target].{key} must be {wanted!r}, got {actual!r}")
+
+    build = table(data, "build")
+    if build.get("type") != "Release":
+        fail(f"[build].type must be 'Release', got {build.get('type')!r}")
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         fail("usage: validate-manifest.py OVERLAY_ROOT MANIFEST UPSTREAM_PIN")
@@ -96,6 +119,12 @@ def main() -> None:
     upstream = table(data, "upstream")
     if value(upstream, "upstream", "pin", str) != pin:
         fail("[upstream].pin does not match UPSTREAM_PIN")
+    if upstream.get("version") != "v0.9.1":
+        fail("[upstream].version must be 'v0.9.1'")
+    if upstream.get("remote") != "https://github.com/NVIDIA/TensorRT-Edge-LLM.git":
+        fail("[upstream].remote must be the NVIDIA repository")
+
+    verify_release_target(data)
 
     proposed = table(data, "proposed_upstream_patches")
     if value(proposed, "proposed_upstream_patches", "directory",

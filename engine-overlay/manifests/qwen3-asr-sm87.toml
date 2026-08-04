@@ -28,6 +28,7 @@ sm = "87"
 cuda = "12.6"
 tensorrt = "10.3"
 l4t = "36.4.3"
+jetpack = "6.2"
 embedded_target = "jetson-orin"
 aarch64_build = true
 

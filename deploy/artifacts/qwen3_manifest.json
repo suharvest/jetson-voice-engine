@@ -240,6 +240,95 @@
             "hf_prefix": "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5/v091",
             "upstream_repo": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
             "upstream_sha": "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
+            "proposed_upstream_patch_count": 7,
+            "proposed_upstream_series_sha256": "9fe8677a4c6886a4b7d8d253a245b6d95509d26a7fe8072eb0de6ed83633c733",
+            "overlay_patch_count": 35,
+            "overlay_series_sha256": "a358dcafc5d3fc70468a01e21c97236a1a6664644d26f635ed6ee6934d3be3d5",
+            "overlay_checksums_sha256": "810eab4177951bbffed0d7fa40c592dce5a5c376a7fbd7f286c7fe2314f1753a",
+            "target": {
+                "device": "jetson-orin-nx",
+                "sm": "87",
+                "jetpack": "6.2",
+                "l4t": "36.4.3",
+                "cuda": "12.6",
+                "tensorrt": "10.3",
+                "embedded_target": "jetson-orin",
+                "aarch64_build": true,
+                "build_type": "Release"
+            },
+            "release_lock": {
+                "owner": "OpenVoiceStream",
+                "path": "deploy/artifacts/v091-release-lock.json",
+                "required": true,
+                "hf_revision_required": true,
+                "schema_fields": [
+                    "schema_version",
+                    "artifact_set",
+                    "target.platform",
+                    "target.sm",
+                    "target.jetpack",
+                    "target.cuda",
+                    "target.tensorrt",
+                    "target.onnxruntime",
+                    "source.upstream_sha",
+                    "source.build_outer_sha",
+                    "source.engine_overlay_sha",
+                    "source.formal_diff_sha256",
+                    "model_artifacts.<model>.repo",
+                    "model_artifacts.<model>.revision",
+                    "model_artifacts.<model>.payload_sha256",
+                    "model_artifacts.<model>.payload_size",
+                    "artifacts.<path>.sha256",
+                    "artifacts.<path>.size",
+                    "artifacts.<path>.mode"
+                ],
+                "policy": "OVS release lock is the only release source of truth; this aggregate manifest is legacy build/staging provenance."
+            },
+            "model_sources": {
+                "qwen3_asr": {
+                    "repo_id": "Qwen/Qwen3-ASR-0.6B",
+                    "revision": null,
+                    "revision_policy": "immutable revision required from the OVS release lock"
+                },
+                "qwen3_tts_customvoice": {
+                    "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                    "revision": null,
+                    "revision_policy": "immutable revision required from the OVS release lock"
+                },
+                "qwen3_tts_base": {
+                    "repo_id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                    "revision": null,
+                    "revision_policy": "TTS_BASE_MODEL_REVISION is mandatory and must match the OVS release lock"
+                },
+                "sparktts": {
+                    "repo_id": "SparkAudio/Spark-TTS-0.5B",
+                    "revision": "642071559bfc6346c2359d19dcb6be3f9dd8a05d",
+                    "source_repo": "https://github.com/SparkAudio/Spark-TTS.git",
+                    "source_revision": "2f1ea9082400547242641f5271b6f941c9f439d1"
+                },
+                "moss_tts_nano": {
+                    "repo_id": "OpenMOSS-Team/MOSS-TTS-Nano-100M",
+                    "revision": null,
+                    "revision_policy": "immutable revision required from the OVS release lock"
+                },
+                "moss_audio_tokenizer": {
+                    "repo_id": "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
+                    "revision": null,
+                    "revision_policy": "immutable revision required from the OVS release lock"
+                },
+                "qwen3_5_gdn_mtp": {
+                    "repo_id": "Qwen/Qwen3.5-4B",
+                    "revision": null,
+                    "revision_policy": "immutable revision required from the OVS release lock"
+                }
+            },
+            "artifact_repositories": {
+                "qwen3_asr_tts": "harvestsu/qwen3-edgellm-jetson-artifacts",
+                "sparktts": "harvestsu/sparktts-0p5b-jetson-artifacts",
+                "moss_tts_nano": "harvestsu/seeed-local-voice-artifacts",
+                "gdn_mtp": "harvestsu/Qwen3.5-4B-AWQ-GDN-MTP-TensorRT-EdgeLLM-engine",
+                "sensevoice": "harvestsu/sensevoice-rknn"
+            },
             "capabilities": {
                 "asr_max_slots": 2,
                 "base_isolated_max_slots": 2,

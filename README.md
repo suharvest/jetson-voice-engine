@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Qwen3-TTS · Matcha TRT · Qwen3-ASR on Jetson Orin Nano/NX — <strong>RTF 0.63 · 28ms TTFA · voice clone · no cloud</strong>
+  TensorRT-Edge-LLM v0.9.1 engine builds for Jetson Orin — <strong>7 upstream fixes + 35 local product patches</strong>
 </p>
 
 <!-- TODO: Add demo GIF — record a ~15s terminal session showing:
@@ -19,11 +19,15 @@
 
 ## What is this?
 
-jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It takes official Hugging Face model weights (Qwen3-TTS/ASR, Matcha, Kokoro, Paraformer) and produces validated TensorRT engines + runtime artifacts that OpenVoiceStream deploys on Jetson Orin Nano and NX.
+jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It takes official model snapshots and produces TensorRT engines, workers, plugins, provenance, and checksums. It does not own OVS profiles, HTTP APIs, images, or deployment.
 
-One script handles the entire chain — ONNX export, engine build, HF artifact download, Docker start, and loopback verification. Exit 0 means the whole stack is working.
+The active source contract is NVIDIA TensorRT-Edge-LLM v0.9.1 at
+`7f061f21f0a581ba234a1e233c9315b89d8e47d6`, followed by exactly 7 locked
+proposed-upstream bug patches and 35 sparse local product patches.
 
-> **For deployment:** use [OpenVoiceStream](https://github.com/suharvest/openvoicestream)'s `deploy/install.sh --target jetson`. This repo is consumed as its `third_party/qwen3-edgellm-jetson` submodule and is intended for engine contributors and platform engineers.
+> **For deployment:** use OpenVoiceStream. Its
+> `deploy/artifacts/v091-release-lock.json` is the only release source of truth;
+> this repository's aggregate manifest is legacy build/staging provenance.
 
 ## Features
 
@@ -31,34 +35,29 @@ One script handles the entire chain — ONNX export, engine build, HF artifact d
 - **Matcha TRT** — 28ms TTFA on Orin NX via `/tts/stream`; RTF 0.015–0.021 (50–70× real-time); TRT vocos vocoder
 - **Qwen3-ASR int4** — ~55ms latency on Orin NX, ~60ms on Orin Nano; 52-language; int4 confirmed stable (FP16 hangs on NX)
 - **Kokoro TRT** — hybrid prefix TRT + ORT suffix; RTF 0.54 on Orin Nano; speaker 52
-- **One-script reproduction** — `reproduce_qwen3_highperf.sh` from HF weights to verified service with SHA-256 gate, symbol check, and TTS→ASR loopback
-- **Thin engine-overlay** — NVIDIA TRT-Edge-LLM pinned at `v0.7.1` + 8 theme patches as a thin overlay, no vendored source tree
-- **JetPack 6 / TensorRT 10 / SM87** — production-validated on Orin Nano Super 8 GB and Orin NX 16 GB
+- **Fail-closed build manifests** — reject any target other than Orin NX / SM87 / JetPack 6.2 / L4T R36.4.3 / CUDA 12.6 / TensorRT 10.3 / aarch64 Release
+- **Thin engine overlay** — NVIDIA v0.9.1 pin + separately locked 7 upstream-fix and 35 local-product patch series
+- **Per-model artifact ownership** — Qwen3, SparkTTS, MOSS, GDN/MTP, and SenseVoice repositories are mapped in `HF_ARTIFACTS.md`
+- **Matcha build support** — this repo produces Matcha engines; OVS profiles compose and serve them
 
-## Quick Start — Qwen3 one-shot on Orin NX
+## Quick Start — materialize or build v0.9.1
 
 ```bash
-git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
-bash qwen3-edgellm-jetson/scripts/reproduce_qwen3_highperf.sh
-# add: --reference path/to/24kHz_mono.wav   to also verify voice clone
+git clone https://github.com/suharvest/jetson-voice-engine.git
+cd jetson-voice-engine/engine-overlay
+./build.sh --apply-only
+
+# On the qualified Orin NX build host:
+./build.sh manifests/qwen3-asr-sm87.toml
+./build.sh manifests/qwen3-tts-highperf-sm87.toml
 ```
 
-`reproduce_qwen3_highperf.sh` is idempotent and handles the whole Qwen3 chain:
-clones repos at validated branches, builds EdgeLLM, downloads + SHA-256-verifies
-HF artifacts, builds the slim Docker image, starts the service, then runs
-`verify_reproduction.sh` which gates on:
-
-1. W8A16 plugin symbol set
-2. Artifact SHA-256 integrity
-3. HTTP TTS→ASR loopback on 3 Chinese prompts (LCS ≥ 0.7, up to 3 retries)
-4. Voice clone via a real reference WAV
-
-Exit 0 = the whole chain is verified. On failure it prints which check failed.
-
-**Prerequisites:** Jetson Orin NX, JetPack 6 (TensorRT 10.3.0.30, CUDA 12.6),
-`docker` + `--runtime nvidia`, ~10 GB free disk for HF artifacts.
-
-See `docs/reproduce-from-zero.md` for the manual step-by-step fallback.
+`--apply-only` proves the source overlay without CUDA. Full builds probe the
+actual SM/platform/L4T/CUDA/TensorRT tuple before CMake and fail if the host is
+not the qualified Orin NX target or mandatory workers/plugins are not
+produced. Model downloads must use `HF_ENDPOINT=https://hf-mirror.com` and an
+immutable revision from the OVS release lock. See
+`docs/reproduce-from-zero.md` for the complete build/staging flow.
 
 ## Table of Contents
 
@@ -68,8 +67,8 @@ See `docs/reproduce-from-zero.md` for the manual step-by-step fallback.
 - [Per-model build scripts](#per-model-build-scripts-models)
 - [ONNX export](#onnx-export)
 - [HF artifact repo](#hf-artifact-repo)
-- [Jetson Voice integration](#jetson-voice-integration)
-- [Qwen3 runtime profiles & EdgeLLM branches](#qwen3-runtime-profiles--edgellm-branches)
+- [OpenVoiceStream integration](#openvoicestream-integration)
+- [Runtime source identity](#runtime-source-identity)
 - [Qwen3 voice clone](#qwen3-voice-clone)
 - [Current Qwen3 baseline](#current-qwen3-baseline-2026-05-11)
 - [Benchmarking](#benchmarking)
@@ -79,7 +78,8 @@ See `docs/reproduce-from-zero.md` for the manual step-by-step fallback.
 
 ## Performance
 
-Measured 2026-06-22. JetPack 6, TensorRT 10. All RTF = synthesis time / audio duration
+The measurements below are historical pre-v0.9.1 baselines from 2026-06-22;
+they are not v0.9.1 release qualification. JetPack 6, TensorRT 10. All RTF = synthesis time / audio duration
 (lower is better; < 1.0 means faster than real-time). TTFA = time to first audio chunk
 via HTTP `/tts/stream` (true streaming, measured with `bench/bench_http_tts_stream.py`).
 Direct-backend latency (no service) measured with `bench/bench_*.py`, 3 trials after 1 warmup.
@@ -156,8 +156,8 @@ Direct-backend latency (no service) measured with `bench/bench_*.py`, 3 trials a
 | `models/paraformer/` | Paraformer ASR TRT build + decoder ONNX surgery. |
 | `models/common/` | Cross-model helpers: ONNX subgraph/STFT surgery, engine-bundle builder, parity gate, model downloader, perf setup, v2v debug tools. |
 | `patches/product/` | Product-level source patches applied on top of the engine build (qwen3-tts text-embedding FP8 variants, paraformer EOF fix). |
-| `configs/profiles/` | Jetson Voice deployment profiles (`multilanguage-qwen-{highperf,highperf-nx,official}.json`), all using `${QWEN3_ARTIFACT_ROOT}` so they stay portable. |
-| `deploy/artifacts/` | Qwen3 HF artifact manifest (`qwen3_manifest.json`) + SHA-256/size sidecar (`qwen3_checksums.json`). |
+| `configs/profiles/` | Legacy build/integration examples. Active product profiles are owned by OVS. |
+| `deploy/artifacts/` | Legacy aggregate build/staging manifest plus checksum sidecar; not the OVS release lock. |
 | `deploy/audio_preprocessing/` | Shared mel filters + Whisper feature-extractor config used by the ASR worker. |
 | `native/edgellm_voice_worker/` | Resident C++ ASR/TTS worker sources (mel extractor, VAD split, qwen3 ASR/TTS workers, kissfft) used by Jetson Voice. |
 | `scripts/` | Qwen3 orchestration + reproduction entry points (`reproduce_qwen3_highperf.sh`, `verify_reproduction.sh`, artifact packager/downloader, ONNX export, speaker-embedding extraction). |
@@ -245,77 +245,44 @@ scripts/export_qwen3_tts_onnx.sh --model-dir /models/Qwen3-TTS-0.6B --out /tmp/q
 See `docs/export-from-official-weights.md` for the uv environment, Qwen package
 dependencies, and highperf post-processing details.
 
-## HF artifact repo
+## HF artifact repositories
 
-Runtime TensorRT/embedding artifacts live in the HF model repo
-<https://huggingface.co/harvestsu/qwen3-edgellm-jetson-artifacts>; ONNX files
-are reproducible intermediate build products generated locally from official
-Qwen weights. Expected layout and required files are in
-`deploy/artifacts/qwen3_manifest.json`. The shared `tts/tokenizer/` directory
-must include `tokenizer.json`, `tokenizer_config.json`, and
-`processed_chat_template.json`; missing sidecars break the C++ tokenizer load
-on a from-zero device.
+Generated outputs are split by model ownership. Qwen3, SparkTTS, MOSS,
+GDN/MTP, and SenseVoice repository IDs are listed in `HF_ARTIFACTS.md` and in
+the r5 staging entry of `deploy/artifacts/qwen3_manifest.json`. The only proven
+fixed model revisions currently in this repository are Spark-TTS model
+`642071559bfc6346c2359d19dcb6be3f9dd8a05d` and source
+`2f1ea9082400547242641f5271b6f941c9f439d1`; all other immutable revisions must
+come from the OVS release lock.
 
-See `HF_ARTIFACTS.md` for what belongs in the artifact repo and the
-stage/upload flow (`scripts/package_qwen3_artifacts.py` + `hf upload`).
+The aggregate r5 manifest remains `published_to_hf=false` and is legacy
+build/staging provenance. It is not a deploy lock and a floating repository
+`main` is never a production revision.
 
-Current Qwen3 HF publication status:
+## OpenVoiceStream integration
 
-| Artifact set | Status | Notes |
-|---|---|---|
-| `orin-nano-highperf-2026-05-10` | complete | Product highperf Nano artifact set. |
-| `orin-nx-highperf-2026-05-11` | complete | Product highperf NX-native artifact set. |
-| `orin-nano-official-2026-05-10` | complete | Official/minimal Nano artifact set. |
+OVS consumes this repository as a build-time submodule. It alone owns profiles,
+leaf composition, containers, APIs, and runtime qualification. In particular,
+Matcha is a buildable model family here but is selected and combined with ASR
+only by an OVS profile.
 
-## Jetson Voice integration
+OVS `deploy/artifacts/v091-release-lock.json` is the only release source of
+truth. It binds the target tuple (including ONNX Runtime), source SHAs and
+formal-diff hash, each model artifact repo/revision/payload digest+size, and
+every release file's digest/size/mode. Do not deploy directly from this
+repository's aggregate manifest.
 
-Preferred: let `scripts/reproduce_qwen3_highperf.sh` build and start
-everything. For manual deployment of an existing image:
+## Runtime source identity
 
-```bash
-JETSON_VOICE_PROFILE=multilanguage-qwen-highperf-nx \
-QWEN3_HF_REPO_ID=harvestsu/qwen3-edgellm-jetson-artifacts \
-docker compose -f deploy/docker-compose.yml up -d
-```
-
-(`multilanguage-qwen-highperf` for Nano, `multilanguage-qwen-highperf-nx` for NX.)
-
-Sanity-check the running service in one line:
-
-```bash
-bash scripts/verify_reproduction.sh \
-    --plugin /opt/edgellm-bin/libNvInfer_edgellm_plugin.so \
-    --artifact-root /opt/models/qwen3-edgellm \
-    --service-url http://localhost:18092 \
-    [--embedding /tmp/precomputed_speaker_emb.b64]
-```
-
-## Qwen3 runtime profiles & EdgeLLM branches
-
-Two Qwen profiles are maintained:
-
-- `official`: minimal-diff EdgeLLM-compatible path for correctness and upstream review.
-- `highperf`: product path for low-latency Qwen3 ASR + Qwen3 TTS dual residency on Orin.
-
-Jetson Voice consumes these via the JSON profiles under `configs/profiles/` and
-the artifact manifest `deploy/artifacts/qwen3_manifest.json`.
-`multilanguage-qwen-highperf` targets the Nano artifact set;
-`multilanguage-qwen-highperf-nx` targets NX-native engines.
-
-The corresponding TensorRT-Edge-LLM fork branches:
-
-- `official-qwen3-tts-upstream-runtime`: minimal-diff correctness/runtime branch.
-- `qwen3-tts-highperf-runtime-w8a16`: product high-performance branch for the
-  current Orin highperf artifacts (explicit Qwen3-TTS backend, W8A16 plugin/runtime,
-  CP runtime optimizations + GPU CP kernels, stateful Code2Wav runner). These
-  runtime changes are also captured as `engine-overlay/` patches above.
-
-Do not deploy highperf artifacts against EdgeLLM `main`.
+Release builds no longer select historical fork feature branches. The source
+identity is reconstructed from NVIDIA v0.9.1 `7f061f21…`, 7 locked proposed-
+upstream patches, addon files, and 35 locked local product patches. OVS locks
+the resulting JVE submodule commit and runtime image digest.
 
 ## Qwen3 voice clone
 
 > **Note:** voice cloning is the **base Qwen3-TTS** path only. **Qwen3-CustomVoice**
-> (`customvoice-v071`) does **not** support voice cloning — it serves a fixed set
+> does **not** support voice cloning — it serves a fixed set
 > of built-in speakers. Use the base Qwen3-TTS engines for `/tts/clone/stream`.
 
 Pre-extract the speaker embedding on a workstation (librosa + onnxruntime)

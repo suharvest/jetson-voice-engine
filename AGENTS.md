@@ -1,107 +1,81 @@
 # Agent Guide
 
-This repo is the Qwen3-specific companion to `jetson-voice`.
+This repository is the Jetson engine **build component** consumed by
+OpenVoiceStream (OVS). It is not the OVS service and it is not VoxEdge.
 
-## Project Boundary
+## Release boundary
 
-- `jetson-voice`: deployable product service, API, profiles, Docker, backend selection.
-- `qwen3-edgellm-jetson`: Qwen3 ASR/TTS export scripts, engine build helpers, artifact manifests, validation scripts, and performance notes.
-- `suharvest/TensorRT-Edge-LLM`: runtime/plugin fork. Do not duplicate EdgeLLM runtime patches here.
-- `harvestsu/qwen3-edgellm-jetson-artifacts`: HF runtime artifact repo. It stores deployable `.engine` files and required sidecars, not ONNX by default.
+- NVIDIA upstream is `TensorRT-Edge-LLM` v0.9.1 at
+  `7f061f21f0a581ba234a1e233c9315b89d8e47d6`.
+- `engine-overlay/build.sh` applies exactly 7 locked proposed-upstream bug
+  patches and then exactly 35 sparse local product patches. Keep those two
+  series separate; never fold, renumber, or silently skip them.
+- This repository owns export/build drivers, the overlay, native voice workers,
+  build manifests, checksums, and artifact-production documentation.
+- OVS owns profiles, composition, HTTP/API behavior, image assembly, runtime
+  deployment, and `deploy/artifacts/v091-release-lock.json`. That outer lock is
+  the only release source of truth. Its schema binds `schema_version`,
+  `artifact_set`, `target`, `source`, `model_artifacts`, and `artifacts`.
+- Matcha is built here, but an OVS profile composes it with ASR and the service.
+  Do not claim that this repository deploys or selects Matcha.
 
-## Branches
+The active build target is fail-closed: Orin NX / SM87, JetPack 6.2 (L4T
+R36.4.3), CUDA 12.6, TensorRT 10.3, aarch64, `jetson-orin`, Release. The build
+probes the host and `verify-release-target.py` rejects mismatches before CMake.
+Changing any field requires a new qualified artifact set, not an edit to the
+existing release identity.
 
-Use these EdgeLLM fork branches:
+## Reproducible inputs
 
-- `official-qwen3-tts-upstream-runtime`: minimal-diff correctness path for upstream review.
-- `qwen3-tts-highperf-runtime-w8a16`: product high-performance path for current Orin artifacts.
+Use `HF_ENDPOINT=https://hf-mirror.com` and verify it in a non-login child
+shell before downloading. Use `hf download --revision <immutable-sha>`; never
+use a floating branch for a release build. The Spark inputs are currently
+locked in `engine-overlay/drivers/fetch-sparktts-v091-inputs.sh`. Other model
+revisions must be supplied by, and match, the outer OVS release lock. Do not
+invent a revision when historical provenance does not prove it.
 
-## ONNX Export
+Generated artifacts are model-owned in HF. See `HF_ARTIFACTS.md` for the repo
+map. The JVE aggregate manifest is legacy build/staging provenance, not a
+release lock. `published_to_hf=false` means it must not be presented as a
+downloadable release.
 
-Users should be able to start from official Qwen3 ASR/TTS Hugging Face snapshots and generate ONNX locally.
+## Build
 
-Environment:
+Materialize the exact source tree without CUDA:
 
 ```bash
-TRT_SRC=$HOME/project/TensorRT-Edge-LLM \
-TRT_EXPORT_PROJECT=/tmp/trt-export \
-PYTHON=3.12 \
-bash scripts/setup_trt_export_env.sh
+cd engine-overlay
+./build.sh --apply-only
 ```
 
-If Qwen Python packages are not installed in the user site, set:
+Build on the qualified Jetson host:
 
 ```bash
-QWEN_ASR_PKG_DIR=/path/to/qwen_asr
-QWEN_TTS_PKG_DIR=/path/to/qwen_tts
-QWEN_OMNI_UTILS_PKG_DIR=/path/to/qwen_omni_utils
+cd engine-overlay
+./build.sh manifests/qwen3-asr-sm87.toml
+./build.sh manifests/qwen3-tts-highperf-sm87.toml
+./build.sh manifests/customvoice-v091.toml
+./build.sh manifests/sparktts-sm87-v091.toml
 ```
 
-Export wrappers:
-
-```bash
-scripts/export_qwen3_asr_onnx.sh --model-dir /models/Qwen3-ASR-0.6B --out /tmp/qwen3-asr-onnx
-scripts/export_qwen3_tts_onnx.sh --model-dir /models/Qwen3-TTS-0.6B --out /tmp/qwen3-tts-onnx
-```
-
-Detailed instructions live in `docs/export-from-official-weights.md`.
-
-## Runtime Artifacts
-
-HF runtime artifacts are described by `deploy/artifacts/qwen3_manifest.json`.
-
-Current sets:
-
-- `orin-nano-highperf-2026-05-10`: fully published to HF.
-- `orin-nx-highperf-2026-05-11`: fully published to HF.
-- `orin-nano-official-2026-05-10`: fully published to HF.
-
-Use `scripts/package_qwen3_artifacts.py` to stage artifacts and write checksums before upload.
-
-Do not upload temporary logs, ONNX intermediates, or ad-hoc audio samples to the runtime HF repo unless a new manifest set explicitly calls for them.
-
-Before claiming a profile is reproducible, compare `deploy/artifacts/qwen3_manifest.json`
-against the HF repo and make sure every required file exists.
-
-## From-zero Reproduction
-
-Use `docs/reproduce-from-zero.md` as the source of truth. Keep it aligned with:
-
-- `README.md`
-- `HF_ARTIFACTS.md`
-- `deploy/artifacts/qwen3_manifest.json`
-- Jetson Voice `configs/profiles/multilanguage-qwen-*.json`
-
-The highperf path must use the EdgeLLM fork branch
-`qwen3-tts-highperf-runtime-w8a16`; EdgeLLM `main` is not enough.
-
-Open `docs/reproduction-remaining-work-2026-05-11.md` before assigning or
-starting follow-up reproduction tasks. It lists what is done, what still needs
-clean-room validation, and what should not be re-tried.
+Required workers, plugins, engines, provenance files, and checksums must fail
+loud. A release path must not convert missing outputs into a warning or an
+exit-zero best-effort result.
 
 ## Validation
 
-Before committing script changes:
+Before committing:
 
 ```bash
-bash -n scripts/*.sh
-python3 -m py_compile scripts/*.py
+bash -n engine-overlay/*.sh engine-overlay/drivers/*.sh scripts/*.sh
+python3 -m py_compile engine-overlay/*.py scripts/*.py
+python3 -m pytest -q tests/test_v091_overlay_contract.py \
+  tests/test_v091_release_download_contract.py \
+  tests/test_sparktts_export_compat.py
+bash engine-overlay/tests/verify-patch-stack.sh
+SKIP_AUTOCLONE=1 bash engine-overlay/tests/test-provenance-negative.sh
 ```
 
-For wrapper-only changes, at minimum run:
-
-```bash
-scripts/export_qwen3_asr_onnx.sh --help
-scripts/export_qwen3_tts_onnx.sh --help
-scripts/export_qwen3_asr_onnx.sh --model-dir /tmp/fake-model --out /tmp/qwen3-asr-dry --dry-run
-scripts/export_qwen3_tts_onnx.sh --model-dir /tmp/fake-model --out /tmp/qwen3-tts-dry --official-only --dry-run
-```
-
-For device work, use the fleet CLI from the parent environment rather than hardcoding SSH credentials.
-
-## Known Decisions
-
-- Full vocab is the product default for ASR and TTS.
-- ONNX is generated from official weights, not stored in the default HF runtime repo.
-- TensorRT engines are device/tactic specific; build them on the target Jetson class.
-- The highperf product path uses W8A16 Talker, CP lm-head pretranspose, stateful Code2Wav, CP decode CUDA graph, and `QWEN3_TTS_ACTIVE_CP_GROUPS=13`.
+For model/toolchain builds, retain the manifest, `PROVENANCE.md`,
+`DRIVER_REVISION`, and SHA-256 sidecars. A device runtime claim additionally
+requires OVS release-lock validation and the OVS hardware qualification gate.

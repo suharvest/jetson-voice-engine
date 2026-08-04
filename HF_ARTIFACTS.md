@@ -1,58 +1,75 @@
-# Hugging Face Artifacts
+# Hugging Face artifact contract
 
-Target repo: `harvestsu/qwen3-edgellm-jetson-artifacts`.
+This repository builds Jetson artifacts. OpenVoiceStream resolves and deploys
+them through its profiles and its fail-closed
+`deploy/artifacts/v091-release-lock.json`.
 
-This repository should contain large generated artifacts only:
+## Repository map
 
-- ASR thinker engines and config/tokenizer sidecars
-- ASR audio encoder engines
-- TTS Talker config/tokenizer/text embedding sidecars
-- TTS W8A16 explicit Talker engines
-- TTS CodePredictor engines and auxiliary tensors
-- TTS stateful Code2Wav engines and configs
-- per-device manifests/checksums
-
-Do not store these large files in GitHub. Keep the required relative paths in `deploy/artifacts/qwen3_manifest.json` aligned with Jetson Voice profiles.
-
-## Publication status
-
-| Artifact set | HF status |
+| Model family | Generated-artifact repository |
 |---|---|
-| `orin-nano-highperf-2026-05-10` | complete |
-| `orin-nx-highperf-2026-05-11` | complete |
-| `orin-nano-official-2026-05-10` | complete |
-| `orin-nx-edgellm-v091-jp62-trt103-sm87-20260725` | 143-file staging set verified on Orin NX and WSL; original 116-file payload is on HF, while 24 sidecars plus the default-512 Code2Wav engine/config/sidecar and updated controls await explicit upload approval |
+| Qwen3 ASR / Qwen3 TTS | `harvestsu/qwen3-edgellm-jetson-artifacts` |
+| SparkTTS | `harvestsu/sparktts-0p5b-jetson-artifacts` |
+| MOSS-TTS-Nano | `harvestsu/seeed-local-voice-artifacts` |
+| Qwen3.5 GDN/MTP | `harvestsu/Qwen3.5-4B-AWQ-GDN-MTP-TensorRT-EdgeLLM-engine` |
+| SenseVoice | `harvestsu/sensevoice-rknn` |
 
-Do not mark a profile as reproducible until every path in its
-`required_files` list exists in the HF repo.
+The table names generated artifact stores, not official weight sources. The
+official model repo IDs and the proven immutable revisions are recorded in the
+r5 entry of `deploy/artifacts/qwen3_manifest.json`. Spark is pinned to model
+snapshot `642071559bfc6346c2359d19dcb6be3f9dd8a05d` and source commit
+`2f1ea9082400547242641f5271b6f941c9f439d1`. For the remaining models, the
+historical files in this repository do not prove one immutable snapshot; the
+outer OVS release lock must supply it. A floating `main` is not a release pin.
 
-The v0.9.1 full-runtime set is stored under
-`orin-nx-edgellm-v091-jp62-trt103-sm87-20260725/v091`. Unlike the older
-Qwen3-only sets, it includes version-matched runtime binaries, plugin, pybind,
-GDN+MTP, ASR, CustomVoice, Base, SparkTTS, MOSS, and SenseVoice artifacts.
-Its `manifest.json` inventories every payload file; `SHA256SUMS` is the
-portable verification list. The set is bound to SM87, JetPack 6.2 /
-L4T R36.4.3, CUDA 12.6, and TensorRT 10.3.0.30.
+## v0.9.1 assembly set
 
-The original publication was verified through the official
-`https://huggingface.co` endpoint. The expanded 143-file staging manifest is
-deliberately marked `published_to_hf=false` until the sidecars and default-512
-Code2Wav files have been uploaded, the remote tree has been rechecked, and the
-downloaded manifest matches byte-for-byte.
+The legacy aggregate staging candidate is
+`orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5`, under `v091/` in the
+Qwen3 artifact repository. It is bound to:
 
-## Stage and upload
+- NVIDIA TensorRT-Edge-LLM v0.9.1 at `7f061f21f0a581ba234a1e233c9315b89d8e47d6`;
+- 7 locked proposed-upstream bug patches plus 35 local product patches;
+- Jetson Orin NX, SM87, JetPack 6.2 / L4T R36.4.3, CUDA 12.6,
+  TensorRT 10.3, aarch64 Release;
+- the required file list, manifest, provenance, and SHA-256 inventory in
+  `deploy/artifacts/qwen3_manifest.json`.
 
-If the source directory already matches the manifest-relative layout:
+It remains `published_to_hf=false`. Do not describe it as released or use the
+repository-level `revision: main` as a production lock. This aggregate manifest
+is retained only for build/staging provenance.
+
+The only release source of truth is OVS
+`deploy/artifacts/v091-release-lock.json`. Its schema records:
+
+- `schema_version` and `artifact_set`;
+- `target.platform`, `target.sm`, `target.jetpack`, `target.cuda`,
+  `target.tensorrt`, and `target.onnxruntime`;
+- `source.upstream_sha`, `source.build_outer_sha`,
+  `source.engine_overlay_sha`, and `source.formal_diff_sha256`;
+- each `model_artifacts.<model>.repo`, immutable `revision`,
+  `payload_sha256`, and `payload_size`;
+- each `artifacts.<path>` digest, size, mode, and any other required file
+  metadata.
+
+## Publication gate
+
+All required files must exist and verify. Missing worker binaries, plugin,
+engines, metadata, provenance, or checksum files are fatal; optional/best-effort
+semantics are forbidden for anything listed in `required_files`.
+
+Use the mirror and preserve resumable HF cache state:
 
 ```bash
-python3 scripts/package_qwen3_artifacts.py \
-  --set orin-nano-highperf-2026-05-10 \
-  --source-root /opt/models/qwen3-edgellm \
-  --out /tmp/qwen3-hf-upload
+test "$(bash -c 'printf %s "$HF_ENDPOINT"')" = https://hf-mirror.com
 
-hf upload harvestsu/qwen3-edgellm-jetson-artifacts /tmp/qwen3-hf-upload . \
-  --repo-type model \
-  --commit-message "Upload orin-nano highperf artifacts"
+python3 scripts/package_qwen3_artifacts.py \
+  --set orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5 \
+  --source-root /opt/edgellm-v091 \
+  --out /tmp/edgellm-v091-r5-stage
 ```
 
-For scattered build outputs, repeat `--map RELATIVE_PATH=/actual/source/file` for each file that is not already under `--source-root`. The packager writes `checksums/<artifact-set>.json` with file sizes and SHA-256 digests.
+Upload requires explicit release approval. After upload, record the immutable
+HF commit in the OVS release lock, download that revision into a clean path,
+and verify every byte against `SHA256SUMS` before changing
+`published_to_hf` to true.

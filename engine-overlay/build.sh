@@ -253,6 +253,32 @@ _TGT="$(bash "${HERE}/detect-target.sh")" || { echo "ERROR: target detection fai
 eval "${_TGT}"
 CUDA_ARCH="${CMAKE_CUDA_ARCHITECTURES:-${CMAKE_CUDA_ARCH}}"
 echo "==> target: SM=${TARGET_SM} platform=${TARGET_PLATFORM} arch=${CUDA_ARCH} cute_tag=${CUTE_DSL_ARTIFACT_TAG} embedded='${EDGELLM_EMBEDDED_TARGET}'"
+
+# Probe the actual host and reject a different toolchain before CMake can emit
+# plausible-looking but incompatible release artifacts. Explicit probe values
+# are supported for hermetic builders; they remain subject to the exact gate.
+L4T_ACTUAL="${EDGELLM_TARGET_L4T_VERSION:-}"
+if [ -z "${L4T_ACTUAL}" ] && [ -r /etc/nv_tegra_release ]; then
+  L4T_ACTUAL="$(sed -nE 's/^# R([0-9]+).*REVISION: ([0-9]+\.[0-9]+).*/\1.\2/p' /etc/nv_tegra_release | head -1)"
+fi
+[ -n "${L4T_ACTUAL}" ] || { echo "ERROR: cannot prove L4T 36.4.3; set EDGELLM_TARGET_L4T_VERSION from trusted builder metadata." >&2; exit 3; }
+CUDA_ACTUAL="${EDGELLM_TARGET_CUDA_VERSION:-$(nvcc --version | sed -nE 's/.*release ([0-9]+\.[0-9]+).*/\1/p' | tail -1)}"
+[ -n "${CUDA_ACTUAL}" ] || { echo "ERROR: cannot probe CUDA toolkit version." >&2; exit 3; }
+TRT_ACTUAL="${EDGELLM_TARGET_TENSORRT_VERSION:-}"
+if [ -z "${TRT_ACTUAL}" ] && command -v dpkg-query >/dev/null 2>&1; then
+  TRT_ACTUAL="$(dpkg-query -W -f='${Version}\n' libnvinfer10 2>/dev/null | sed -nE 's/^([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' | head -1)"
+fi
+if [ -z "${TRT_ACTUAL}" ]; then
+  TRT_ACTUAL="$(python3 -c 'import tensorrt; print(tensorrt.__version__)' 2>/dev/null || true)"
+fi
+[ -n "${TRT_ACTUAL}" ] || { echo "ERROR: cannot prove TensorRT 10.3; set EDGELLM_TARGET_TENSORRT_VERSION from trusted builder metadata." >&2; exit 3; }
+python3 "${HERE}/verify-release-target.py" \
+  --sm "${TARGET_SM}" \
+  --platform "${TARGET_PLATFORM}" \
+  --embedded-target "${EDGELLM_EMBEDDED_TARGET}" \
+  --l4t "${L4T_ACTUAL}" \
+  --cuda "${CUDA_ACTUAL}" \
+  --tensorrt "${TRT_ACTUAL}"
 # ============================================================================
 # DUAL BUILD CONFIGURATION (v0.9.1 migration) — pick per artifact family:
 #
@@ -332,19 +358,24 @@ if [ -f "${VOICE_WORKER_SRC}/CMakeLists.txt" ]; then
   cmake --build "${WORKDIR}/build/voice-workers" -j"$(nproc)" \
         --target qwen3_asr_worker spark_tts_worker
 else
-  echo "WARN: ${VOICE_WORKER_SRC}/CMakeLists.txt not found — ASR worker NOT built." >&2
+  echo "ERROR: ${VOICE_WORKER_SRC}/CMakeLists.txt not found; required voice workers cannot be built." >&2
+  exit 4
 fi
 
 # --- 4c. MOSS worker ----------------------------------------------------------
 # Candidate 0031/0032 carries the worker in examples/omni/moss_tts_nano_worker.cpp
 # and registered the CMake target `moss_tts_nano_worker` (needs onnxruntime via
 # ORT_ROOT env / /usr/local/onnxruntime / ~/ort-from-container + SentencePiece;
-# the target is SKIPPED with a STATUS message when deps are missing, so this is
-# best-effort). The old cpp/workers/build_moss_worker.sh helper is LEGACY
+# the target is SKIPPED with a STATUS message when deps are missing. Release
+# builds require the worker, so both target failure and a missing output are
+# fatal. The old cpp/workers/build_moss_worker.sh helper is LEGACY
 # reference only — do not use it on the v0.9.1 chain.
-echo "==> building MOSS worker (cmake target moss_tts_nano_worker, best-effort)"
-cmake --build "${WORKDIR}/build" -j"$(nproc)" --target moss_tts_nano_worker \
-  || echo "WARN: moss_tts_nano_worker target unavailable (ORT/SentencePiece missing?) — skipped." >&2
+echo "==> building required MOSS worker (cmake target moss_tts_nano_worker)"
+cmake --build "${WORKDIR}/build" -j"$(nproc)" --target moss_tts_nano_worker
+if [ ! -x "${WORKDIR}/build/examples/omni/moss_tts_nano_worker" ]; then
+  echo "ERROR: moss_tts_nano_worker target completed without the required executable (check ORT_ROOT/SentencePiece)." >&2
+  exit 4
+fi
 # --- 4d. plugin unversioned symlink -----------------------------------------
 # The plugin builds as libNvInfer_edgellm_plugin.so.1.0 (VERSION 1.0/SOVERSION 1).
 # The workers default to the UNVERSIONED relative path build/libNvInfer_edgellm_plugin.so.
@@ -356,13 +387,14 @@ if [ -n "${PLUGIN_VERSIONED}" ]; then
   echo "==> plugin symlink: ${WORKDIR}/build/libNvInfer_edgellm_plugin.so -> $(basename "${PLUGIN_VERSIONED}")"
   echo "    (export EDGELLM_PLUGIN_PATH=${WORKDIR}/build/libNvInfer_edgellm_plugin.so to override)"
 else
-  echo "WARN: libNvInfer_edgellm_plugin.so.* not found in ${WORKDIR}/build — no symlink created." >&2
+  echo "ERROR: required libNvInfer_edgellm_plugin.so.* was not produced." >&2
+  exit 4
 fi
 
 echo "==> build done. Artifacts:"
 echo "      ${WORKDIR}/build/                       libNvInfer_edgellm_plugin.so*"
 echo "      ${WORKDIR}/build/examples/omni/         qwen3_tts_streaming_worker (Base N>1, slot-pool + shared-engine ctor)"
-echo "      ${WORKDIR}/build/examples/omni/         moss_tts_nano_worker (if ORT/SP present)"
+echo "      ${WORKDIR}/build/examples/omni/         moss_tts_nano_worker"
 echo "      ${WORKDIR}/build/voice-workers/workers/ qwen3_asr_worker (N>1)"
 echo "    Collect worker binaries + plugin .so + .engine, write md5 sidecars,"
 echo "    and reconcile against ${MANIFEST}. Engine build uses build_engine_bundle.py."

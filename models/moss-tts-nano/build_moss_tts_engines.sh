@@ -93,11 +93,10 @@ echo "[build] (3/6) moss_tts_local_decoder.plan ..."
 ${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_decoder.onnx" ${LOCAL_PREC} \
   --saveEngine="${ENGINES_DIR}/moss_tts_local_decoder.plan" 2>&1 | tail -5
 
-# ---- 4) Local cached step (optional, MVP unused but loaded) -----------------
+# ---- 4) Local cached step (required by the v0.9.1 release manifest) ---------
 echo "[build] (4/6) moss_tts_local_cached_step.plan ..."
 ${TRTEXEC} --onnx="${ONNX_DIR}/moss_tts_local_cached_step.onnx" ${LOCAL_PREC} \
-  --saveEngine="${ENGINES_DIR}/moss_tts_local_cached_step.plan" 2>&1 | tail -5 || \
-  echo "[build] WARN: local_cached_step build failed (non-fatal; engine is optional)"
+  --saveEngine="${ENGINES_DIR}/moss_tts_local_cached_step.plan" 2>&1 | tail -5
 
 # ---- 5) Local fixed sampled frame (production sampler, static) -------------
 echo "[build] (5/6) moss_tts_local_fixed_sampled_frame.plan ..."
@@ -121,6 +120,24 @@ done
 for f in codec_browser_onnx_meta.json moss_audio_tokenizer_encode.onnx \
          moss_audio_tokenizer_encode.data moss_audio_tokenizer_decode_shared.data; do
   [[ -f "${CODEC_ONNX_DIR}/${f}" ]] && cp "${CODEC_ONNX_DIR}/${f}" "${CODEC_DIR}/${f}"
+done
+
+for required in \
+  "${ENGINES_DIR}/moss_tts_prefill.plan" \
+  "${ENGINES_DIR}/moss_tts_decode_step.plan" \
+  "${ENGINES_DIR}/moss_tts_local_decoder.plan" \
+  "${ENGINES_DIR}/moss_tts_local_cached_step.plan" \
+  "${ENGINES_DIR}/moss_tts_local_fixed_sampled_frame.plan" \
+  "${ENGINES_DIR}/tokenizer.model" \
+  "${CODEC_DIR}/codec_decode_step.plan" \
+  "${CODEC_DIR}/codec_browser_onnx_meta.json" \
+  "${CODEC_DIR}/moss_audio_tokenizer_decode_shared.data" \
+  "${CODEC_DIR}/moss_audio_tokenizer_encode.onnx" \
+  "${CODEC_DIR}/moss_audio_tokenizer_encode.data"; do
+  if [[ ! -s "${required}" ]]; then
+    echo "[build] ERROR: required v0.9.1 MOSS artifact missing or empty: ${required}" >&2
+    exit 6
+  fi
 done
 
 # Symlink codec assets into engines/ (worker hardcodes codec_*.{plan,json} lookup under engineDir).

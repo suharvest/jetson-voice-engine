@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE_BUILDER = ROOT / "engine-overlay/build-engines-for-device.sh"
 SPARK_FETCH = ROOT / "engine-overlay/drivers/fetch-sparktts-v091-inputs.sh"
+MOSS_BUILD = ROOT / "models/moss-tts-nano/build_moss_tts_engines.sh"
 ARTIFACT_MANIFEST = ROOT / "deploy/artifacts/qwen3_manifest.json"
 FINAL_ARTIFACT_SET = "orin-nx-edgellm-v091-jp62-trt103-sm87-20260803-r5"
 
@@ -54,6 +55,23 @@ def test_spark_fetcher_materializes_a_new_no_checkout_clone_even_at_pinned_head(
     assert text.index(checkout) < text.index('actual_source="$(git -C "${source_dir}" rev-parse HEAD)"')
 
 
+def test_required_moss_release_outputs_are_not_best_effort():
+    text = MOSS_BUILD.read_text()
+    assert "local_cached_step build failed" not in text
+    assert "non-fatal" not in text
+    for required in (
+        "moss_tts_local_cached_step.plan",
+        "codec_decode_step.plan",
+        "codec_browser_onnx_meta.json",
+        "moss_audio_tokenizer_decode_shared.data",
+        "moss_audio_tokenizer_encode.onnx",
+        "moss_audio_tokenizer_encode.data",
+        "tokenizer.model",
+    ):
+        assert required in text
+    assert "required v0.9.1 MOSS artifact missing or empty" in text
+
+
 def test_final_v091_artifact_set_is_deployable_with_streaming_spark_engines():
     manifest = json.loads(ARTIFACT_MANIFEST.read_text())
     artifact_set = manifest["artifact_sets"][FINAL_ARTIFACT_SET]
@@ -64,6 +82,35 @@ def test_final_v091_artifact_set_is_deployable_with_streaming_spark_engines():
     assert artifact_set["capabilities"]["sparktts_max_slots"] == 2
     assert artifact_set["capabilities"]["sparktts_http_cancel_rounds"] == 10
     assert artifact_set["capabilities"]["moss_max_slots"] == 1
+    assert artifact_set["target"] == {
+        "device": "jetson-orin-nx",
+        "sm": "87",
+        "jetpack": "6.2",
+        "l4t": "36.4.3",
+        "cuda": "12.6",
+        "tensorrt": "10.3",
+        "embedded_target": "jetson-orin",
+        "aarch64_build": True,
+        "build_type": "Release",
+    }
+    assert artifact_set["proposed_upstream_patch_count"] == 7
+    assert artifact_set["overlay_patch_count"] == 35
+    assert artifact_set["release_lock"]["path"] == "deploy/artifacts/v091-release-lock.json"
+    assert artifact_set["release_lock"]["required"] is True
+    assert artifact_set["release_lock"]["hf_revision_required"] is True
+    spark = artifact_set["model_sources"]["sparktts"]
+    assert spark["revision"] == "642071559bfc6346c2359d19dcb6be3f9dd8a05d"
+    assert spark["source_revision"] == "2f1ea9082400547242641f5271b6f941c9f439d1"
+    for model in (
+        "qwen3_asr",
+        "qwen3_tts_customvoice",
+        "qwen3_tts_base",
+        "moss_tts_nano",
+        "moss_audio_tokenizer",
+        "qwen3_5_gdn_mtp",
+    ):
+        assert artifact_set["model_sources"][model]["revision"] is None
+        assert "release lock" in artifact_set["model_sources"][model]["revision_policy"]
     assert {
         "manifest.json",
         "SHA256SUMS",

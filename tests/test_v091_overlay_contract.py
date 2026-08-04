@@ -72,6 +72,87 @@ def test_manifests_pin_v091_and_require_provenance():
         assert data["proposed_upstream_patches"]["count"] == 7, path
         assert data["artifacts"]["provenance_required"] is True, path
         assert data["artifacts"]["sha256_required"] is True, path
+        assert data["target"] == {
+            "device": "jetson-orin-nx",
+            "sm": "87",
+            "jetpack": "6.2",
+            "l4t": "36.4.3",
+            "cuda": "12.6",
+            "tensorrt": "10.3",
+            "embedded_target": "jetson-orin",
+            "aarch64_build": True,
+        }, path
+        assert data["build"]["type"] == "Release", path
+
+
+def test_manifest_validator_rejects_non_release_target_before_build(tmp_path):
+    source = OVERLAY / "manifests/qwen3-asr-sm87.toml"
+    validator = OVERLAY / "validate-manifest.py"
+    for old, new, expected in (
+        ('sm = "87"', 'sm = "89"', "[target].sm"),
+        ('jetpack = "6.2"', 'jetpack = "6.1"', "[target].jetpack"),
+        ('cuda = "12.6"', 'cuda = "13.0"', "[target].cuda"),
+        ('tensorrt = "10.3"', 'tensorrt = "10.4"', "[target].tensorrt"),
+        ('type = "Release"', 'type = "Debug"', "[build].type"),
+    ):
+        candidate = tmp_path / f"bad-{expected.rsplit('.', 1)[-1]}.toml"
+        candidate.write_text(source.read_text().replace(old, new, 1))
+        result = subprocess.run(
+            [sys.executable, str(validator), str(OVERLAY), str(candidate), PIN],
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode != 0
+        assert expected in result.stderr
+
+
+def test_required_release_workers_and_plugin_fail_loud():
+    text = (OVERLAY / "build.sh").read_text()
+    assert "moss_tts_nano_worker, best-effort" not in text
+    assert "target unavailable" not in text
+    assert 'if [ ! -x "${WORKDIR}/build/examples/omni/moss_tts_nano_worker" ]' in text
+    assert "required voice workers cannot be built" in text
+    assert "required libNvInfer_edgellm_plugin.so.* was not produced" in text
+
+
+def test_release_target_probe_accepts_only_qualified_tuple():
+    verifier = OVERLAY / "verify-release-target.py"
+    good = subprocess.run(
+        [
+            sys.executable,
+            str(verifier),
+            "--sm", "87",
+            "--platform", "tegra",
+            "--embedded-target", "jetson-orin",
+            "--l4t", "36.4.3",
+            "--cuda", "12.6",
+            "--tensorrt", "10.3.0.30",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert good.returncode == 0, good.stderr
+
+    for flag, wrong in (
+        ("--sm", "89"),
+        ("--l4t", "36.4.2"),
+        ("--cuda", "12.8"),
+        ("--tensorrt", "10.4.0"),
+    ):
+        command = [
+            sys.executable,
+            str(verifier),
+            "--sm", "87",
+            "--platform", "tegra",
+            "--embedded-target", "jetson-orin",
+            "--l4t", "36.4.3",
+            "--cuda", "12.6",
+            "--tensorrt", "10.3.0.30",
+        ]
+        command[command.index(flag) + 1] = wrong
+        bad = subprocess.run(command, text=True, capture_output=True)
+        assert bad.returncode != 0
+        assert "release target mismatch" in bad.stderr
 
 
 def test_engine_builder_has_explicit_mtp_fail_loud_hook():
