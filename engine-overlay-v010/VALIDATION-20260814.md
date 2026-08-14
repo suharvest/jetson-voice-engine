@@ -183,12 +183,75 @@ Its RMS/peak (352.66/4215) are comparable to one-shot (386.78/4231), and the
 two modes have the same RVQ SHA-256
 `6258d8b62d8f98f7c3b0c0f678debaca7b3fcaa4951f89e8a709d74bce6ca7eb`.
 
+## Qwen3-ASR FP16 gray runtime on orin-nano (2026-08-15)
+
+This is a gray functional lane, not the formal INT4 release artifact. The
+checkpoint is `Qwen/Qwen3-ASR-0.6B` at immutable revision
+`5eb144179a02acc5e5ba31e748d22b0cf3e303b0`. It was downloaded through
+`https://hf-mirror.com`; `model.safetensors` SHA-256 is
+`79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea`.
+The checked checkpoint tar SHA-256 is
+`673d68f455b118f54955eeb29baea163ba44a2a8149c52d492040e77d17db747`.
+
+The complete patched v0.10 exporter produced FP16 thinker and audio-encoder
+ONNX on the host; both pass `onnx.checker`. The checked ONNX transport tar
+SHA-256 is
+`cafe29ab00c9b191b966aba7d452ef23582af3cd251b69eb855b155d36b7541b`.
+The v0.10 builders then produced on Nano:
+
+- thinker b1:
+  `7894bdf9207edf6b55b169735cc9fe52e84b4cb8907d1fda7d17e87e3325abf9`;
+- thinker b2 (`max_batch_size=2`):
+  `8c5efe7647ce6abc3464ec86417095b46365aabb3a3e5952cb613cae503a6586`;
+- audio encoder:
+  `84c41bf89e394cf76f59db472db4d4bab4d1ad2266ee23bd9f68ed8e1fd961b1`.
+
+The ASR worker was rebuilt from this branch's vendored source and linked to
+the same v0.10 `libedgellmCore.a` and plugin. After the native-batch safety
+guard described below, source SHA-256 is
+`07aadf3a9b76835cfe2bb43886fb132687bc9e3f2f89c426f7aa0f7583b91bd7`
+and binary SHA-256 is
+`3381a9ce35d32c199ac37a65cecfe772b056678a48796d296d4f2520e752eab2`.
+
+The b1 worker transcribed a checked 3.2-second real 24 kHz Chinese WAV
+(`40609737c5c1d290f6bfe8e45ccebdb316a44c61606d286754b62b229bf753eb`)
+through the production `pcm_b64` path as exactly
+`一二三四五六七八九十。`. Three repeated finalizations took 558--584 ms
+engine time. The b1 engine correctly clamps `--max_slots=2` to one lane; a
+second begin returns `pool_saturated` / status 4429, and the lane is reusable
+after release. A 33-sample `tegrastats` run observed peak RAM 4311/7620 MB and
+peak GPU busy 72%.
+
+The b2 engine exposes lanes 0 and 1, rejects a third begin with status 4429,
+and reuses a released lane. Two simultaneously resident sessions finalized
+serially with exact isolated transcripts `今天天气真好。` and
+`人工智能改变了世界。` in 614 ms and 166 ms in the final guarded run. Peak
+RAM was 4381/7620 MB and peak GPU busy 96%.
+
+However, a single native multimodal request containing those two distinct WAVs
+did **not** preserve isolation: before the guard, row 0 returned row 1's text
+and row 1 hallucinated while the runtime reported `ok=true`. This is positive
+evidence that v0.10 does not yet provide usable ASR continuous batching. The
+worker now fails that unsafe request shape closed with
+`native_audio_batch_unsafe_v010`; N=2 currently means two sessions may
+co-reside while their full-audio finalizations execute serially. It is neither
+mid-decode admission/refill nor true continuous batching. A two-distinct-WAV
+native isolation gate must pass before this guard can be removed.
+
+The v0.10 audio runner logs two non-fatal constraints in this configuration:
+online GPU fbank needs `ENABLE_CUTE_DSL=gemm` (the release build currently
+enables `fmha`, so CPU mel fallback is used), and the generic Omni runner probes
+an optional `action.engine` that ASR does not use. Neither prevented the checked
+ASR outputs above.
+
 ## Gates still required before an overall OVS upgrade
 
 - Regenerate every ONNX and TensorRT engine with v0.10 identity.
 - Publish model-owned immutable artifacts and a new outer v0.10 release lock.
-- Run ASR, Qwen3-TTS Base/CustomVoice/native clone, MOSS, Spark, Qwen3.5,
-  cancellation/recovery, N=1/N=2, byte/parity, co-residency, and RSS gates.
+- Replace the ASR FP16 gray set with formal INT4 artifacts; keep native audio
+  batch disabled until its two-WAV isolation defect is fixed.
+- Run Qwen3-TTS CustomVoice, MOSS, Spark, Qwen3.5, cancellation/recovery,
+  byte/parity, cross-model co-residency, and release-profile RSS gates.
 - Build new v0.10 runtime images/profiles/compose identities while preserving
   v0.9.1 as rollback.
 

@@ -1639,6 +1639,23 @@ Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t s
         {
             throw std::runtime_error("No valid ASR requests found");
         }
+        // v0.10.0's Qwen3-ASR multimodal preprocessor does not preserve audio
+        // isolation when two distinct PCM clips are submitted in one native
+        // request batch: Orin gray validation observed row 0 consuming row 1's
+        // transcript while row 1 hallucinated, even though handleRequest()
+        // returned success. Keep the safe N>1 contract (two sessions may
+        // co-reside, with their one-shot finalizations serialized below), but
+        // never return silently corrupted native-batch output. Remove this
+        // guard only after a two-distinct-WAV isolation gate passes on v0.10+.
+        for (auto const& batch : batchedRequests)
+        {
+            if (batch.requests.size() > 1)
+            {
+                throw std::runtime_error(
+                    "native_audio_batch_unsafe_v010: use separate ASR sessions; "
+                    "worker finalizations are serialized for audio isolation");
+            }
+        }
 
         Json responses = Json::array();
         bool ok = true;

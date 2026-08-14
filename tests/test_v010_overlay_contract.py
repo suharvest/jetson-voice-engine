@@ -252,3 +252,12 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
     result = subprocess.run([str(driver)], text=True, capture_output=True)
     assert result.returncode != 0
     assert "set UPSTREAM" in result.stderr
+
+
+def test_v010_asr_worker_fails_closed_on_unsafe_native_audio_batch():
+    worker = (
+        ROOT / "native/edgellm_voice_worker/qwen3_asr_worker.cpp"
+    ).read_text(encoding="utf-8")
+    assert "native_audio_batch_unsafe_v010" in worker
+    assert "batch.requests.size() > 1" in worker
+    assert "worker finalizations are serialized for audio isolation" in worker
