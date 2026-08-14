@@ -20,7 +20,7 @@ checksums = "patches/v010-candidate/SHA256SUMS"
 count = 32
 sparse_numbering = true
 series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
-checksums_sha256 = "de6990fbba76cfbb40573a39b24648eff2476712301a68bb4944375d95eb8b2c"
+checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
 
 [target]
 device = "jetson-orin-nx"
@@ -34,7 +34,7 @@ aarch64_build = true
 
 [build]
 type = "Release"
-enable_cute_dsl = "OFF"
+enable_cute_dsl = "fmha"
 worker = "spark_tts_worker"
 
 [driver]

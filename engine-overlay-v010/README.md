@@ -77,7 +77,17 @@ The first qualified artifact metadata and checksum are recorded in
 `CUTEDSL-SM87-CUDA12.lock`; a final release must publish and bind that artifact
 in the outer OVS v0.10 release lock.
 
-The copied aggregate `build-engines-for-device.sh` is deliberately fail-closed:
-its export/build assumptions belong to v0.9.1. Model-specific v0.10 export and
-engine drivers must be ported and must produce a new artifact set before any
-outer OVS profile, image, or release lock moves to v0.10.
+The aggregate `build-engines-for-device.sh` is now a v0.10-only driver. It
+verifies the official v0.10.0 base pin, requires immutable model revisions,
+uses the native Base/VoiceDesign/CustomVoice exporter, builds both native Base
+clone encoders, and uses the upstream MTP `--specBase` / `--specDraft` path.
+Qwen3-TTS INT4 remains an explicit product driver because upstream v0.10
+supports the Talker in FP16 only: `qwen3-tts` is the native FP16 route and
+`qwen3-tts-int4` is the separately qualified product extension. Native
+VoiceDesign and Qwen3.5 DFlash routes are revision-locked for gray testing.
+The aggregate driver always writes to a new v0.10 artifact root; no v0.9.1
+ONNX or engine is accepted as an input.
+
+The port makes model regeneration possible but does not by itself switch OVS.
+Every v0.10 model artifact must still pass hardware qualification and be bound
+by a new outer release lock before profiles, images, or compose identities move.

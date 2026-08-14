@@ -20,7 +20,7 @@ checksums = "patches/v010-candidate/SHA256SUMS"
 count = 32
 sparse_numbering = true
 series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
-checksums_sha256 = "de6990fbba76cfbb40573a39b24648eff2476712301a68bb4944375d95eb8b2c"
+checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
 
 [target]
 device = "jetson-orin-nx"
@@ -34,7 +34,7 @@ aarch64_build = true
 
 [build]
 type = "Release"
-enable_cute_dsl = "OFF"
+enable_cute_dsl = "fmha"
 worker = "qwen3_tts_streaming_worker"
 max_batch_size = 1
 max_input_len = 1024
@@ -43,34 +43,36 @@ n2_opt_in_env = "TTS_MAX_BATCH_SIZE=2"
 
 [model.customvoice]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+revision = "85e237c12c027371202489a0ec509ded67b5e4b5"
 precision = "int4"
+upstream_supported_precision = false
+product_extension = true
 components = ["talker", "code_predictor", "code2wav"]
 required_driver_env = "EDGELLM_TTS_INT4_DRIVER"
 required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md"]
 
 [model.base]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-precision = "int4"
-components = ["talker", "code_predictor", "code2wav", "speaker_encoder"]
-required_driver_env = "EDGELLM_TTS_BASE_DRIVER"
-required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md", "SHA256SUMS"]
-required_model_revision_env = "TTS_BASE_MODEL_REVISION"
-required_int4_stage2_env = ["TTS_BASE_STAGE2_CHECKPOINT", "TTS_BASE_STAGE2_REVISION"]
+revision = "5d83992436eae1d760afd27aff78a71d676296fc"
+precision = "fp16"
+components = ["talker", "code_predictor", "code2wav", "speaker_encoder", "speech_tokenizer_encoder"]
+native_v010_export = true
 
 [artifacts]
 root = "/opt/edgellm-v010"
 required = [
   "libNvInfer_edgellm_plugin.so",
   "bin/qwen3_tts_streaming_worker",
-  "engines/tts_customvoice_int4/talker/llm.engine",
-  "engines/tts_customvoice_int4/talker/DRIVER_REVISION",
-  "engines/tts_customvoice_int4/talker/PROVENANCE.md",
-  "engines/tts_customvoice_fp16/code_predictor/llm.engine",
-  "engines/tts_customvoice_fp16/code2wav/code2wav/code2wav.engine",
-  "engines/tts_base_talker/llm.engine",
-  "engines/tts_base_code_predictor/llm.engine",
-  "engines/tts_base_code2wav_512/code2wav.engine",
-  "engines/tts_base_spk_encoder/speaker_encoder/spk_encoder.engine",
+  "engines/qwen3-tts-int4/talker/llm.engine",
+  "engines/qwen3-tts-int4/talker/DRIVER_REVISION",
+  "engines/qwen3-tts-int4/talker/PROVENANCE.md",
+  "engines/qwen3-tts-int4/code_predictor/llm.engine",
+  "engines/qwen3-tts-int4/code2wav/code2wav.engine",
+  "engines/qwen3-tts-base/talker/llm.engine",
+  "engines/qwen3-tts-base/code_predictor/llm.engine",
+  "engines/qwen3-tts-base/code2wav/code2wav.engine",
+  "engines/qwen3-tts-base/clone_encoders/speaker_encoder.engine",
+  "engines/qwen3-tts-base/clone_encoders/speech_tokenizer_encoder.engine",
 ]
 provenance_required = true
 sha256_required = true

@@ -20,7 +20,7 @@ checksums = "patches/v010-candidate/SHA256SUMS"
 count = 32
 sparse_numbering = true
 series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
-checksums_sha256 = "de6990fbba76cfbb40573a39b24648eff2476712301a68bb4944375d95eb8b2c"
+checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
 
 [target]
 device = "jetson-orin-nx"
@@ -34,12 +34,15 @@ aarch64_build = true
 
 [build]
 type = "Release"
-enable_cute_dsl = "OFF"
+enable_cute_dsl = "fmha"
 worker = "qwen3_asr_worker"
 
 [model]
 id = "Qwen/Qwen3-ASR-0.6B"
+revision = "5eb144179a02acc5e5ba31e748d22b0cf3e303b0"
 precision = "int4_awq"
+upstream_supported_precision = false
+product_extension = true
 components = ["thinker", "audio_encoder"]
 batch_sizes = [1, 2]
 max_input_len = 1024
@@ -51,9 +54,9 @@ root = "/opt/edgellm-v010"
 required = [
   "libNvInfer_edgellm_plugin.so",
   "bin/qwen3_asr_worker",
-  "engines/asr_thinker_full_int4_b1/llm.engine",
-  "engines/asr_thinker_full_int4_b2/llm.engine",
-  "engines/asr_audio_encoder/audio/audio_encoder.engine",
+  "engines/qwen3-asr/thinker-b1/llm.engine",
+  "engines/qwen3-asr/thinker-b2/llm.engine",
+  "engines/qwen3-asr/audio_encoder/audio/audio_encoder.engine",
 ]
 provenance_required = true
 sha256_required = true

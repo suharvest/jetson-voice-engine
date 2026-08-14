@@ -21,7 +21,7 @@ checksums = "patches/v010-candidate/SHA256SUMS"
 count = 32
 sparse_numbering = true
 series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
-checksums_sha256 = "de6990fbba76cfbb40573a39b24648eff2476712301a68bb4944375d95eb8b2c"
+checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
 
 [target]
 device = "jetson-orin-nx"
@@ -35,13 +35,16 @@ aarch64_build = true
 
 [build]
 type = "Release"
-enable_cute_dsl = "OFF"
+enable_cute_dsl = "fmha"
 worker = "qwen3_tts_streaming_worker"
 max_batch_size = 2
 
 [model]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+revision = "85e237c12c027371202489a0ec509ded67b5e4b5"
 precision = "int4"
+upstream_supported_precision = false
+product_extension = true
 components = ["talker", "code_predictor", "code2wav"]
 
 [artifacts]
@@ -49,11 +52,11 @@ root = "/opt/edgellm-v010"
 required = [
   "libNvInfer_edgellm_plugin.so",
   "bin/qwen3_tts_streaming_worker",
-  "engines/tts_customvoice_int4/talker/llm.engine",
-  "engines/tts_customvoice_int4/talker/DRIVER_REVISION",
-  "engines/tts_customvoice_int4/talker/PROVENANCE.md",
-  "engines/tts_customvoice_fp16/code_predictor/llm.engine",
-  "engines/tts_customvoice_fp16/code2wav/code2wav/code2wav.engine",
+  "engines/qwen3-tts-int4/talker/llm.engine",
+  "engines/qwen3-tts-int4/talker/DRIVER_REVISION",
+  "engines/qwen3-tts-int4/talker/PROVENANCE.md",
+  "engines/qwen3-tts-int4/code_predictor/llm.engine",
+  "engines/qwen3-tts-int4/code2wav/code2wav.engine",
 ]
 provenance_required = true
 sha256_required = true

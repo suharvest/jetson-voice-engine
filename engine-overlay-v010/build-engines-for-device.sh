@@ -12,7 +12,7 @@
 # audio_build pipeline). Add a model = add a MODELS[] manifest line:
 #   qwen3-asr       | Qwen/Qwen3-ASR-0.6B                    | asr | int4_awq (b1+b2)
 #   qwen3-tts       | Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice   | tts | int4
-#   qwen3-tts-base  | Qwen/Qwen3-TTS-12Hz-0.6B-Base          | tts | int4 (+ speaker encoder)
+#   qwen3-tts-base  | Qwen/Qwen3-TTS-12Hz-0.6B-Base          | tts | fp16 (+ native clone encoders)
 #   qwen3.5-4b      | compatibility alias for qwen3.5-4b-base
 #   qwen3.5-4b-base | Qwen/Qwen3.5-4B                        | llm | nvfp4
 #   qwen3.5-4b-mtp  | same source; base plus explicit MTP integration hook
@@ -31,16 +31,24 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "ERROR: the copied v0.9.1 aggregate engine driver is not qualified for v0.10.0." >&2
-echo "       v0.10 ONNX and engines must be regenerated with model-specific v0.10 drivers" >&2
-echo "       and published under a new release identity; see README.md." >&2
-exit 5
-
 UPSTREAM="${UPSTREAM:?set UPSTREAM=<patched TensorRT-Edge-LLM tree>}"
+EXPECTED_UPSTREAM_PIN="71dd1bae032e70771265917ec74d3ff4cad07a10"
+ACTUAL_UPSTREAM_PIN="$(git -C "${UPSTREAM}" rev-parse HEAD 2>/dev/null || true)"
+if [ -z "${ACTUAL_UPSTREAM_PIN}" ]; then
+  # Release builders may consume a verified source archive without .git.
+  # The archive producer must bind the exact base in trusted metadata and pass
+  # it explicitly; arbitrary bypasses and floating version strings are rejected.
+  ACTUAL_UPSTREAM_PIN="${EDGELLM_UPSTREAM_BASE_REVISION:-}"
+fi
+[ "${ACTUAL_UPSTREAM_PIN}" = "${EXPECTED_UPSTREAM_PIN}" ] || {
+  echo "ERROR: expected TensorRT-Edge-LLM v0.10.0 base ${EXPECTED_UPSTREAM_PIN}" >&2
+  echo "       got ${ACTUAL_UPSTREAM_PIN:-<not-a-git-checkout>} from ${UPSTREAM}" >&2
+  exit 5
+}
 EXPORT_ROOT="${EXPORT_ROOT:-${UPSTREAM}/../export}"
 MODEL_ROOT="${MODEL_ROOT:-${UPSTREAM}/../models}"
-BUILD="${UPSTREAM}/build"                 # voice-worker build (ENABLE_CUTE_DSL=OFF)
-BUILD_GDN="${UPSTREAM}/build-gdn"         # GDN build (ENABLE_CUTE_DSL=fmha;gdn) — for llm
+BUILD="${UPSTREAM}/build"                 # voice-worker build (ENABLE_CUTE_DSL=fmha)
+BUILD_GDN="${UPSTREAM}/build-gdn"         # GDN build (ENABLE_CUTE_DSL=ALL) — for GDN/spec decode
 PLUGIN="${BUILD}/libNvInfer_edgellm_plugin.so"
 HF="${HF_ENDPOINT:-}"
 if [ "${HF}" != "https://hf-mirror.com" ]; then
@@ -92,9 +100,21 @@ _find_trtexec() {
   command -v trtexec 2>/dev/null || { echo "trtexec not found (set TRTEXEC=)" >&2; exit 3; }
 }
 
-_dl() { # repo -> local dir (idempotent)
-  local repo="$1" dst="${MODEL_ROOT}/$(basename "$1")"
-  [ -f "${dst}/config.json" ] || HF_ENDPOINT="${HF}" hf download "${repo}" --local-dir "${dst}" >/dev/null
+_dl() { # repo revision -> local dir (idempotent, immutable)
+  local repo="$1" revision="$2" dst="${MODEL_ROOT}/$(basename "$1")"
+  [ -n "${revision}" ] || {
+    echo "ERROR: immutable HF revision is required for ${repo}" >&2
+    exit 14
+  }
+  if [ ! -f "${dst}/config.json" ]; then
+    HF_ENDPOINT="${HF}" hf download "${repo}" --revision "${revision}" --local-dir "${dst}" >/dev/null
+    printf '%s\n' "${revision}" > "${dst}/SOURCE_REVISION"
+  elif [ ! -s "${dst}/SOURCE_REVISION" ] \
+      || [ "$(cat "${dst}/SOURCE_REVISION")" != "${revision}" ]; then
+    echo "ERROR: existing model directory has missing/mismatched SOURCE_REVISION: ${dst}" >&2
+    echo "       expected ${revision}; use a clean MODEL_ROOT for v0.10" >&2
+    exit 14
+  fi
   printf '%s' "${dst}"
 }
 
@@ -107,9 +127,24 @@ _write_meta(Path(sys.argv[1]), detect_host_signature(), "local_build", None)
 PY
 }
 
-build_asr() { # $1 model_id  $2 hf_repo  $3 precision(int4_awq|fp16)
-  local m="$1" repo="$2" prec="${3:-int4_awq}" src out max_input max_kv suffix
-  src="$(_dl "${repo}")"; out="${EXPORT_ROOT}/${m}"
+_provenance() { # artifact-root repo revision precision
+  local root="$1" repo="$2" revision="$3" precision="$4"
+  mkdir -p "${root}"
+  {
+    printf 'upstream_version: v0.10.0\n'
+    printf 'upstream_revision: %s\n' "${EXPECTED_UPSTREAM_PIN}"
+    printf 'model_repo: %s\n' "${repo}"
+    printf 'model_revision: %s\n' "${revision}"
+    printf 'precision: %s\n' "${precision}"
+    printf 'target_sm: %s\n' "${TARGET_SM}"
+    printf 'target_platform: %s\n' "${TARGET_PLATFORM}"
+  } > "${root}/PROVENANCE.md"
+  sha256sum "${root}/PROVENANCE.md" > "${root}/SHA256SUMS.provenance"
+}
+
+build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
+  local m="$1" repo="$2" prec="${3:-int4_awq}" src out max_input max_kv suffix export_src
+  src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   max_input="${ASR_MAX_INPUT_LEN:-1024}"
   max_kv="${ASR_MAX_KV_CACHE_CAPACITY:-1536}"
   if { [ "${max_input}" != "1024" ] || [ "${max_kv}" != "1536" ]; } \
@@ -122,10 +157,33 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision(int4_awq|fp16)
       && { [ "${max_input}" != "1024" ] || [ "${max_kv}" != "1536" ]; }; then
     suffix="-longctx-${max_input}-${max_kv}"
   fi
-  echo "==> [asr:${m}] quantize ${prec} -> export(--fp8-embedding) -> thinker + audio encoder"
+  export_src="${src}"
+  if [ "${prec}" != "fp16" ] && [ "${prec}" != "bf16" ]; then
+    export_src="${out}/_q"
+    echo "==> [asr:${m}] quantize ${prec}"
+    ( cd "${UPSTREAM}"
+      tensorrt-edgellm-quantize llm \
+        --model_dir "${src}" \
+        --output_dir "${export_src}" \
+        --quantization "${prec}" \
+        --text_dataset cnn_dailymail )
+  fi
+  echo "==> [asr:${m}] v0.10 export -> thinker + audio encoder"
   ( cd "${UPSTREAM}"
-    tensorrt-edgellm-quantize llm --model_dir "${src}" --output_dir "${out}/_q" --quantization "${prec}"
-    tensorrt-edgellm-export "${out}/_q" "${out}/onnx" --fp8-embedding )
+    if [ "${ASR_FP8_EMBEDDING:-0}" = "1" ]; then
+      tensorrt-edgellm-export "${export_src}" "${out}/onnx" --fp8-embedding
+    else
+      tensorrt-edgellm-export "${export_src}" "${out}/onnx"
+    fi )
+  for required in \
+    llm/model.onnx llm/config.json llm/embedding.safetensors \
+    llm/tokenizer.json llm/processed_chat_template.json \
+    audio/model.onnx audio/config.json; do
+    [ -s "${out}/onnx/${required}" ] || {
+      echo "ERROR: v0.10 ASR exporter did not produce ${out}/onnx/${required}" >&2
+      exit 8
+    }
+  done
   # Keep distinct b1/b2 artifacts: b1 is the low-footprint rollback; b2 is
   # required for two independent SessionLaneManager lanes. Long-context
   # opt-ins use suffixed directories and cannot overwrite the production pair.
@@ -135,16 +193,21 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision(int4_awq|fp16)
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
       --engineDir "${out}/thinker-b2${suffix}" --maxBatchSize 2 \
       --maxInputLen "${max_input}" --maxKVCacheCapacity "${max_kv}"
-  run_builder "${BUILD}/examples/multimodal/audio_build" --onnxDir "${out}/onnx/audio" --engineDir "${out}/audio_encoder"
+  run_builder "${BUILD}/examples/multimodal/audio_build" \
+      --onnxDir "${out}/onnx/audio" \
+      --engineDir "${out}/audio_encoder" \
+      --minTimeSteps "${ASR_AUDIO_MIN_TIME_STEPS:-100}" \
+      --maxTimeSteps "${ASR_AUDIO_MAX_TIME_STEPS:-3000}"
   _meta "${out}/thinker-b1${suffix}/llm.engine"
   _meta "${out}/thinker-b2${suffix}/llm.engine"
   _meta "${out}/audio_encoder/audio/audio_encoder.engine"
+  _provenance "${out}" "${repo}" "$4" "${prec}"
 }
 
-build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
+build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable revision
   local m="$1" repo="$2" prec="${3:-int4}" src out
   local tts_batch tts_max_input tts_max_kv tts_engine_suffix
-  src="$(_dl "${repo}")"; out="${EXPORT_ROOT}/${m}"
+  src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   # Product defaults are the v0.8 Base limits already validated on Jetson.
   # Concurrency is a separate artifact choice: the default build is the
   # low-footprint N=1 engine; opt-in N=2 builds use distinct directories so
@@ -164,39 +227,15 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
     echo "ERROR: TTS context is frozen at input=1024/KV=1536; rebuild only after updating the validated product contract" >&2
     exit 13
   fi
-  echo "==> [tts:${m}] talker(${prec}) + code_predictor + code2wav (fp16)"
+  echo "==> [tts:${m}] v0.10 talker(${prec}) + code_predictor + code2wav (fp16)"
   ( cd "${UPSTREAM}"
-    if [ "${m}" = "qwen3-tts-base" ]; then
-      # Official v0.9.1 rejects Qwen3-TTS Base checkpoints and supports only
-      # CustomVoice. Keep Base as a reviewed local integration until upstream
-      # implements it; never credit a historical ONNX tree as a v0.9.1 export.
-      if [ -z "${EDGELLM_TTS_BASE_DRIVER:-}" ] \
-          || [ ! -x "${EDGELLM_TTS_BASE_DRIVER:-}" ]; then
-        echo "ERROR: Qwen3-TTS Base requires executable EDGELLM_TTS_BASE_DRIVER" >&2
-        exit 12
-      fi
-      TTS_BASE_UPSTREAM="${UPSTREAM}" \
-      TTS_BASE_MODEL="${src}" \
-      TTS_BASE_OUTPUT="${out}/onnx" \
-      TTS_BASE_PRECISION="${prec}" \
-        "${EDGELLM_TTS_BASE_DRIVER}"
-      for required in \
-        llm/model.onnx llm/config.json \
-        code_predictor/model.onnx code_predictor/config.json \
-        code2wav/model.onnx code2wav/config.json \
-        DRIVER_REVISION PROVENANCE.md SHA256SUMS; do
-        [ -s "${out}/onnx/${required}" ] || {
-          echo "ERROR: Base driver did not produce ${out}/onnx/${required}" >&2
-          exit 12
-        }
-      done
-    elif [ "${prec}" = "int4" ]; then
-      # v0.9.1 does not ship the product INT4 talker driver. Require a reviewed,
-      # executable integration and provenance instead of referencing a
-      # repository-local driver directory that upstream does not provide.
+    if [ "${prec}" = "int4" ]; then
+      # v0.10 still supports Qwen3-TTS Talker in FP16 only. Keep the reviewed
+      # product INT4 Talker route isolated and provenance-bearing; all other
+      # components, including Base clone encoders, come from native v0.10.
       if [ -z "${EDGELLM_TTS_INT4_DRIVER:-}" ] \
           || [ ! -x "${EDGELLM_TTS_INT4_DRIVER:-}" ]; then
-        echo "ERROR: CustomVoice INT4 requires executable EDGELLM_TTS_INT4_DRIVER" >&2
+        echo "ERROR: Qwen3-TTS INT4 requires executable EDGELLM_TTS_INT4_DRIVER" >&2
         exit 9
       fi
       TTS_INT4_UPSTREAM="${UPSTREAM}" \
@@ -212,8 +251,22 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
       done
       tensorrt-edgellm-export "${src}" "${out}/onnx" --components code_predictor,code2wav
     else
-      tensorrt-edgellm-export "${src}" "${out}/onnx" --components talker,code_predictor,code2wav
+      tensorrt-edgellm-export "${src}" "${out}/onnx" \
+        --components talker,code_predictor,code2wav
     fi )
+  for required in \
+    llm/model.onnx llm/config.json llm/embedding.safetensors \
+    llm/text_embedding.safetensors llm/text_projection.safetensors \
+    llm/tokenizer.json llm/processed_chat_template.json \
+    code_predictor/model.onnx code_predictor/config.json \
+    code_predictor/codec_embeddings.safetensors \
+    code_predictor/lm_heads.safetensors \
+    code2wav/model.onnx code2wav/config.json; do
+    [ -s "${out}/onnx/${required}" ] || {
+      echo "ERROR: v0.10 exporter did not produce ${out}/onnx/${required}" >&2
+      exit 12
+    }
+  done
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
       --engineDir "${out}/talker${tts_engine_suffix}" \
       --maxBatchSize "${tts_batch}" \
@@ -222,9 +275,6 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
   if [ "${prec}" = "int4" ]; then
     cp -p "${out}/onnx/llm/DRIVER_REVISION" "${out}/talker${tts_engine_suffix}/DRIVER_REVISION"
     cp -p "${out}/onnx/llm/PROVENANCE.md" "${out}/talker${tts_engine_suffix}/PROVENANCE.md"
-  elif [ "${m}" = "qwen3-tts-base" ]; then
-    cp -p "${out}/onnx/DRIVER_REVISION" "${out}/talker${tts_engine_suffix}/DRIVER_REVISION"
-    cp -p "${out}/onnx/PROVENANCE.md" "${out}/talker${tts_engine_suffix}/PROVENANCE.md"
   fi
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/code_predictor" \
       --engineDir "${out}/code_predictor${tts_engine_suffix}" \
@@ -237,128 +287,224 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)
   # the full-range profile explicitly through the environment.
   run_builder "${BUILD}/examples/multimodal/audio_build" \
       --onnxDir "${out}/onnx/code2wav" \
-      --engineDir "${out}/code2wav" \
+      --engineDir "${out}" \
       --minCodeLen "${QWEN3_TTS_CODE2WAV_MIN_CODE_LEN:-1}" \
       --optCodeLen "${QWEN3_TTS_CODE2WAV_OPT_CODE_LEN:-128}" \
       --maxCodeLen "${QWEN3_TTS_CODE2WAV_MAX_CODE_LEN:-512}"
   if [ "${m}" = "qwen3-tts-base" ]; then
-    local trtexec spk_engine_dir spk_onnx_dir spk_revision spk_source
-    local spk_expected_sha spk_actual_sha
-    # v0.9.1 has no speaker-encoder component and does not install the
-    # historical `tensorrt-edgellm-export-audio` command. Treat the encoder as
-    # an explicit, version-independent ONNX input rather than pretending it
-    # was exported by Edge-LLM. Its source revision is mandatory provenance.
-    spk_onnx_dir="${QWEN3_TTS_BASE_SPEAKER_ENCODER_ONNX_DIR:-}"
-    spk_revision="${QWEN3_TTS_BASE_SPEAKER_ENCODER_REVISION:-}"
-    spk_expected_sha="${QWEN3_TTS_BASE_SPEAKER_ENCODER_SHA256:-}"
-    if [ -s "${spk_onnx_dir}/model.onnx" ]; then
-      spk_source="${spk_onnx_dir}/model.onnx"
-    elif [ -s "${spk_onnx_dir}/speaker_encoder.onnx" ]; then
-      spk_source="${spk_onnx_dir}/speaker_encoder.onnx"
-    else
-      spk_source=""
-    fi
-    if [ -z "${spk_source}" ] || [ -z "${spk_revision}" ] \
-        || [ -z "${spk_expected_sha}" ]; then
-      echo "ERROR: qwen3-tts-base requires QWEN3_TTS_BASE_SPEAKER_ENCODER_ONNX_DIR" >&2
-      echo "       with model.onnx or speaker_encoder.onnx, plus non-empty" >&2
-      echo "       QWEN3_TTS_BASE_SPEAKER_ENCODER_REVISION and" >&2
-      echo "       QWEN3_TTS_BASE_SPEAKER_ENCODER_SHA256." >&2
-      exit 11
-    fi
-    spk_actual_sha="$(sha256sum "${spk_source}" | awk '{print $1}')"
-    if [ "${spk_actual_sha}" != "${spk_expected_sha}" ]; then
-      echo "ERROR: speaker encoder SHA-256 mismatch" >&2
-      echo "       expected ${spk_expected_sha}" >&2
-      echo "       actual   ${spk_actual_sha}" >&2
-      exit 11
-    fi
-    echo "==> [tts:${m}] import + build explicit speaker_encoder for voice cloning"
-    mkdir -p "${out}/onnx/speaker_encoder"
-    cp -p "${spk_source}" "${out}/onnx/speaker_encoder/model.source.onnx"
-    python3 "${HERE}/fix-qwen3-tts-speaker-encoder-trt10.py" \
-      "${out}/onnx/speaker_encoder/model.source.onnx" \
-      "${out}/onnx/speaker_encoder/model.onnx"
-    printf '%s  model.source.onnx\n' "${spk_actual_sha}" \
-      > "${out}/onnx/speaker_encoder/SHA256SUMS.source"
-    sha256sum "${out}/onnx/speaker_encoder/model.onnx" \
-      "${HERE}/fix-qwen3-tts-speaker-encoder-trt10.py" \
-      > "${out}/onnx/speaker_encoder/SHA256SUMS.trt10"
-    printf '%s\n' \
-      '{"model_type":"qwen3_tts_speaker_encoder","input":{"name":"mel","dtype":"float32","shape":[1,"time",128]},"output":{"name":"speaker_embedding","dtype":"float32","shape":[1024]},"sample_rate":24000}' \
-      > "${out}/onnx/speaker_encoder/config.json"
-    printf 'source_revision: %s\nsource_file: %s\nsource_sha256: %s\n' \
-      "${spk_revision}" "${spk_source}" "${spk_actual_sha}" \
-      > "${out}/onnx/speaker_encoder/PROVENANCE.md"
-    # audio_build supports only audio_encoder/code2wav in v0.9.1. The speaker
-    # encoder is a standalone ONNX graph, so use TensorRT's documented builder.
+    local trtexec clone_engine_dir
+    for required in speaker_encoder.onnx speech_tokenizer_encoder.onnx; do
+      [ -s "${out}/onnx/clone_encoders/${required}" ] || {
+        echo "ERROR: v0.10 Base export did not produce clone_encoders/${required}" >&2
+        exit 11
+      }
+    done
     trtexec="$(_find_trtexec)"
-    spk_engine_dir="${EXPORT_ROOT}/tts_base_spk_encoder/speaker_encoder"
-    mkdir -p "${spk_engine_dir}"
-    "${trtexec}" --onnx="${out}/onnx/speaker_encoder/model.onnx" \
+    clone_engine_dir="${out}/clone_encoders"
+    mkdir -p "${clone_engine_dir}"
+    echo "==> [tts:${m}] build native v0.10 speaker + speech-tokenizer clone encoders"
+    "${trtexec}" --onnx="${out}/onnx/clone_encoders/speaker_encoder.onnx" \
       --fp16 \
-      --minShapes=mel:1x10x128 \
-      --optShapes=mel:1x555x128 \
-      --maxShapes=mel:1x2000x128 \
-      --saveEngine="${spk_engine_dir}/spk_encoder.engine"
-    cp -p "${out}/onnx/speaker_encoder/PROVENANCE.md" \
-      "${out}/onnx/speaker_encoder/SHA256SUMS.source" \
-      "${out}/onnx/speaker_encoder/SHA256SUMS.trt10" \
-      "${spk_engine_dir}/"
-    _meta "${spk_engine_dir}/spk_encoder.engine"
+      --minShapes=wav:1x24000 \
+      --optShapes=wav:1x240000 \
+      --maxShapes=wav:1x960000 \
+      --saveEngine="${clone_engine_dir}/speaker_encoder.engine"
+    "${trtexec}" \
+      --onnx="${out}/onnx/clone_encoders/speech_tokenizer_encoder.onnx" \
+      --fp16 \
+      --saveEngine="${clone_engine_dir}/speech_tokenizer_encoder.engine"
+    _meta "${clone_engine_dir}/speaker_encoder.engine"
+    _meta "${clone_engine_dir}/speech_tokenizer_encoder.engine"
   fi
-  # tokenizer dir the C++ worker loadFromHF() needs: tokenizer.json + config + chat template
-  cp -n "${out}/talker/tokenizer.json" "${out}/talker/processed_chat_template.json" "${src}/" 2>/dev/null || true
-  for e in "${out}/talker/llm.engine" "${out}/code_predictor/llm.engine" "${out}/code2wav/code2wav/code2wav.engine"; do _meta "${e}"; done
+  for e in \
+    "${out}/talker${tts_engine_suffix}/llm.engine" \
+    "${out}/code_predictor${tts_engine_suffix}/llm.engine" \
+    "${out}/code2wav/code2wav.engine"; do
+    _meta "${e}"
+  done
+  _provenance "${out}" "${repo}" "$4" "${prec}"
 }
 
-build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision(nvfp4|fp16)
+build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
   local m="$1" repo="$2" prec="${3:-nvfp4}" src out
-  src="$(_dl "${repo}")"; out="${EXPORT_ROOT}/gdn-base"
+  src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
+  [ -x "${BUILD_GDN}/examples/llm/llm_build" ] \
+      && [ -s "${BUILD_GDN}/libNvInfer_edgellm_plugin.so" ] || {
+    echo "ERROR: ${m} requires a v0.10 BUILD_GDN with ENABLE_CUTE_DSL=ALL" >&2
+    exit 6
+  }
   echo "==> [llm:${m}] quantize ${prec}+fp8-kv -> export(--skip-visual) -> GDN engine"
   ( cd "${UPSTREAM}"
     tensorrt-edgellm-quantize llm --model_dir "${src}" --output_dir "${out}/_q" \
-      --quantization "${prec}" --kv_cache_quantization fp8 --dataset abisee/cnn_dailymail
+      --quantization "${prec}" --kv_cache_quantization fp8 --text_dataset cnn_dailymail
     tensorrt-edgellm-export "${out}/_q" "${out}/onnx" --skip-visual --skip-audio )
+  for required in \
+    llm/model.onnx llm/config.json llm/embedding.safetensors \
+    llm/tokenizer.json llm/processed_chat_template.json; do
+    [ -s "${out}/onnx/${required}" ] || {
+      echo "ERROR: v0.10 LLM exporter did not produce ${out}/onnx/${required}" >&2
+      exit 6
+    }
+  done
   # GDN needs the CuTe-enabled llm_build (build-gdn); tag auto-inferred from arch
   EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
   "${BUILD_GDN}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
       --engineDir "${out}" --maxBatchSize 1 --maxInputLen 4096 --maxKVCacheCapacity 8192
   _meta "${out}/llm.engine"
+  _provenance "${out}" "${repo}" "$4" "${prec}"
 }
 
-build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision
-  local m="$1" repo="$2" prec="$3" src export_dir spec_dir
-  src="$(_dl "${repo}")"
+build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
+  local m="$1" repo="$2" prec="$3" src export_dir spec_dir export_src
+  src="$(_dl "${repo}" "$4")"
   export_dir="${EXPORT_ROOT}/${m}/onnx"
   spec_dir="${MTP_SPEC_DIR:-${EXPORT_ROOT}/gdn-mtp}"
-  # v0.9.1 exposes MTP model data, but this repository has not yet established
-  # a stable official export/build CLI contract. Do not guess one. A reviewed
-  # integration script owns the MTP export/build as one coherent operation and
-  # must create spec_base.engine + spec_draft.engine + config/provenance in the
-  # same spec directory. Vanilla GDN is a separate qwen3.5-4b-base build.
-  if [ -z "${EDGELLM_MTP_BUILD_SCRIPT:-}" ] || [ ! -x "${EDGELLM_MTP_BUILD_SCRIPT:-}" ]; then
-    echo "ERROR: qwen3.5-4b-mtp requires executable EDGELLM_MTP_BUILD_SCRIPT." >&2
-    echo "       The hook receives MTP_UPSTREAM, MTP_MODEL, MTP_EXPORT," >&2
-    echo "       MTP_SPEC_DIR and MTP_PLUGIN." >&2
-    exit 6
+  export_src="${src}"
+  if [ "${prec}" != "fp16" ] && [ "${prec}" != "bf16" ]; then
+    export_src="${EXPORT_ROOT}/${m}/_q"
+    echo "==> [llm:${m}] quantize ${prec}+fp8-kv for native v0.10 MTP"
+    ( cd "${UPSTREAM}"
+      tensorrt-edgellm-quantize llm \
+        --model_dir "${src}" \
+        --output_dir "${export_src}" \
+        --quantization "${prec}" \
+        --kv_cache_quantization fp8 \
+        --text_dataset cnn_dailymail )
   fi
-  MTP_UPSTREAM="${UPSTREAM}" \
-  MTP_MODEL="${src}" \
-  MTP_EXPORT="${export_dir}" \
-  MTP_SPEC_DIR="${spec_dir}" \
-  MTP_PLUGIN="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-    "${EDGELLM_MTP_BUILD_SCRIPT}"
+  echo "==> [llm:${m}] native v0.10 export --mtp"
+  ( cd "${UPSTREAM}"
+    tensorrt-edgellm-export "${export_src}" "${export_dir}" --mtp )
+  for required in llm/model.onnx llm/config.json mtp_draft/model.onnx mtp_draft/config.json; do
+    [ -s "${export_dir}/${required}" ] || {
+      echo "ERROR: v0.10 MTP export did not produce ${export_dir}/${required}" >&2
+      exit 6
+    }
+  done
+  [ -x "${BUILD_GDN}/examples/llm/llm_build" ] \
+      && [ -s "${BUILD_GDN}/libNvInfer_edgellm_plugin.so" ] || {
+    echo "ERROR: MTP requires a v0.10 BUILD_GDN with ENABLE_CUTE_DSL=ALL" >&2
+    exit 6
+  }
+  mkdir -p "${spec_dir}"
+  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
+    "${BUILD_GDN}/examples/llm/llm_build" \
+      --onnxDir "${export_dir}/llm" \
+      --engineDir "${spec_dir}" \
+      --maxBatchSize 1 \
+      --maxInputLen "${MTP_MAX_INPUT_LEN:-2048}" \
+      --maxKVCacheCapacity "${MTP_MAX_KV_CACHE_CAPACITY:-4096}" \
+      --maxVerifyTreeSize 4 \
+      --specBase
+  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
+    "${BUILD_GDN}/examples/llm/llm_build" \
+      --onnxDir "${export_dir}/mtp_draft" \
+      --engineDir "${spec_dir}" \
+      --maxBatchSize 1 \
+      --maxInputLen "${MTP_MAX_INPUT_LEN:-2048}" \
+      --maxKVCacheCapacity "${MTP_MAX_KV_CACHE_CAPACITY:-4096}" \
+      --maxDraftTreeSize 4 \
+      --specDraft
+  # v0.9.1 used EDGELLM_MTP_BUILD_SCRIPT here. v0.10 owns --mtp export and
+  # --specBase/--specDraft builds natively, so the opaque hook is retired.
   if [ ! -s "${spec_dir}/spec_base.engine" ] \
       || [ ! -s "${spec_dir}/spec_draft.engine" ] \
-      || [ ! -s "${spec_dir}/config.json" ] \
-      || [ ! -s "${spec_dir}/PROVENANCE.md" ]; then
-    echo "ERROR: MTP hook must produce spec_base.engine, spec_draft.engine," >&2
-    echo "       config.json and PROVENANCE.md under ${spec_dir}" >&2
+      || [ ! -s "${spec_dir}/base_config.json" ] \
+      || [ ! -s "${spec_dir}/draft_config.json" ]; then
+    echo "ERROR: native v0.10 MTP build must produce spec_base.engine," >&2
+    echo "       spec_draft.engine, base_config.json and draft_config.json under ${spec_dir}" >&2
     exit 6
   fi
   _meta "${spec_dir}/spec_base.engine"
   _meta "${spec_dir}/spec_draft.engine"
+  _provenance "${spec_dir}" "${repo}" "$4" "${prec}"
+}
+
+build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
+  local m="$1" base_repo="$2" draft_repo="$3" prec="$4"
+  local base_rev="$5" draft_rev="$6" base_src draft_src root base_q draft_q spec_dir
+  base_src="$(_dl "${base_repo}" "${base_rev}")"
+  draft_src="$(_dl "${draft_repo}" "${draft_rev}")"
+  root="${EXPORT_ROOT}/${m}"
+  base_q="${root}/_q-base"
+  draft_q="${root}/_q-draft"
+  spec_dir="${DFLASH_SPEC_DIR:-${root}/engines}"
+  [ -x "${BUILD_GDN}/examples/llm/llm_build" ] \
+      && [ -s "${BUILD_GDN}/libNvInfer_edgellm_plugin.so" ] || {
+    echo "ERROR: DFlash requires a v0.10 BUILD_GDN with ENABLE_CUTE_DSL=ALL" >&2
+    exit 15
+  }
+  case "${prec}" in
+    fp16|bf16)
+      base_q="${base_src}"
+      draft_q="${draft_src}"
+      ;;
+    *)
+      echo "==> [llm:${m}] quantize DFlash base + draft (${prec})"
+      ( cd "${UPSTREAM}"
+        tensorrt-edgellm-quantize llm \
+          --model_dir "${base_src}" \
+          --output_dir "${base_q}" \
+          --quantization "${prec}" \
+          --kv_cache_quantization fp8 \
+          --text_dataset cnn_dailymail
+        tensorrt-edgellm-quantize draft \
+          --base_model_dir "${base_src}" \
+          --draft_model_dir "${draft_src}" \
+          --output_dir "${draft_q}" \
+          --quantization "${prec}" \
+          --lm_head_quantization "${prec}" \
+          --text_dataset cnn_dailymail )
+      ;;
+  esac
+  echo "==> [llm:${m}] v0.10 DFlash base + draft export"
+  ( cd "${UPSTREAM}"
+    tensorrt-edgellm-export \
+      "${base_q}" "${root}/base-export" \
+      --dflash-base --dflash-draft-dir "${draft_q}"
+    tensorrt-edgellm-export \
+      "${base_q}" "${root}/draft-export" \
+      --dflash-draft --dflash-draft-dir "${draft_q}" )
+  for required in \
+    base-export/llm/model.onnx base-export/llm/config.json \
+    base-export/llm/embedding.safetensors \
+    draft-export/dflash_draft/model.onnx \
+    draft-export/dflash_draft/config.json; do
+    [ -s "${root}/${required}" ] || {
+      echo "ERROR: v0.10 DFlash exporter did not produce ${root}/${required}" >&2
+      exit 15
+    }
+  done
+  mkdir -p "${spec_dir}"
+  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
+    "${BUILD_GDN}/examples/llm/llm_build" \
+      --onnxDir "${root}/base-export/llm" \
+      --engineDir "${spec_dir}" \
+      --maxBatchSize 1 \
+      --maxInputLen "${DFLASH_MAX_INPUT_LEN:-1024}" \
+      --maxKVCacheCapacity "${DFLASH_MAX_KV_CACHE_CAPACITY:-2048}" \
+      --maxVerifyTreeSize 16 \
+      --specBase
+  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
+    "${BUILD_GDN}/examples/llm/llm_build" \
+      --onnxDir "${root}/draft-export/dflash_draft" \
+      --engineDir "${spec_dir}" \
+      --maxBatchSize 1 \
+      --maxInputLen "${DFLASH_MAX_INPUT_LEN:-1024}" \
+      --maxKVCacheCapacity "${DFLASH_MAX_KV_CACHE_CAPACITY:-2048}" \
+      --maxDraftTreeSize 16 \
+      --specDraft
+  for required in \
+    spec_base.engine spec_draft.engine base_config.json draft_config.json \
+    embedding.safetensors; do
+    [ -s "${spec_dir}/${required}" ] || {
+      echo "ERROR: v0.10 DFlash build did not produce ${spec_dir}/${required}" >&2
+      exit 15
+    }
+  done
+  _meta "${spec_dir}/spec_base.engine"
+  _meta "${spec_dir}/spec_draft.engine"
+  _provenance "${spec_dir}" \
+    "${base_repo}+${draft_repo}" "${base_rev}+${draft_rev}" "${prec}"
 }
 
 build_moss() { # $1 model_id  $2 (unused) $3 precision(mix1)
@@ -440,13 +586,16 @@ build_sparktts() { # $1 model_id  $2 (unused)  $3 mode(bf16|w4a16)
 }
 
 # --- manifest: model_id | hf_repo | kind | default_precision ---
-declare -A REPO KIND PREC
-REPO[qwen3-asr]="Qwen/Qwen3-ASR-0.6B";                  KIND[qwen3-asr]=asr;  PREC[qwen3-asr]=int4_awq
-REPO[qwen3-tts]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; KIND[qwen3-tts]=tts;  PREC[qwen3-tts]=int4
-REPO[qwen3-tts-base]="Qwen/Qwen3-TTS-12Hz-0.6B-Base";   KIND[qwen3-tts-base]=tts; PREC[qwen3-tts-base]=fp16
-REPO[qwen3.5-4b]="Qwen/Qwen3.5-4B";                     KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=nvfp4
-REPO[qwen3.5-4b-base]="Qwen/Qwen3.5-4B";                KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=nvfp4
-REPO[qwen3.5-4b-mtp]="Qwen/Qwen3.5-4B";                 KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=nvfp4
+declare -A REPO REV DRAFT_REPO DRAFT_REV KIND PREC
+REPO[qwen3-asr]="Qwen/Qwen3-ASR-0.6B";                  REV[qwen3-asr]="5eb144179a02acc5e5ba31e748d22b0cf3e303b0"; KIND[qwen3-asr]=asr; PREC[qwen3-asr]=int4_awq
+REPO[qwen3-tts]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; REV[qwen3-tts]="85e237c12c027371202489a0ec509ded67b5e4b5"; KIND[qwen3-tts]=tts; PREC[qwen3-tts]=fp16
+REPO[qwen3-tts-int4]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; REV[qwen3-tts-int4]="85e237c12c027371202489a0ec509ded67b5e4b5"; KIND[qwen3-tts-int4]=tts; PREC[qwen3-tts-int4]=int4
+REPO[qwen3-tts-base]="Qwen/Qwen3-TTS-12Hz-0.6B-Base";   REV[qwen3-tts-base]="5d83992436eae1d760afd27aff78a71d676296fc"; KIND[qwen3-tts-base]=tts; PREC[qwen3-tts-base]=fp16
+REPO[qwen3-tts-voicedesign]="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"; REV[qwen3-tts-voicedesign]="5ecdb67327fd37bb2e042aab12ff7391903235d3"; KIND[qwen3-tts-voicedesign]=tts; PREC[qwen3-tts-voicedesign]=fp16
+REPO[qwen3.5-4b]="Qwen/Qwen3.5-4B";                     REV[qwen3.5-4b]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=nvfp4
+REPO[qwen3.5-4b-base]="Qwen/Qwen3.5-4B";                REV[qwen3.5-4b-base]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=nvfp4
+REPO[qwen3.5-4b-mtp]="Qwen/Qwen3.5-4B";                 REV[qwen3.5-4b-mtp]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=nvfp4
+REPO[qwen3.5-4b-dflash]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-dflash]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; DRAFT_REPO[qwen3.5-4b-dflash]="z-lab/Qwen3.5-4B-DFlash"; DRAFT_REV[qwen3.5-4b-dflash]="9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf"; KIND[qwen3.5-4b-dflash]=llm_dflash; PREC[qwen3.5-4b-dflash]=nvfp4
 # moss/sparktts are not plain HF-repo pipelines — sources come from env
 # (MOSS_ONNX_BUNDLE / SPARKTTS_MODEL_DIR+SPARKTTS_REPO); REPO holds a hint only.
 REPO[moss]="env:MOSS_ONNX_BUNDLE";                      KIND[moss]=moss;     PREC[moss]=mix1
@@ -458,10 +607,11 @@ for m in "$@"; do
   # per-model precision override: PRECISION_qwen3_5_4b=fp16 bash ...
   ov="PRECISION_${m//[.-]/_}"; prec="${!ov:-${PREC[$m]}}"
   case "${KIND[$m]}" in
-    asr)      build_asr "$m" "${REPO[$m]}" "${prec}" ;;
-    tts)      build_tts "$m" "${REPO[$m]}" "${prec}" ;;
-    llm_base) build_llm_base "$m" "${REPO[$m]}" "${prec}" ;;
-    llm_mtp)  build_llm_mtp "$m" "${REPO[$m]}" "${prec}" ;;
+    asr)      build_asr "$m" "${REPO[$m]}" "${prec}" "${REV[$m]}" ;;
+    tts)      build_tts "$m" "${REPO[$m]}" "${prec}" "${REV[$m]}" ;;
+    llm_base) build_llm_base "$m" "${REPO[$m]}" "${prec}" "${REV[$m]}" ;;
+    llm_mtp)  build_llm_mtp "$m" "${REPO[$m]}" "${prec}" "${REV[$m]}" ;;
+    llm_dflash) build_llm_dflash "$m" "${REPO[$m]}" "${DRAFT_REPO[$m]}" "${prec}" "${REV[$m]}" "${DRAFT_REV[$m]}" ;;
     moss)     build_moss "$m" "${REPO[$m]}" "${prec}" ;;
     sparktts) build_sparktts "$m" "${REPO[$m]}" "${prec}" ;;
   esac

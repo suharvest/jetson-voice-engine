@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless a probed build host matches the v0.9.1 release tuple."""
+"""Fail closed unless a probed build host matches the v0.10.0 release tuple."""
 
 from __future__ import annotations
 

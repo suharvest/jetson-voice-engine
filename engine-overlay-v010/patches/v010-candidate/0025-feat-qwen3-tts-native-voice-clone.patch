@@ -7,6 +7,15 @@ Use the v0.10 Base voice-clone path (`cloneEncoderDir`) and forward
 `ref_audio`/`ref_text` to the native runtime, which owns reference encoding and
 ICL construction.
 
+Keep the native export path portable as well: Code2Wav selects CUDA only when
+available, and the Mimi clone encoder uses eager attention so current
+Transformers can export its static speech-tokenizer bucket without a symbolic
+SDPA guard failure.
+
+Normalize streaming CLI PCM chunks according to the engine's actual waveform
+dtype. Qwen3-TTS Code2Wav exports FP32, so interpreting its buffer as FP16
+produces saturated noise even though the RVQ codes are correct.
+
 The legacy `speaker_embedding_b64` request field remains accepted for protocol
 compatibility, but is deliberately not decoded: v0.10 has no host-side
 arbitrary speaker-embedding ABI. Requests containing it receive a warning and
@@ -15,8 +24,70 @@ the field is ignored; callers must migrate to `ref_audio` with optional
 
 Signed-off-by: suharvest <suharvest@gmail.com>
 ---
- examples/omni/qwen3_tts_streaming_worker.cpp | 65 ++++++++++++--------
- 1 file changed, 41 insertions(+), 24 deletions(-)
+ examples/omni/qwen3_tts_inference.cpp                           | 28 +++++++--
+ examples/omni/qwen3_tts_streaming_worker.cpp                    | 65 ++++++++++++--------
+ .../qwen3_tts/modeling_qwen3_tts_clone_encoders.py             |  4 +++-
+ .../qwen3_tts/modeling_qwen3_tts_code2wav.py                   |  4 +++-
+ 4 files changed, 72 insertions(+), 29 deletions(-)
+
+diff --git a/examples/omni/qwen3_tts_inference.cpp b/examples/omni/qwen3_tts_inference.cpp
+index f535b08..752e552 100644
+--- a/examples/omni/qwen3_tts_inference.cpp
++++ b/examples/omni/qwen3_tts_inference.cpp
+@@ -487,7 +487,10 @@ int main(int argc, char** argv)
+     // handleAudioGeneration call; cleared between groups.
+     struct StreamingBatchCtx
+     {
+-        std::vector<__half> pcmBuffer; //!< Accumulated FP16 PCM samples (chunk-by-chunk concat)
++        // Normalize each chunk to FP32. Qwen3-Omni Code2Wav emits FP16, while
++        // Qwen3-TTS tokenizer_decoder emits FP32; treating both as __half
++        // reinterprets FP32 bytes and produces saturated/noisy WAV output.
++        std::vector<float> pcmBuffer;
+         int32_t numFramesEmitted{0};   //!< Codec frames vocoded so far
+         int32_t numChunkCalls{0};      //!< Total callback invocations (including final flush)
+         bool finalSeen{false};
+@@ -574,9 +577,28 @@ int main(int argc, char** argv)
+                         }
+                         else if (chunkAudio.waveform && !chunkAudio.waveform->isEmpty())
+                         {
+-                            __half const* src = static_cast<__half const*>(chunkAudio.waveform->rawPointer());
+                             int64_t const samples = chunkAudio.waveform->getShape()[1];
+-                            ctx.pcmBuffer.insert(ctx.pcmBuffer.end(), src, src + samples);
++                            auto const dtype = chunkAudio.waveform->getDataType();
++                            ctx.pcmBuffer.reserve(ctx.pcmBuffer.size() + static_cast<size_t>(samples));
++                            if (dtype == nvinfer1::DataType::kFLOAT)
++                            {
++                                float const* src = static_cast<float const*>(chunkAudio.waveform->rawPointer());
++                                ctx.pcmBuffer.insert(ctx.pcmBuffer.end(), src, src + samples);
++                            }
++                            else if (dtype == nvinfer1::DataType::kHALF)
++                            {
++                                __half const* src = static_cast<__half const*>(chunkAudio.waveform->rawPointer());
++                                for (int64_t i = 0; i < samples; ++i)
++                                {
++                                    ctx.pcmBuffer.push_back(__half2float(src[i]));
++                                }
++                            }
++                            else
++                            {
++                                LOG_WARNING("Streaming vocode returned unsupported waveform dtype for request %zu",
++                                    requestIdx);
++                                ctx.vocoderFailed = true;
++                            }
+                             if (!ctx.ttfpaRecorded && ctx.ttfpaEvent)
+                             {
+                                 CUDA_CHECK(cudaEventRecord(ctx.ttfpaEvent, stream));
+@@ -627,8 +649,8 @@ int main(int argc, char** argv)
+                 {
+                     int64_t const totalSamples = static_cast<int64_t>(ctx.pcmBuffer.size());
+                     auto waveformTensor = std::make_shared<rt::Tensor>(
+-                        rt::Coords{1, totalSamples}, rt::DeviceType::kCPU, nvinfer1::DataType::kHALF, "streaming_pcm");
+-                    std::memcpy(waveformTensor->rawPointer(), ctx.pcmBuffer.data(), totalSamples * sizeof(__half));
++                        rt::Coords{1, totalSamples}, rt::DeviceType::kCPU, nvinfer1::DataType::kFLOAT, "streaming_pcm");
++                    std::memcpy(waveformTensor->rawPointer(), ctx.pcmBuffer.data(), totalSamples * sizeof(float));
+                     audioOutput.waveform = waveformTensor;
+                     audioOutput.sampleRate = code2wavRunner->getConfig().sampleRate;
+                     audioOutput.hasWaveform = true;
 
 diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
 index a2e6604..5bb52ff 100644
@@ -172,3 +243,34 @@ index a2e6604..5bb52ff 100644
  
              // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
              // so concurrent slots never contend. useStateful only affects `ready` meta.
+diff --git a/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py b/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py
+index 02d4215..b9dc4eb 100644
+--- a/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py
++++ b/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py
+@@ -559,7 +559,9 @@ def export_qwen3_tts_clone_encoders(model_dir: str, output_dir: str) -> None:
+     with open(os.path.join(st_dir, "config.json")) as f:
+         st_cfg = json.load(f)
+     with _patch_mimi_for_export():
+-        mimi = MimiModel(MimiConfig(**st_cfg["encoder_config"])).eval()
++        mimi_config = MimiConfig(**st_cfg["encoder_config"])
++        mimi_config._attn_implementation = "eager"
++        mimi = MimiModel(mimi_config).eval()
+         st_state = load_file(os.path.join(st_dir, "model.safetensors"))
+         enc_state = {
+             k[len("encoder."):]: v.float()
+diff --git a/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_code2wav.py b/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_code2wav.py
+index 0e0487c..f68e568 100644
+--- a/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_code2wav.py
++++ b/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_code2wav.py
+@@ -730,8 +730,10 @@ def build_qwen3_tts_code2wav(
+ def export_qwen3_tts_code2wav(model_dir: str,
+                               output_dir: str,
+                               torch_dtype: torch.dtype,
+-                              device: str = "cuda") -> None:
++                              device: str | None = None) -> None:
+     """Export Qwen3-TTS ``speech_tokenizer`` decoder to ONNX."""
++    if device is None:
++        device = "cuda" if torch.cuda.is_available() else "cpu"
+     os.makedirs(output_dir, exist_ok=True)
+     output_path = os.path.join(output_dir, "model.onnx")
+     for external_data_name in ("onnx_model.data", "model.onnx.data"):

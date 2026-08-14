@@ -21,7 +21,7 @@ a09e645994d93f343f1c5e94c3a0334f9b70cc2e11379e0b8ad3598b671ea7dd  0017-test-mixe
 3b00990ffbda4bec59871e97559c191e8a530c27aa698118c21ed539f65ddf10  0021-refactor-config-rename-mixed_precision-bf16_residual.patch
 2cc4ef3ca3424da4d4abecbf5850a088cf8f2153a1dca7b8ecb424df884d1c97  0022-feat-qwen3-tts-streaming-worker-v010-native.patch
 44dad36f508bc51ca244a0318ba69669146e8b0211e9cc714c998fe09812314b  0023-fix-qwen3-tts-empty-prefill-guard.patch
-f1a7146cfaa6f086e89f9b6cb7719913de53bbccf58c42f00ab2872c9ed50a4d  0025-feat-qwen3-tts-native-voice-clone.patch
+57f935eb2dc254de9292904096450c9d12d1c3cb45de4d5fac484ea921a11721  0025-feat-qwen3-tts-native-voice-clone.patch
 68b1e25377c1ad97ba943c4fd9f0c616a0c62b390e9f910860b69b634bae6820  0026-feat-qwen3-tts-fp8-text-embedding-loader.patch
 ac7ca6c5c0c8a688a2cc13b0e8a5c1a8529ff891f53c99c0cd803c4de80030fa  0027-feat-qwen3-tts-language-wire.patch
 d0c386a62bd3b6e66ca891ae9a66a920f0a07a1d410eae6fe604d876e2e5273b  0028-feat-qwen3-tts-cooperative-cancel.patch
