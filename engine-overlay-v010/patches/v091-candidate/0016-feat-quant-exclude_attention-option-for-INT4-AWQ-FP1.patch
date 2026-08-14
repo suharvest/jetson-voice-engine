@@ -1,0 +1,101 @@
+From 8cab6d28312d627c99fdf42a38af3dcdd6d2e4b7 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 14:36:54 +0800
+Subject: [PATCH 16/40] feat(quant): exclude_attention option for INT4-AWQ
+ (FP16 attention island)
+
+build_quant_config / quantize_and_export / quantize CLI gain --exclude_attention
+which disables INT4 quantizers on q/k/v/o_proj, keeping attention FP16 while the
+MLP is INT4. Required for the mixed-precision overflow-safe recipe (attention
+FP16 island + INT4 MLP with BF16 down_proj output). Default False -> unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+---
+ .../quantization/quantization_configs.py             | 12 ++++++++++++
+ tensorrt_edgellm/quantization/quantize.py            |  2 ++
+ tensorrt_edgellm/scripts/quantize.py                 |  7 +++++++
+ 3 files changed, 21 insertions(+)
+
+diff --git a/tensorrt_edgellm/quantization/quantization_configs.py b/tensorrt_edgellm/quantization/quantization_configs.py
+index 48363ff..d9c810b 100644
+--- a/tensorrt_edgellm/quantization/quantization_configs.py
++++ b/tensorrt_edgellm/quantization/quantization_configs.py
+@@ -202,6 +202,15 @@ _AUDIO_PREFIXES = (
+ )
+ _AUDIO_PATTERNS = tuple(f"*{p}.*" for p in _AUDIO_PREFIXES)
+ 
++# Keep the attention projection island unquantized for the SparkTTS
++# BF16-residual/FP16-attention W4A16 path.
++_ATTENTION_PROJ_PATTERNS = (
++    "*q_proj*",
++    "*k_proj*",
++    "*v_proj*",
++    "*o_proj*",
++)
++
+ 
+ def _audio_quant_cfg(input_cfg: Optional[Dict[str, Any]],
+                      weight_cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+@@ -439,6 +448,7 @@ def build_quant_config(
+     visual_quantization: Optional[str] = None,
+     audio_quantization: Optional[str] = None,
+     cp_quantization: Optional[str] = None,
++    exclude_attention: bool = False,
+ ) -> Dict[str, Any]:
+     """Build a composite ModelOpt quantization config from method names.
+ 
+@@ -507,6 +517,8 @@ def build_quant_config(
+         groups_to_disable.append(_VISUAL_PATTERNS)
+     if audio_quantization is None:
+         groups_to_disable.append(_AUDIO_PATTERNS)
++    if exclude_attention:
++        groups_to_disable.append(_ATTENTION_PROJ_PATTERNS)
+     cfg["quant_cfg"] = _merge_quant_cfg(
+         cfg["quant_cfg"],
+         _disable_groups(*groups_to_disable),
+diff --git a/tensorrt_edgellm/quantization/quantize.py b/tensorrt_edgellm/quantization/quantize.py
+index dc48af9..87e6e6b 100644
+--- a/tensorrt_edgellm/quantization/quantize.py
++++ b/tensorrt_edgellm/quantization/quantize.py
+@@ -631,6 +631,7 @@ def quantize_and_export(
+     image_dataset: Union[str, ImageDataset, None] = None,
+     audio_dataset: Union[str, AudioDataset, None] = None,
+     num_samples: int = 512,
++    exclude_attention: bool = False,
+ ) -> str:
+     """Load a HuggingFace model, quantize it, and export a unified checkpoint.
+ 
+@@ -715,6 +716,7 @@ def quantize_and_export(
+             visual_quantization=visual_quantization,
+             audio_quantization=audio_quantization,
+             cp_quantization=cp_quantization,
++            exclude_attention=exclude_attention,
+         )
+         if cp_quantization is not None and has_code_predictor(model):
+             # CP is only reached via the Thinker->Talker->CP generation path,
+diff --git a/tensorrt_edgellm/scripts/quantize.py b/tensorrt_edgellm/scripts/quantize.py
+index 0a559f5..63ed649 100644
+--- a/tensorrt_edgellm/scripts/quantize.py
++++ b/tensorrt_edgellm/scripts/quantize.py
+@@ -114,6 +114,12 @@ def _add_common_args(parser):
+               f"Default: {DEFAULT_AUDIO_DATASET}. Available: "
+               f"{', '.join(available_datasets('audio'))}."))
+     parser.add_argument("--num_samples", type=int, default=512)
++    parser.add_argument(
++        "--exclude_attention",
++        action="store_true",
++        help=("Keep q/k/v/o projections unquantized for the "
++              "BF16-residual/FP16-attention W4A16 path."),
++    )
+ 
+ 
+ def main():
+@@ -183,6 +189,7 @@ def main():
+             image_dataset=args.image_dataset,
+             audio_dataset=args.audio_dataset,
+             num_samples=args.num_samples,
++            exclude_attention=args.exclude_attention,
+         )
+     elif args.command == "draft":
+         if _is_dflash_draft(args.draft_model_dir):

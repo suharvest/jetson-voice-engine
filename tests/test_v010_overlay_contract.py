@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import hashlib
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OVERLAY = ROOT / "engine-overlay-v010"
+PIN = "71dd1bae032e70771265917ec74d3ff4cad07a10"
+
+
+def _series_entries(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checksum_entries(path: Path) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split()
+        assert len(fields) == 2, line
+        entries.append((fields[1], fields[0]))
+    return entries
+
+
+def _assert_series_and_hashes(directory: Path, expected_count: int) -> list[str]:
+    series = _series_entries(directory / "series")
+    patches = sorted(path.name for path in directory.glob("*.patch"))
+    assert len(series) == expected_count
+    assert sorted(series) == patches
+
+    checksums = _checksum_entries(directory / "SHA256SUMS")
+    assert [name for name, _ in checksums] == series
+    assert len(checksums) == expected_count
+    for name, expected in checksums:
+        assert _sha256(directory / name) == expected, name
+    return series
+
+
+def test_v010_pin_and_4_plus_32_series_are_hash_locked():
+    pin = next(
+        line.strip()
+        for line in (OVERLAY / "UPSTREAM_PIN").read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert pin == PIN
+
+    upstream = _assert_series_and_hashes(
+        OVERLAY / "patches/upstream-v010-prs", expected_count=4
+    )
+    product = _assert_series_and_hashes(
+        OVERLAY / "patches/v010-candidate", expected_count=32
+    )
+
+    assert upstream == [
+        "0001-pr118-respect-explicit-cuda-architectures.patch",
+        "0002-pr118-static-target-wrap-interface.patch",
+        "0003-pr146-normalize-linear-mrope.patch",
+        "0004-pr149-checkpoint-dtype.patch",
+    ]
+    assert all(name.startswith(("000", "001", "002", "003", "004")) for name in product)
+
+
+def test_retired_generic_and_product_patches_are_not_active():
+    upstream_series = _series_entries(
+        OVERLAY / "patches/upstream-v010-prs/series"
+    )
+    for retired in (
+        "0003-pr145-trt-fp4-guard.patch",
+        "0005-pr147-trt-stream-reader.patch",
+        "0006-pr148-fmha-mask-scoped-load.patch",
+    ):
+        assert retired not in upstream_series
+
+    product_dir = OVERLAY / "patches/v010-candidate"
+    product_series = _series_entries(product_dir / "series")
+    for prefix in ("0024-", "0035-", "0036-"):
+        assert not any(name.startswith(prefix) for name in product_series)
+    state = (product_dir / "PATCH-STATE.md").read_text(encoding="utf-8")
+    for retired in ("0024", "0035", "0036"):
+        assert retired in state
+    assert "Retired on v0.10.0" in state
+
+
+def test_v010_manifests_have_release_provenance_and_fresh_hashes():
+    upstream_dir = OVERLAY / "patches/upstream-v010-prs"
+    product_dir = OVERLAY / "patches/v010-candidate"
+    for manifest_path in sorted((OVERLAY / "manifests").glob("*.toml")):
+        data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+        assert data["upstream"]["version"] == "v0.10.0", manifest_path
+        assert data["upstream"]["pin"] == PIN, manifest_path
+        assert data["upstream"]["remote"] == (
+            "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
+        )
+        assert data["proposed_upstream_patches"]["count"] == 4
+        assert data["patches"]["count"] == 32
+        assert data["patches"]["directory"] == "patches/v010-candidate"
+        assert data["artifacts"]["provenance_required"] is True
+        assert data["artifacts"]["sha256_required"] is True
+        assert data["target"] == {
+            "device": "jetson-orin-nx",
+            "sm": "87",
+            "jetpack": "6.2",
+            "l4t": "36.4.3",
+            "cuda": "12.6",
+            "tensorrt": "10.3",
+            "embedded_target": "jetson-orin",
+            "aarch64_build": True,
+        }
+        assert data["build"]["type"] == "Release"
+
+        proposed = data["proposed_upstream_patches"]
+        assert proposed["series_sha256"] == _sha256(upstream_dir / "series")
+        assert proposed["lock_sha256"] == _sha256(upstream_dir / "LOCK")
+        assert proposed["checksums_sha256"] == _sha256(
+            upstream_dir / "SHA256SUMS"
+        )
+        product = data["patches"]
+        assert product["series_sha256"] == _sha256(product_dir / "series")
+        assert product["checksums_sha256"] == _sha256(
+            product_dir / "SHA256SUMS"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(OVERLAY / "validate-manifest.py"),
+                str(OVERLAY),
+                str(manifest_path),
+                PIN,
+            ],
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+
+def test_build_wrapper_replays_exact_counts_and_fails_closed():
+    build = OVERLAY / "build.sh"
+    text = build.read_text(encoding="utf-8")
+    assert (
+        'load_series "${UPSTREAM_PATCH_DIR}" "${UPSTREAM_PATCH_DIR}/series" 4 '
+        '"proposed-upstream"'
+    ) in text
+    assert (
+        'load_series "${PATCH_DIR}" "${PATCH_DIR}/series" 32 '
+        '"local-product"'
+    ) in text
+    assert '[ -f "${PATCH_DIR}/series" ]' in text
+    assert "ERROR: missing v0.10 product patch series" in text
+    assert "exit 5" in text
+
+    missing_manifest = subprocess.run(
+        [str(build)], text=True, capture_output=True
+    )
+    assert missing_manifest.returncode != 0
+    assert "build manifest required" in missing_manifest.stderr
+
+
+def test_readme_records_v010_identity_and_runtime_constraints():
+    readme = (OVERLAY / "README.md").read_text(encoding="utf-8")
+    for required in (
+        "TensorRT-Edge-LLM v0.10.0",
+        "patches/upstream-v010-prs/",
+        "patches/v010-candidate/",
+        "complete 4+32",
+        "Existing v0.9.1 images and artifacts remain the",
+        "CuTe FMHA-v2",
+        "ENABLE_CUTE_DSL=fmha",
+    ):
+        assert required in readme
+    assert "v0.9.1 patch files are" in readme
+
+
+def test_legacy_aggregate_engine_driver_fails_closed():
+    driver = OVERLAY / "build-engines-for-device.sh"
+    result = subprocess.run([str(driver)], text=True, capture_output=True)
+    assert result.returncode == 5
+    assert "not qualified for v0.10.0" in result.stderr
+    assert "new release identity" in result.stderr

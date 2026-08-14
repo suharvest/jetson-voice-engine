@@ -1,0 +1,52 @@
+v080-0008: TTS CuTe DSL --wrap toolchain fix (applies on top of v080-0007)
+
+Re-apply -Wl,--wrap=_cudaLaunchKernelEx at the qwen3_tts_inference executable
+link. The Talker MLP CuTe DSL GEMM lives in the STATIC edgellmCore archive and
+calls the runtime template wrapper _cudaLaunchKernelEx -> cudaLaunchKernelExC,
+which no-ops on CUDA <12.8 for cuLibraryLoadData-loaded kernels (never registered
+in fat-binary tables) -> "invalid device function" at launch. cmake/CuteDsl.cmake
+applies the wrap only to its SHARED LINK_TARGETS; for the statically-linked
+executable the wrap MUST be re-applied at the final link to redirect those call
+sites to the shim's __wrap__cudaLaunchKernelEx (driver-API cuLaunchKernelEx).
+No numerics change -- same kernel, correct launch path.
+
+PROVEN EFFECT: without this, qwen3_tts_inference fails at the first Talker MLP GEMM
+launch ("invalid device function") and emits zero audio. With it, the pipeline runs
+end-to-end (en: 34 frames / 2.72s; zh: generates codes). This is the load-bearing
+toolchain unblock.
+
+DROPPED from the box-local 5ad0cbb commit (NOT included here):
+  - projectToTalkerInput split-projection (role[:3]+body[3:3+N]): a speculative
+    workaround for a CuTe GEMM row-1 corruption. Box testing + this verification
+    confirm it has NO effect on the symptom (en still garbled, zh still EOS@2).
+    Dropped to keep the tree clean (keep only changes with proven effect).
+  - langId / 9-row CustomVoice conditioning + kernel layout: already tracked in
+    v080-0007-customvoice-language-conditioning.patch. Not duplicated here.
+
+This patch is incremental on top of v080-0007's shim block.
+
+diff --git a/examples/omni/CMakeLists.txt b/examples/omni/CMakeLists.txt
+index fd2086d..8539a62 100644
+--- a/examples/omni/CMakeLists.txt
++++ b/examples/omni/CMakeLists.txt
+@@ -17,6 +17,20 @@ add_cross_build_link_options(qwen3_tts_inference)
+ if(TARGET trt_edgellm_cutedsl_cudart_shim)
+   target_link_libraries(qwen3_tts_inference PRIVATE
+     "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++  # The Talker MLP CuTe DSL GEMM (in the STATIC edgellmCore archive) calls the
++  # runtime template wrapper _cudaLaunchKernelEx, which forwards to
++  # cudaLaunchKernelExC. On CUDA <12.8 that host-side stub no-ops for
++  # cuLibraryLoadData-loaded kernels (they are never registered via fat-binary
++  # tables) -> "invalid device function" at launch. cute_dsl_setup() applies
++  # -Wl,--wrap only to its SHARED LINK_TARGETS; for a STATIC edgellmCore the
++  # wrap must be re-applied at the final executable link to redirect those call
++  # sites to the shim's __wrap__cudaLaunchKernelEx (driver-API cuLaunchKernelEx).
++  # No numerics change -- same kernel, correct launch path.
++  if(NOT DEFINED CUDA_CTK_VERSION OR CUDA_CTK_VERSION STREQUAL ""
++     OR CUDA_CTK_VERSION VERSION_LESS 12.8)
++    target_link_options(qwen3_tts_inference PRIVATE
++      "-Wl,--wrap=_cudaLaunchKernelEx")
++  endif()
+ endif()
+ 
+ # Set output directory

@@ -1,0 +1,109 @@
+From 77f4fc2ba304a4546c09933c00be2f34d5808632 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 15:09:36 +0800
+Subject: [PATCH] fix(mixed-precision): support int4_awq_modelopt (prepacked
+ AWQ) path
+
+ModelOpt's AWQ export produces quant_type=int4_awq_modelopt (prepacked W4A16),
+not int4_awq. mixed_precision_active now accepts both INT4-AWQ variants, and
+ModelOptAWQPrepackedLinear gains the same output_bf16 BF16-output bridge as
+AWQLinear (BF16-input accept + cast to FP16, down_proj emits BF16).
+make_linear sets output_bf16 for .down_proj under mixed_precision_active on the
+_modelopt branch too. Verified: re-exported SparkTTS INT4 ONNX has exactly 24
+bf16-output plugin nodes (one down_proj per layer); 48 gate/up stay FP16.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+
+diff --git a/tensorrt_edgellm/config.py b/tensorrt_edgellm/config.py
+index e45b11a2f56697b3182cf9091669492541b5f329..1c358e71057f7ab8719a58e1435922cff0e08d08 100644
+--- a/tensorrt_edgellm/config.py
++++ b/tensorrt_edgellm/config.py
+@@ -939,7 +939,8 @@ class ModelConfig:
+         if not self.quant.is_quantized:
+             return True
+         return (bool(self.mixed_precision_with_quant)
+-                and self.quant.quant_type == QUANT_INT4_AWQ)
++                and self.quant.quant_type
++                in (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT))
+ 
+     @property
+     def residual_dtype(self) -> "torch.dtype":  # noqa: F821
+diff --git a/tensorrt_edgellm/models/linear.py b/tensorrt_edgellm/models/linear.py
+index cda23b329972afd19aa4a45481aa3aa09d5f38a0..2ac616da29d7c5048ae995e6313c1e4943685043 100644
+--- a/tensorrt_edgellm/models/linear.py
++++ b/tensorrt_edgellm/models/linear.py
+@@ -642,11 +642,13 @@ class ModelOptAWQPrepackedLinear(LinearBase):
+         out_features: int,
+         group_size: int = 128,
+         bias: bool = False,
++        output_bf16: bool = False,
+     ) -> None:
+         super().__init__()
+         self.in_features = in_features
+         self.out_features = out_features
+         self.group_size = group_size
++        self.output_bf16 = output_bf16
+         # Loaded from checkpoint as uint8; cast to int8 by the loader.
+         self.register_buffer(
+             "weight",
+@@ -666,18 +668,29 @@ class ModelOptAWQPrepackedLinear(LinearBase):
+             self.bias = None
+ 
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        _require_fp16_input(hidden_states, "ModelOptAWQPrepackedLinear")
++        if hidden_states.dtype != torch.float16:
++            hidden_states = hidden_states.to(torch.float16)
+         hidden_states = hidden_states * self.pre_quant_scale
+-        out = _int4_groupwise_gemm_dispatch(
+-            hidden_states,
+-            self.weight,
+-            self.weight_scale,
+-            self.out_features,
+-            self.in_features,
+-            self.group_size,
+-        )
++        if self.output_bf16:
++            out = _int4_groupwise_gemm_bf16(
++                hidden_states,
++                self.weight,
++                self.weight_scale,
++                self.out_features,
++                self.in_features,
++                self.group_size,
++            )
++        else:
++            out = _int4_groupwise_gemm_dispatch(
++                hidden_states,
++                self.weight,
++                self.weight_scale,
++                self.out_features,
++                self.in_features,
++                self.group_size,
++            )
+         if self.bias is not None:
+-            out = out + self.bias
++            out = out + self.bias.to(out.dtype)
+         return out
+ 
+ 
+@@ -973,8 +986,14 @@ def make_linear(
+                           bias,
+                           output_bf16=output_bf16)
+     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
+-        layer = ModelOptAWQPrepackedLinear(in_features, out_features,
+-                                           config.quant.group_size, bias)
++        output_bf16 = (config.mixed_precision_active
++                       and module_name.endswith(".down_proj")
++                       and not _is_attention_projection(module_name))
++        layer = ModelOptAWQPrepackedLinear(in_features,
++                                           out_features,
++                                           config.quant.group_size,
++                                           bias,
++                                           output_bf16=output_bf16)
+     elif quant_type == QUANT_NVFP4_A16:
+         layer = NVFP4A16MarlinLinear(in_features, out_features,
+                                      config.quant.group_size, bias)
+-- 
+2.50.1 (Apple Git-155)
+

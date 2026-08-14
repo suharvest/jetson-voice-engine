@@ -1,0 +1,79 @@
+From 8d1c8c85c59081bde7ab3b71a31eba1f462afb0b Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 19:54:00 +0800
+Subject: [PATCH] fix: normalize linear MRoPE metadata for runtime
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ .../checkpoint/checkpoint_utils.py            |  2 +-
+ .../python-unittests/test_checkpoint_utils.py | 37 ++++++++++++++++++-
+ 2 files changed, 36 insertions(+), 3 deletions(-)
+
+diff --git a/tensorrt_edgellm/checkpoint/checkpoint_utils.py b/tensorrt_edgellm/checkpoint/checkpoint_utils.py
+index 2302d6a..3fcf686 100644
+--- a/tensorrt_edgellm/checkpoint/checkpoint_utils.py
++++ b/tensorrt_edgellm/checkpoint/checkpoint_utils.py
+@@ -63,7 +63,7 @@ def normalize_rope_scaling_for_runtime(rope_scaling: Any) -> Any:
+     normalized = dict(rope_scaling)
+     if "mrope_section" in normalized:
+         rope_type = normalized.get("type") or normalized.get("rope_type")
+-        if rope_type in (None, "default", "mrope"):
++        if rope_type in (None, "default", "linear", "mrope"):
+             normalized["type"] = "default"
+             normalized["rope_type"] = "default"
+     # rope_parameters (transformers v5) carries "rope_type" without "type";
+diff --git a/tests/python-unittests/test_checkpoint_utils.py b/tests/python-unittests/test_checkpoint_utils.py
+index 091ec2e..c8e5e9c 100644
+--- a/tests/python-unittests/test_checkpoint_utils.py
++++ b/tests/python-unittests/test_checkpoint_utils.py
+@@ -37,8 +37,8 @@ if _REPO_ROOT not in sys.path:
+     sys.path.insert(0, _REPO_ROOT)
+ 
+ try:
+-    from tensorrt_edgellm.checkpoint.checkpoint_utils import \
+-        load_checkpoint_config_dicts
++    from tensorrt_edgellm.checkpoint.checkpoint_utils import (
++        load_checkpoint_config_dicts, normalize_rope_scaling_for_runtime)
+ except ImportError as exc:  # pragma: no cover
+     pytest.skip(f"tensorrt_edgellm not importable: {exc}",
+                 allow_module_level=True)
+@@ -95,6 +95,39 @@ def _assert_kmrope(rope_scaling):
+         f"for kMRope; got {rope_type!r}")
+ 
+ 
++def test_linear_rope_with_mrope_section_is_normalized_for_runtime():
++    """Qwen3-ASR uses linear scaling metadata for an MRoPE configuration."""
++    source = {
++        "factor": 1.0,
++        "mrope_section": [24, 20, 20],
++        "rope_type": "linear",
++    }
++
++    normalized = normalize_rope_scaling_for_runtime(source)
++
++    assert normalized == {
++        "factor": 1.0,
++        "mrope_section": [24, 20, 20],
++        "rope_type": "default",
++        "type": "default",
++    }
++    assert source["rope_type"] == "linear"
++
++
++def test_linear_rope_without_mrope_section_keeps_linear_semantics():
++    """Ordinary linear RoPE must not be classified as MRoPE."""
++    normalized = normalize_rope_scaling_for_runtime({
++        "factor": 2.0,
++        "rope_type": "linear",
++    })
++
++    assert normalized == {
++        "factor": 2.0,
++        "rope_type": "linear",
++        "type": "linear",
++    }
++
++
+ def test_qwen3_vl_transformers_v5_recovers_rope_from_text_config_rope_parameters(
+ ):
+     """The bug that caused MR !761 VLM CI failures: transformers-v5 puts the

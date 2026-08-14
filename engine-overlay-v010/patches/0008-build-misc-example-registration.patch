@@ -1,0 +1,105 @@
+diff --git a/.gitignore b/.gitignore
+index 3ee0a94..d1b41cc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,7 +14,8 @@ data.tar
+ *.tar.gz
+ internal/
+ *.log
+-.DS_Store/
++.DS_Store
++._*
+ docs/cpp_docs/
+ docs/build/
+ docs/source/cpp_api/
+diff --git a/examples/llm/CMakeLists.txt b/examples/llm/CMakeLists.txt
+index 0d6766b..6fa3bc4 100644
+--- a/examples/llm/CMakeLists.txt
++++ b/examples/llm/CMakeLists.txt
+@@ -38,3 +38,54 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
+                                              ${CMAKE_SOURCE_DIR}/examples/utils)
+ target_compile_options(llm_bench PRIVATE -Wno-psabi)
+ add_cross_build_link_options(llm_bench)
++
++# Streaming-ASR M1 acceptance test (design doc §12).
++# Drives the new appendPrefillEmbeds public API through one-shot vs split-chunk
++# paths on the real thinker engine and compares logits element-wise.
++add_executable(spike_m1_append_prefill_embeds spike_m1_append_prefill_embeds.cpp)
++target_link_libraries(spike_m1_append_prefill_embeds PRIVATE edgellmCore
++                                                             exampleUtils
++                                                             commonLibraryExt)
++target_include_directories(
++  spike_m1_append_prefill_embeds PRIVATE ${COMMON_INCLUDE_DIRS}
++                                          ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_m1_append_prefill_embeds)
++
++# Streaming-ASR M2 acceptance test (design doc §12 milestone 2): session
++# lifecycle (beginAsrSession/endAsrSession idempotence) + capacity caps
++# (KV-overflow + per-chunk-overflow refusal).
++add_executable(spike_m2_session_lifecycle spike_m2_session_lifecycle.cpp)
++target_link_libraries(spike_m2_session_lifecycle PRIVATE edgellmCore
++                                                          exampleUtils
++                                                          commonLibraryExt)
++target_include_directories(
++  spike_m2_session_lifecycle PRIVATE ${COMMON_INCLUDE_DIRS}
++                                      ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_m2_session_lifecycle)
++
++# Streaming-ASR M3.5 acceptance test (design doc §13b): audio runner split
++# correctness — encodeMelChunk on full mel vs three chunk-aligned splits
++# must produce bit-exact identical audio embeddings.
++add_executable(spike_m35_audio_runner_split spike_m35_audio_runner_split.cpp)
++target_link_libraries(spike_m35_audio_runner_split PRIVATE edgellmCore
++                                                            exampleUtils
++                                                            commonLibraryExt)
++target_include_directories(
++  spike_m35_audio_runner_split PRIVATE ${COMMON_INCLUDE_DIRS}
++                                        ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_m35_audio_runner_split)
++
++# Streaming-ASR M3.6 empirical LCS test: end-to-end chunked-prefill text-quality
++# comparison. Drives beginAsrSession + encodeMelChunk + appendPrefillEmbeds +
++# decodeAfterChunkedPrefillForTesting + endAsrSession for chunk_blocks in
++# {1, 2, 4, 8} on a real ASR sample, then compares decoded token sequences via
++# LCS-similarity. If LCS >= 0.95 for production chunk sizes the streaming
++# worker ships as-is with no encoder rework.
++add_executable(spike_m36_empirical_lcs spike_m36_empirical_lcs.cpp)
++target_link_libraries(spike_m36_empirical_lcs PRIVATE edgellmCore
++                                                       exampleUtils
++                                                       commonLibraryExt)
++target_include_directories(
++  spike_m36_empirical_lcs PRIVATE ${COMMON_INCLUDE_DIRS}
++                                   ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_m36_empirical_lcs)
+diff --git a/examples/omni/CMakeLists.txt b/examples/omni/CMakeLists.txt
+index c258ecb..f9b8bc2 100644
+--- a/examples/omni/CMakeLists.txt
++++ b/examples/omni/CMakeLists.txt
+@@ -4,17 +4,27 @@
+ # Qwen3-Omni Inference Example Note: cuBLAS is loaded at runtime via
+ # dlopen/dlsym in TTSRuntime, no compile-time linking needed.
+ add_executable(qwen3_tts_inference qwen3_tts_inference.cpp)
++add_executable(qwen3_tts_streaming_worker qwen3_tts_streaming_worker.cpp)
+ 
+ target_include_directories(
+   qwen3_tts_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                               ${CMAKE_SOURCE_DIR}/examples/utils)
++target_include_directories(
++  qwen3_tts_streaming_worker PRIVATE ${COMMON_INCLUDE_DIRS}
++                                     ${CMAKE_SOURCE_DIR}/examples/utils)
+ 
+ target_link_libraries(qwen3_tts_inference PRIVATE edgellmCore exampleUtils
+                                                   commonLibraryExt)
++target_link_libraries(qwen3_tts_streaming_worker PRIVATE edgellmCore exampleUtils
++                                                         commonLibraryExt)
+ 
+ add_cross_build_link_options(qwen3_tts_inference)
++add_cross_build_link_options(qwen3_tts_streaming_worker)
+ 
+ # Set output directory
+ set_target_properties(
+   qwen3_tts_inference PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                  ${CMAKE_BINARY_DIR}/examples/omni)
++set_target_properties(
++  qwen3_tts_streaming_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
++                                        ${CMAKE_BINARY_DIR}/examples/omni)

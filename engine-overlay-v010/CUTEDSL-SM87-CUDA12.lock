@@ -1,0 +1,17 @@
+# Generated CuTe DSL FMHA-v2 artifact used for the first v0.10 Orin gate.
+# The final release lock must bind the published artifact location as well as
+# these values; this file is build/qualification provenance, not a downloader.
+filename=tel-v0100-fmha-sm87-cuda12.tar.gz
+sha256=0402253a874db3b03e25dbb76a5c4f5d2f9531eb66d9b8868081df31f43dcb7b
+arch=aarch64
+gpu_arch=sm_87
+cuda_package_variant=cu12
+host_cuda_version=12.6.68
+cutlass_dsl_version=4.6.1
+cutlass_dsl_cuda_version=12.9
+cupy_package=cupy-cuda12x
+cupy_version=12.3.0
+groups=fmha
+variant_count=25
+build_device=orin-nano
+build_date=2026-08-14T14:28:22.997208Z

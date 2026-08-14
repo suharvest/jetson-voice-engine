@@ -1,0 +1,38 @@
+Rebased onto v0.8.0 (f9cc7462) — C2 sparktts re-pin, 2026-07-03.
+builderUtils.cpp hunk ONLY (Jetson engine-build memory budget: 4GiB workspace
+pool + kWEIGHT_STREAMING + cuBLAS/cuBLAS-LT tactic limit). OPT-IN — NOT in the
+default build.sh apply chain: every v0.8.0 serve-gated build was produced
+WITHOUT it (GDN VRAM fit is handled at engine-export time). Apply manually only
+when an engine build OOMs on a memory-constrained Orin.
+The v0.7.1 patch's other hunks are gone for cause: eagleDraftEngineRunner.cpp /
+llmEngineRunner.{cpp,h} / llmRuntimeUtils.{cpp,h} no longer exist at those paths
+in v0.8.0, and their shared-engine-ctor content is superseded in-series by
+v080-sparktts-0007 (a361221) + v080-sparktts-0029 (21119ec).
+---
+diff --git a/cpp/builder/builderUtils.cpp b/cpp/builder/builderUtils.cpp
+index 8b9d248..05e7636 100644
+--- a/cpp/builder/builderUtils.cpp
++++ b/cpp/builder/builderUtils.cpp
+@@ -260,6 +260,22 @@ std::unique_ptr<nvinfer1::IBuilderConfig> createBuilderConfig(nvinfer1::IBuilder
+     config->setPreviewFeature(nvinfer1::PreviewFeature::kALIASED_PLUGIN_IO_10_03, true);
+ #endif
+ 
++    // Limit workspace memory pool to avoid OOM on memory-constrained devices
++    // (e.g. Jetson Orin NX with 15 GB unified memory).  TRT tactic profiling
++    // otherwise requests 2-3.5 GB of workspace, which + weight memory > total.
++    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 4ULL << 30);  // 4 GiB
++
++    // Stream weights instead of loading all into GPU memory at once (TRT 10+).
++    // On unified-memory Jetson this avoids pinning the full ONNX weight buffer.
++    config->setFlag(nvinfer1::BuilderFlag::kWEIGHT_STREAMING);
++
++    // Limit tactics to cuBLAS / cuBLAS-LT to reduce profiling memory pressure.
++    // Full tactic set includes cuDNN / edge-mask convolution tactics that
++    // require 2+ GiB of scratch space, which is infeasible on 15 GB Orin NX.
++    auto tacticSources = 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS)
++                       | 1U << static_cast<int>(nvinfer1::TacticSource::kCUBLAS_LT);
++    config->setTacticSources(tacticSources);
++
+     return config;
+ }
+ 

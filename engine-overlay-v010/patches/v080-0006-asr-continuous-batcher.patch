@@ -1,0 +1,902 @@
+diff --git a/cpp/runtime/asrContinuousBatcher.cpp b/cpp/runtime/asrContinuousBatcher.cpp
+new file mode 100644
+index 0000000..1af5d32
+--- /dev/null
++++ b/cpp/runtime/asrContinuousBatcher.cpp
+@@ -0,0 +1,380 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "runtime/asrContinuousBatcher.h"
++#include "common/logger.h"
++
++#include <algorithm>
++
++namespace trt_edgellm
++{
++namespace rt
++{
++
++AsrContinuousBatcher::AsrContinuousBatcher(LLMInferenceRuntime& runtime, SessionLaneManager& laneManager) noexcept
++    : mRuntime(runtime)
++    , mLaneManager(laneManager)
++{
++}
++
++AsrContinuousBatcher::LaneRecord* AsrContinuousBatcher::recordForLane(int32_t lane)
++{
++    for (auto& r : mLanes)
++    {
++        if (r.lane == lane)
++        {
++            return &r;
++        }
++    }
++    return nullptr;
++}
++
++AsrContinuousBatcher::LaneRecord const* AsrContinuousBatcher::recordForLane(int32_t lane) const
++{
++    for (auto const& r : mLanes)
++    {
++        if (r.lane == lane)
++        {
++            return &r;
++        }
++    }
++    return nullptr;
++}
++
++bool AsrContinuousBatcher::rebuildContext(cudaStream_t stream)
++{
++    // Row i of the shared context maps to physical lane mAdmittedLanes[i]. We require the admitted
++    // lanes to be the contiguous prefix {0,1,...,N-1} so that context row i == physical KV/MRope
++    // row i (the prefill primitive packs span[i] into IO row i and commits row i). The ASR lane
++    // partition starts at 0 and SessionLaneManager hands out ascending free lanes, so sequential
++    // ASR admits yield exactly this prefix.
++    int32_t const n = static_cast<int32_t>(mAdmittedLanes.size());
++    for (int32_t i = 0; i < n; ++i)
++    {
++        if (mAdmittedLanes[i] != i)
++        {
++            LOG_ERROR("AsrContinuousBatcher: admitted lanes must be the contiguous prefix {0..N-1} so "
++                      "context row i == physical lane i; got lane %d at row %d.",
++                mAdmittedLanes[i], i);
++            return false;
++        }
++    }
++
++    // (Re)initialize the shared context to cover all admitted lanes. initialize() sets
++    // activeBatchSize=batchSize and the identity batchIndexMapping.
++    mContext = DecodingInferenceContext{};
++    mContext.initialize(/*batchSize=*/n, /*maxGenLength=*/0, std::nullopt, rt::OptionalInputTensors{},
++        /*loraName=*/"", stream);
++
++    // Seed each lane's raw input ids (prompt prefix) and an empty system prompt so the one-shot
++    // setUp runs the cache-miss path (tokenIds = prompt, reuse=0, recurrent zeroed, KV reset for a
++    // new sequence) — exactly the state an append chunk expects, for every lane.
++    mContext.rawBatchedInputIds.clear();
++    for (int32_t i = 0; i < n; ++i)
++    {
++        // Lane records are kept in admission order; find the record for physical lane i.
++        LaneRecord const* rec = recordForLane(i);
++        mContext.rawBatchedInputIds.push_back(rec ? std::vector<int32_t>{} : std::vector<int32_t>{});
++        mContext.systemPrompts[i] = "";
++    }
++
++    if (!mRuntime.setUpAsrSessionPrefill(mContext))
++    {
++        LOG_ERROR("AsrContinuousBatcher: setUpAsrSessionPrefill failed for batch=%d", n);
++        return false;
++    }
++
++    // Init MRope rows for every admitted lane over [0, maxPositions).
++    for (int32_t i = 0; i < n; ++i)
++    {
++        LaneRecord const* rec = recordForLane(i);
++        int32_t const maxPos = rec ? rec->maxPositions : 0;
++        if (!mRuntime.initAsrSessionMRopeLane(i, maxPos, stream))
++        {
++            LOG_ERROR("AsrContinuousBatcher: MRope lane init failed for lane=%d maxPositions=%d", i, maxPos);
++            return false;
++        }
++    }
++    return true;
++}
++
++int32_t AsrContinuousBatcher::admit(
++    int64_t sessionId, std::vector<int32_t> const& promptTokenIds, int32_t maxPositions, cudaStream_t stream)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++
++    int32_t const lane = mLaneManager.acquire(LaneOwnerKind::kAsr, sessionId);
++    if (lane < 0)
++    {
++        LOG_ERROR("AsrContinuousBatcher::admit: no free ASR lane for session %ld", static_cast<long>(sessionId));
++        return -1;
++    }
++    if (lane >= mRuntime.cacheManagerMaxBatchSize())
++    {
++        LOG_ERROR("AsrContinuousBatcher::admit: lane %d exceeds cache maxBatchSize %d", lane,
++            mRuntime.cacheManagerMaxBatchSize());
++        mLaneManager.release(lane);
++        return -1;
++    }
++
++    LaneRecord rec;
++    rec.lane = lane;
++    rec.sessionId = sessionId;
++    rec.status = AsrSessionStatus::kActive;
++    rec.maxPositions = maxPositions;
++    mLanes.push_back(std::move(rec));
++    mAdmittedLanes.push_back(lane);
++    std::sort(mAdmittedLanes.begin(), mAdmittedLanes.end());
++
++    // Rebuild the shared context to cover the new lane set. NOTE: this re-runs the one-shot prefill
++    // setUp, which resets KV lengths for the whole active batch — admit-before-any-append is the
++    // contract (the isolation gate admits both lanes up-front, then appends). promptTokenIds is
++    // captured in the lane record's first queued chunk if non-empty.
++    if (!rebuildContext(stream))
++    {
++        // Roll back the admission.
++        mLanes.pop_back();
++        mAdmittedLanes.erase(std::find(mAdmittedLanes.begin(), mAdmittedLanes.end(), lane));
++        mLaneManager.release(lane);
++        return -1;
++    }
++
++    if (!promptTokenIds.empty())
++    {
++        LaneRecord* live = recordForLane(lane);
++        live->queue.push_back(promptTokenIds);
++        live->queueFinal.push_back(false);
++    }
++
++    LOG_INFO("AsrContinuousBatcher::admit: session %ld -> lane %d (activeBatch=%d, maxPositions=%d)",
++        static_cast<long>(sessionId), lane, mContext.activeBatchSize, maxPositions);
++    return lane;
++}
++
++bool AsrContinuousBatcher::enqueueChunk(int32_t lane, std::vector<int32_t> const& chunkTokenIds, bool isFinalChunk)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    LaneRecord* rec = recordForLane(lane);
++    if (rec == nullptr || rec->status != AsrSessionStatus::kActive)
++    {
++        LOG_ERROR("AsrContinuousBatcher::enqueueChunk: lane %d unknown or not active", lane);
++        return false;
++    }
++    if (chunkTokenIds.empty())
++    {
++        LOG_ERROR("AsrContinuousBatcher::enqueueChunk: empty chunk for lane %d", lane);
++        return false;
++    }
++    rec->queue.push_back(chunkTokenIds);
++    rec->queueFinal.push_back(isFinalChunk);
++    return true;
++}
++
++int32_t AsrContinuousBatcher::tick(cudaStream_t stream)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++
++    // Collect the lanes (ascending == context-row order) that have a pending chunk this tick, and
++    // build each one's effective step tokens with the v080-0004 per-lane carry-over guard.
++    struct Ready
++    {
++        int32_t row;                    // context row == physical lane id
++        LaneRecord* rec;
++        std::vector<int32_t> stepTokens;
++        std::vector<int32_t> nextTail;  // committed to rec->pendingTextTail on success
++        bool isFinal;
++        bool priorKvNonEmpty;
++    };
++    std::vector<Ready> ready;
++
++    for (int32_t row = 0; row < static_cast<int32_t>(mAdmittedLanes.size()); ++row)
++    {
++        int32_t const lane = mAdmittedLanes[row];
++        LaneRecord* rec = recordForLane(lane);
++        if (rec == nullptr || rec->status != AsrSessionStatus::kActive || rec->queue.empty())
++        {
++            continue; // idle lane — MUST NOT be packed (empty span corrupts it).
++        }
++
++        std::vector<int32_t> const chunk = rec->queue.front();
++        bool const isFinal = rec->queueFinal.front();
++        rec->queue.pop_front();
++        rec->queueFinal.pop_front();
++
++        bool const priorKvNonEmpty = (rec->chunkCount > 0) || !rec->pendingTextTail.empty();
++
++        // Prepend any carried text tail (text-only sessions in this scheduler).
++        std::vector<int32_t> effective;
++        if (!rec->pendingTextTail.empty())
++        {
++            effective.reserve(rec->pendingTextTail.size() + chunk.size());
++            effective.insert(effective.end(), rec->pendingTextTail.begin(), rec->pendingTextTail.end());
++            effective.insert(effective.end(), chunk.begin(), chunk.end());
++        }
++        else
++        {
++            effective = chunk;
++        }
++
++        // Defer the trailing token of a non-final chunk so the NEXT step packs >= 2 tokens.
++        bool const deferTail = (!isFinal && effective.size() >= 2);
++        Ready r;
++        r.row = row;
++        r.rec = rec;
++        r.isFinal = isFinal;
++        r.priorKvNonEmpty = priorKvNonEmpty;
++        if (deferTail)
++        {
++            r.nextTail.assign(effective.end() - 1, effective.end());
++            r.stepTokens.assign(effective.begin(), effective.end() - 1);
++        }
++        else
++        {
++            r.stepTokens = std::move(effective);
++        }
++
++        // Per-lane capacity guard.
++        if (rec->maxPositions > 0
++            && rec->appendedTokens + static_cast<int32_t>(r.stepTokens.size()) > rec->maxPositions)
++        {
++            LOG_ERROR("AsrContinuousBatcher::tick: lane %d would exceed capacity (appended=%d + step=%zu > %d)", lane,
++                rec->appendedTokens, r.stepTokens.size(), rec->maxPositions);
++            // Put the original chunk back (refusal-safe — carry state untouched).
++            rec->queue.push_front(chunk);
++            rec->queueFinal.push_front(isFinal);
++            return -1;
++        }
++        ready.push_back(std::move(r));
++    }
++
++    if (ready.empty())
++    {
++        return 0; // nothing pending.
++    }
++
++    // The packed lanes must be the contiguous prefix {0..k-1} so context row i == span index i.
++    // (For the isolation gate every lane is ready every tick → packs {0,1}.) A non-prefix ready
++    // set (e.g. only lane 1 pending) cannot be driven by this primitive — row 0 is implied.
++    for (int32_t i = 0; i < static_cast<int32_t>(ready.size()); ++i)
++    {
++        if (ready[i].row != i)
++        {
++            LOG_ERROR("AsrContinuousBatcher::tick: ready lanes must form the prefix {0..k-1}; row %d at index %d. "
++                      "A lone non-zero lane needs compaction (not implemented for the isolation gate).",
++                ready[i].row, i);
++            return -1;
++        }
++    }
++
++    // Batch-wide single-token guard: the AttentionPlugin keys chunked-prefill vs decode on the
++    // batch-wide max chunk len. Refuse the tick if the max effective step len is 1 while ANY packed
++    // lane has a non-empty KV cache (would misroute the whole batch to the decode path).
++    int32_t maxStepLen = 0;
++    bool anyPriorKv = false;
++    bool anyFinal = false;
++    for (auto const& r : ready)
++    {
++        maxStepLen = std::max(maxStepLen, static_cast<int32_t>(r.stepTokens.size()));
++        anyPriorKv = anyPriorKv || r.priorKvNonEmpty;
++        anyFinal = anyFinal || r.isFinal;
++    }
++    if (maxStepLen == 1 && anyPriorKv)
++    {
++        LOG_ERROR("AsrContinuousBatcher::tick: refusing a max-1-token batched prefill step on a non-empty KV cache "
++                  "(would misroute the whole batch to the decode path).");
++        return -1;
++    }
++
++    // The context's activeBatchSize must equal the number of packed lanes. For the isolation gate
++    // this is the full admitted batch. (If a subset is ready, we would need to temporarily set
++    // activeBatchSize to k; the prefix invariant above guarantees rows 0..k-1 map correctly.)
++    int32_t const packed = static_cast<int32_t>(ready.size());
++    mContext.activeBatchSize = packed;
++
++    std::vector<rt::SpanI32> spans;
++    spans.reserve(packed);
++    for (auto& r : ready)
++    {
++        spans.emplace_back(r.stepTokens.data(), r.stepTokens.size());
++    }
++
++    // Sample only when at least one packed lane's chunk is final. (The isolation gate uses a single
++    // final tick so this samples the comparison logits for both lanes simultaneously.)
++    bool const sampleAfterPrefill = anyFinal;
++    if (!mRuntime.appendPrefillChunk(mContext, spans, /*audioEmbeds=*/std::nullopt, sampleAfterPrefill))
++    {
++        LOG_ERROR("AsrContinuousBatcher::tick: appendPrefillChunk failed (packed=%d)", packed);
++        return -1;
++    }
++
++    // Commit per-lane state now that the prefill succeeded.
++    for (auto& r : ready)
++    {
++        r.rec->pendingTextTail = std::move(r.nextTail);
++        r.rec->appendedTokens += static_cast<int32_t>(r.stepTokens.size());
++        ++r.rec->chunkCount;
++        mLaneManager.setKvLength(r.rec->lane, r.rec->appendedTokens);
++        if (r.isFinal)
++        {
++            r.rec->status = AsrSessionStatus::kFinished;
++        }
++    }
++    return packed;
++}
++
++void AsrContinuousBatcher::evict(int32_t lane, cudaStream_t stream)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    LaneRecord* rec = recordForLane(lane);
++    if (rec == nullptr)
++    {
++        return;
++    }
++    // Per-lane teardown: memset only this lane's KV length (no reshape), then release the lane.
++    mRuntime.resetSessionLane(lane, stream);
++    mLaneManager.release(lane);
++
++    mLanes.erase(std::remove_if(mLanes.begin(), mLanes.end(), [lane](LaneRecord const& r) { return r.lane == lane; }),
++        mLanes.end());
++    mAdmittedLanes.erase(std::remove(mAdmittedLanes.begin(), mAdmittedLanes.end(), lane), mAdmittedLanes.end());
++    // Shrink the logical active batch to the surviving lanes (rows 0..N-1).
++    mContext.activeBatchSize = static_cast<int32_t>(mAdmittedLanes.size());
++}
++
++AsrSessionStatus AsrContinuousBatcher::statusOf(int32_t lane) const
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    LaneRecord const* rec = recordForLane(lane);
++    return rec ? rec->status : AsrSessionStatus::kIdle;
++}
++
++int32_t AsrContinuousBatcher::appendedTokensOf(int32_t lane) const
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    LaneRecord const* rec = recordForLane(lane);
++    return rec ? rec->appendedTokens : 0;
++}
++
++int32_t AsrContinuousBatcher::chunkCountOf(int32_t lane) const
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    LaneRecord const* rec = recordForLane(lane);
++    return rec ? rec->chunkCount : 0;
++}
++
++} // namespace rt
++} // namespace trt_edgellm
+diff --git a/cpp/runtime/asrContinuousBatcher.h b/cpp/runtime/asrContinuousBatcher.h
+new file mode 100644
+index 0000000..db406e5
+--- /dev/null
++++ b/cpp/runtime/asrContinuousBatcher.h
+@@ -0,0 +1,165 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "common/tensor.h"
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager / AsrSessionStatus / LaneOwnerKind
++#include "runtime/llmInferenceRuntime.h"
++#include "runtime/state/decodingInferenceContext.h"
++
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <vector>
++
++namespace trt_edgellm
++{
++namespace rt
++{
++
++/*!
++ * @brief Continuous batch-lane scheduler for concurrent streaming-ASR sessions (spec §6 v2).
++ *
++ * v0.8.0's native request runtime fixes the admitted set at handleRequest entry and its decode
++ * loop ONLY evicts finished lanes (`compactBatch`, llmInferenceRuntime.cpp:~1611) — it never
++ * refills mid-loop, so async-arriving streaming sessions cannot ride it. AsrContinuousBatcher is
++ * the one net-new scheduling layer: it owns ONE shared DecodingInferenceContext sized to N lanes
++ * over the engine's native batch dimension, admits waiting sessions into free lanes, runs a
++ * RAGGED batched prefill-chunk step for the lanes that have a pending chunk this tick (reusing
++ * the existing `runBaseModelPrefillChunk` across the active batch via `appendPrefillChunk`),
++ * samples per-lane for finished lanes, and evicts finished lanes with the per-lane
++ * `resetSessionLane` (HybridCacheManager::resetLanes — memset, no reshape).
++ *
++ * Row<->lane invariant (codex-verified, file:line in PORT_NOTES): the shared context's row i is
++ * physical KV-cache batch row i AND MRope row i. `runBaseModelPrefillChunk` copies span[i] into
++ * IO row i, `commitSequenceLength` commits row i, and the RoPE kernel indexes
++ * `cosSinCacheBatchIdx=batchIdx` when the batch size is not 1 — so a batch-N prefill writes each
++ * lane's absolute position into its own KV/MRope row with zero cross-talk. This is the moat.
++ *
++ * Ragged-cadence rule (codex-verified): an IDLE lane MUST NOT be packed into the batched call —
++ * a zero/empty span yields `selectTokenIndices = ctxLen-1 = -1` in StepPreparer and the attention
++ * path still launches over the padded seq-len, corrupting that lane. So a tick batches ONLY the
++ * lanes that have a real pending chunk. The physical lane id IS the context row, and the prefill
++ * primitive implies row 0; therefore a lone surviving lane can be driven solo only when it is
++ * lane 0. (For the N=2 isolation gate both sessions share an identical chunk cadence, so every
++ * tick packs both lanes — activeBatchSize is always 2 — which is exactly the cross-talk test.)
++ *
++ * Single-token guard (v080-0004, batch-aware): the AttentionPlugin keys chunked-prefill vs decode
++ * on the BATCH-WIDE `qInputTensor.shape[1]` (= max chunk len across packed lanes). A tick is
++ * refused only when the MAX effective step length across the packed lanes is 1 while the KV cache
++ * is non-empty (would misroute the whole batch to the decode path). A mixed [1,5] tick is safe
++ * (shape[1]=5 keeps the whole batch on the chunked-prefill path; per-lane absolute KV-end indices
++ * are computed from kvCacheStartIdx + contextLength). Per-lane carry-over (deferring a trailing
++ * text token) is still applied so a producer that hands a lane a lone trailing token never forces
++ * a 1-token batch.
++ *
++ * Threading: a single internal mutex serializes admit/tick/evict (the shared PipelineIO is mutated
++ * by the engine step). Lockstep/serialized engine steps, not truly-parallel execution — see spec
++ * §5 "shared PipelineIO serialization".
++ */
++class AsrContinuousBatcher
++{
++public:
++    //! @brief One physical lane's streaming-ASR bookkeeping.
++    struct LaneRecord
++    {
++        int32_t lane{-1};                       //!< Physical batch row (== KV/MRope row). -1 if free.
++        int64_t sessionId{-1};                  //!< Caller session id.
++        AsrSessionStatus status{AsrSessionStatus::kIdle};
++        int32_t maxPositions{0};                //!< MRope/KV capacity this session was admitted for.
++        int32_t appendedTokens{0};              //!< Cumulative committed prefill tokens.
++        int32_t chunkCount{0};                  //!< Prefill steps committed so far.
++        std::vector<int32_t> pendingTextTail;   //!< Carried trailing text token (v080-0004 guard).
++        std::deque<std::vector<int32_t>> queue; //!< Pending text-only chunks (each with an isFinal flag in queueFinal).
++        std::deque<bool> queueFinal;            //!< isFinalChunk flag parallel to queue.
++    };
++
++    //! @param runtime Underlying request runtime (must outlive this; its engine must be maxBatchSize >= N).
++    //! @param laneManager Lane allocator (must outlive this); ASR lanes are acquired/released here.
++    AsrContinuousBatcher(LLMInferenceRuntime& runtime, SessionLaneManager& laneManager) noexcept;
++
++    AsrContinuousBatcher(AsrContinuousBatcher const&) = delete;
++    AsrContinuousBatcher& operator=(AsrContinuousBatcher const&) = delete;
++
++    //! @brief Admit a new streaming-ASR session into a free ASR lane.
++    //! @details Acquires a lane from the ASR partition, (re)initializes the SHARED batch context to
++    //!          cover all currently-admitted lanes, runs the one-shot prefill setup once, and inits
++    //!          the lane's MRope rows. The first admit sizes the context; a second admit re-runs
++    //!          setUp over the now-2-lane context. promptTokenIds may be empty (pure-token prefill).
++    //! @return Physical lane id, or -1 if the ASR partition is full / setup failed.
++    int32_t admit(int64_t sessionId, std::vector<int32_t> const& promptTokenIds, int32_t maxPositions,
++        cudaStream_t stream);
++
++    //! @brief Enqueue one text-only prefill chunk for an admitted lane.
++    //! @return False if the lane is unknown / already finished.
++    bool enqueueChunk(int32_t lane, std::vector<int32_t> const& chunkTokenIds, bool isFinalChunk);
++
++    //! @brief Run one scheduler step: ragged batched prefill over all lanes with a pending chunk.
++    //! @details Pops one chunk per ready lane, applies the per-lane carry-over guard, packs the
++    //!          ready lanes (in ascending row order) into a single `appendPrefillChunk` call,
++    //!          samples per-lane for lanes whose popped chunk is final, and advances per-lane state.
++    //!          Lanes whose final chunk was sampled transition to kFinished. Returns the number of
++    //!          lanes advanced (0 if nothing was pending).
++    //! @return Lanes advanced, or -1 on prefill failure / 1-token-batch refusal.
++    int32_t tick(cudaStream_t stream);
++
++    //! @brief Evict a finished (or any) lane: per-lane KV reset + release the lane.
++    void evict(int32_t lane, cudaStream_t stream);
++
++    // ── Introspection / testing surface ──────────────────────────────────────
++
++    //! @brief Active batch size of the shared context (number of admitted lanes).
++    int32_t activeBatchSize() const noexcept
++    {
++        return mContext.activeBatchSize;
++    }
++
++    AsrSessionStatus statusOf(int32_t lane) const;
++    int32_t appendedTokensOf(int32_t lane) const;
++    int32_t chunkCountOf(int32_t lane) const;
++
++    //! @brief Committed KV length for a lane (host-side, synchronous).
++    int32_t peekKvCacheLength(int32_t lane, cudaStream_t stream)
++    {
++        return mRuntime.peekKvCacheLength(lane, stream);
++    }
++
++    //! @brief Last-step logits row for a lane (parity surface for the isolation gate).
++    std::vector<float> getLogitsForTesting(int32_t lane, cudaStream_t stream)
++    {
++        return mRuntime.getLogitsForTesting(lane, stream);
++    }
++
++private:
++    LaneRecord* recordForLane(int32_t lane);
++    LaneRecord const* recordForLane(int32_t lane) const;
++
++    //! @brief (Re)build the shared context to cover the currently-admitted lanes (row==lane).
++    bool rebuildContext(cudaStream_t stream);
++
++    LLMInferenceRuntime& mRuntime;
++    SessionLaneManager& mLaneManager;
++    mutable std::mutex mMutex;
++
++    DecodingInferenceContext mContext;  //!< ONE shared context; row i == physical lane i.
++    std::vector<LaneRecord> mLanes;     //!< One record per admitted lane (ascending lane id).
++    std::vector<int32_t> mAdmittedLanes; //!< Admitted physical lane ids, ascending (== context rows).
++};
++
++} // namespace rt
++} // namespace trt_edgellm
+diff --git a/examples/llm/CMakeLists.txt b/examples/llm/CMakeLists.txt
+index 0d6766b..aff3258 100644
+--- a/examples/llm/CMakeLists.txt
++++ b/examples/llm/CMakeLists.txt
+@@ -23,6 +23,10 @@ target_include_directories(
+   llm_inference PRIVATE ${COMMON_INCLUDE_DIRS}
+                         ${CMAKE_SOURCE_DIR}/examples/utils)
+ add_cross_build_link_options(llm_inference)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(llm_inference PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
+ 
+ add_executable(llm_stream llm_stream.cpp)
+ target_link_libraries(llm_stream PRIVATE edgellmCore exampleUtils
+@@ -30,6 +34,10 @@ target_link_libraries(llm_stream PRIVATE edgellmCore exampleUtils
+ target_include_directories(
+   llm_stream PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/examples/utils)
+ add_cross_build_link_options(llm_stream)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(llm_stream PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
+ 
+ add_executable(llm_bench llm_bench.cpp)
+ target_link_libraries(llm_bench PRIVATE commonLibraryExt edgellmCore
+@@ -38,3 +46,56 @@ target_include_directories(llm_bench PRIVATE ${COMMON_INCLUDE_DIRS}
+                                              ${CMAKE_SOURCE_DIR}/examples/utils)
+ target_compile_options(llm_bench PRIVATE -Wno-psabi)
+ add_cross_build_link_options(llm_bench)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(llm_bench PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
++
++# ── Phase 3b empirical streaming-ASR spikes (patch v080-0003) ────────────────
++add_executable(spike_v080_m1_append_prefill spike_v080_m1_append_prefill.cpp)
++target_link_libraries(spike_v080_m1_append_prefill PRIVATE edgellmCore exampleUtils
++                                                           commonLibraryExt)
++target_include_directories(
++  spike_v080_m1_append_prefill PRIVATE ${COMMON_INCLUDE_DIRS}
++                                       ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m1_append_prefill)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m1_append_prefill PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
++
++add_executable(spike_v080_m2_session_lifecycle spike_v080_m2_session_lifecycle.cpp)
++target_link_libraries(spike_v080_m2_session_lifecycle PRIVATE edgellmCore exampleUtils
++                                                              commonLibraryExt)
++target_include_directories(
++  spike_v080_m2_session_lifecycle PRIVATE ${COMMON_INCLUDE_DIRS}
++                                          ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m2_session_lifecycle)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m2_session_lifecycle PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
++
++add_executable(spike_v080_m3_lane_isolation spike_v080_m3_lane_isolation.cpp)
++target_link_libraries(spike_v080_m3_lane_isolation PRIVATE edgellmCore exampleUtils
++                                                           commonLibraryExt)
++target_include_directories(
++  spike_v080_m3_lane_isolation PRIVATE ${COMMON_INCLUDE_DIRS}
++                                       ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m3_lane_isolation)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m3_lane_isolation PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
++
++add_executable(spike_v080_m4_concurrent_lanes spike_v080_m4_concurrent_lanes.cpp)
++target_link_libraries(spike_v080_m4_concurrent_lanes PRIVATE edgellmCore exampleUtils
++                                                             commonLibraryExt)
++target_include_directories(
++  spike_v080_m4_concurrent_lanes PRIVATE ${COMMON_INCLUDE_DIRS}
++                                         ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m4_concurrent_lanes)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m4_concurrent_lanes PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
+diff --git a/examples/llm/spike_v080_m4_concurrent_lanes.cpp b/examples/llm/spike_v080_m4_concurrent_lanes.cpp
+new file mode 100644
+index 0000000..de06af3
+--- /dev/null
++++ b/examples/llm/spike_v080_m4_concurrent_lanes.cpp
+@@ -0,0 +1,256 @@
++// Phase 5a empirical spike — THE N=2 ASR ISOLATION GATE (the moat property).
++//
++// Proves that running two concurrent streaming-ASR sessions through the new
++// rt::AsrContinuousBatcher over a maxBatchSize=2 v0.8.0 qwen3-asr thinker engine introduces
++// ZERO cross-talk: each lane's per-step sampled logits / argmax are BYTE-IDENTICAL to that same
++// session run SOLO (single-lane). Accuracy > speed — the value is provable per-lane isolation.
++//
++// Procedure:
++//   SOLO baselines (one lane, activeBatchSize=1 via the batcher with a single admit):
++//     Session A — distinct token stream SA, chunked SA0 + SA1 → final logits LA_solo.
++//     Session B — distinct token stream SB (different seed), chunked SB0 + SB1 → LB_solo.
++//   CONCURRENT (two lanes, activeBatchSize=2, lockstep ticks):
++//     admit A→lane0, admit B→lane1; enqueue both lanes' chunk0 (non-final), tick();
++//     enqueue both lanes' chunk1 (final), tick(); read lane0/lane1 logits → LA_cc, LB_cc.
++//   GATE:
++//     argmax(LA_cc)==argmax(LA_solo)  &&  max_i|LA_cc[i]-LA_solo[i]| < 1e-2  (PASS = diff 0.0)
++//     argmax(LB_cc)==argmax(LB_solo)  &&  max_i|LB_cc[i]-LB_solo[i]| < 1e-2
++//   + 0 CUDA errors across the concurrent run (checked after every batcher call + a final
++//     cudaGetLastError + stream sync).
++//
++// Distinct token streams (different seeds) guarantee the two lanes carry genuinely different KV /
++// logits, so a batched step that leaked across rows WOULD perturb the diff. Text tokens only (no
++// mel) isolate the batched prefill-chunk packing/exec/commit/sample math — the batcher's seam.
++//
++// Exit 0 = PASS.
++
++#include "common/tensor.h"
++#include "common/trtUtils.h" // loadEdgellmPluginLib — registers AttentionPlugin before deserialize
++#include "runtime/asrContinuousBatcher.h"
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager
++#include "runtime/llmInferenceRuntime.h"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <random>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++using namespace trt_edgellm;
++
++#define CK(x)                                                                                                          \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        auto _e = (x);                                                                                                 \
++        if (_e != cudaSuccess)                                                                                         \
++        {                                                                                                              \
++            fprintf(stderr, "CUDA err %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(_e));                       \
++            std::exit(2);                                                                                              \
++        }                                                                                                              \
++    } while (0)
++
++namespace
++{
++constexpr int32_t kMaxPositions = 1024;
++
++int argmax(std::vector<float> const& v)
++{
++    int k = 0;
++    for (int i = 1; i < static_cast<int>(v.size()); ++i)
++        if (v[i] > v[k])
++            k = i;
++    return k;
++}
++
++std::vector<int32_t> makeTextTokens(int n, uint32_t seed)
++{
++    std::vector<int32_t> ids(n);
++    std::mt19937 gen(seed);
++    std::uniform_int_distribution<int32_t> dis(1, 100000);
++    for (auto& t : ids)
++        t = dis(gen);
++    return ids;
++}
++
++// Run ONE session solo through a fresh single-lane batcher: admit → chunk0(!final) → chunk1(final).
++// Returns the lane-0 final logits.
++std::vector<float> runSolo(rt::LLMInferenceRuntime& runtime, std::vector<int32_t> const& chunk0,
++    std::vector<int32_t> const& chunk1, cudaStream_t stream)
++{
++    rt::SessionLaneManager laneMgr(/*maxBatchSize=*/2, /*asrMax=*/2, /*ttsMax=*/0);
++    rt::AsrContinuousBatcher batcher(runtime, laneMgr);
++    int32_t lane = batcher.admit(/*sessionId=*/0, /*prompt=*/{}, kMaxPositions, stream);
++    if (lane != 0)
++    {
++        fprintf(stderr, "SOLO: expected lane 0, got %d\n", lane);
++        std::exit(1);
++    }
++    batcher.enqueueChunk(lane, chunk0, /*isFinal=*/false);
++    if (batcher.tick(stream) < 0)
++    {
++        fprintf(stderr, "SOLO: tick(chunk0) failed\n");
++        std::exit(1);
++    }
++    batcher.enqueueChunk(lane, chunk1, /*isFinal=*/true);
++    if (batcher.tick(stream) < 0)
++    {
++        fprintf(stderr, "SOLO: tick(chunk1) failed\n");
++        std::exit(1);
++    }
++    CK(cudaStreamSynchronize(stream));
++    auto logits = batcher.getLogitsForTesting(lane, stream);
++    batcher.evict(lane, stream);
++    CK(cudaStreamSynchronize(stream));
++    return logits;
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++    std::string engineDir = "/home/harvest/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines-v080-b2/llm";
++    std::string multimodalEngineDir = ""; // text-only token prefill — no audio encoder.
++    int totalTokens = 64;
++    int splitAt = 32;
++    if (argc >= 2)
++        engineDir = argv[1];
++    if (argc >= 4)
++    {
++        totalTokens = std::atoi(argv[2]);
++        splitAt = std::atoi(argv[3]);
++    }
++    if (splitAt <= 0 || splitAt >= totalTokens)
++    {
++        fprintf(stderr, "FATAL: splitAt(%d) must be in (0, totalTokens=%d)\n", splitAt, totalTokens);
++        return 2;
++    }
++
++    auto pluginHandles = loadEdgellmPluginLib();
++
++    cudaStream_t stream;
++    CK(cudaStreamCreate(&stream));
++
++    std::unordered_map<std::string, std::string> loraMap;
++    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
++    try
++    {
++        runtime = std::make_unique<rt::LLMInferenceRuntime>(engineDir, multimodalEngineDir, loraMap, stream);
++    }
++    catch (std::exception const& e)
++    {
++        fprintf(stderr, "FATAL: runtime construction failed: %s\n", e.what());
++        return 2;
++    }
++    printf("runtime constructed against %s\n", engineDir.c_str());
++    printf("maxSessionBatchSize=%d\n", runtime->maxSessionBatchSize());
++    if (runtime->maxSessionBatchSize() < 2)
++    {
++        fprintf(stderr, "FATAL: engine maxBatchSize=%d < 2 — this gate needs a maxBatchSize>=2 engine.\n",
++            runtime->maxSessionBatchSize());
++        return 2;
++    }
++
++    // Two DISTINCT token streams (different seeds) — same shape, different content.
++    auto const tokensA = makeTextTokens(totalTokens, /*seed*/ 1234);
++    auto const tokensB = makeTextTokens(totalTokens, /*seed*/ 9876);
++    std::vector<int32_t> a0(tokensA.begin(), tokensA.begin() + splitAt), a1(tokensA.begin() + splitAt, tokensA.end());
++    std::vector<int32_t> b0(tokensB.begin(), tokensB.begin() + splitAt), b1(tokensB.begin() + splitAt, tokensB.end());
++
++    // ── SOLO baselines ───────────────────────────────────────────────────────
++    printf("\n--- SOLO baselines (activeBatchSize=1) ---\n");
++    auto LA_solo = runSolo(*runtime, a0, a1, stream);
++    auto LB_solo = runSolo(*runtime, b0, b1, stream);
++    printf("solo A: argmax=%d  |logits|=%zu\n", argmax(LA_solo), LA_solo.size());
++    printf("solo B: argmax=%d  |logits|=%zu\n", argmax(LB_solo), LB_solo.size());
++
++    // ── CONCURRENT (two lanes, lockstep, activeBatchSize=2) ──────────────────
++    printf("\n--- CONCURRENT N=2 (activeBatchSize=2, lockstep) ---\n");
++    rt::SessionLaneManager laneMgr(/*maxBatchSize=*/2, /*asrMax=*/2, /*ttsMax=*/0);
++    rt::AsrContinuousBatcher batcher(*runtime, laneMgr);
++
++    int32_t laneA = batcher.admit(/*sessionId=*/101, {}, kMaxPositions, stream);
++    int32_t laneB = batcher.admit(/*sessionId=*/202, {}, kMaxPositions, stream);
++    CK(cudaGetLastError());
++    printf("admit: laneA=%d laneB=%d activeBatch=%d\n", laneA, laneB, batcher.activeBatchSize());
++    if (laneA != 0 || laneB != 1 || batcher.activeBatchSize() != 2)
++    {
++        fprintf(stderr, "FATAL: expected laneA=0 laneB=1 activeBatch=2; got %d %d %d\n", laneA, laneB,
++            batcher.activeBatchSize());
++        return 1;
++    }
++
++    // Tick 1: both lanes' chunk0 (non-final) → one batched activeBatchSize=2 prefill.
++    batcher.enqueueChunk(laneA, a0, /*isFinal=*/false);
++    batcher.enqueueChunk(laneB, b0, /*isFinal=*/false);
++    int32_t adv1 = batcher.tick(stream);
++    CK(cudaGetLastError());
++    printf("tick1 advanced=%d  kvA=%d kvB=%d\n", adv1, batcher.peekKvCacheLength(laneA, stream),
++        batcher.peekKvCacheLength(laneB, stream));
++    if (adv1 != 2)
++    {
++        fprintf(stderr, "FATAL: tick1 expected to advance 2 lanes, got %d\n", adv1);
++        return 1;
++    }
++
++    // Tick 2: both lanes' chunk1 (final) → batched activeBatchSize=2 prefill + sample.
++    batcher.enqueueChunk(laneA, a1, /*isFinal=*/true);
++    batcher.enqueueChunk(laneB, b1, /*isFinal=*/true);
++    int32_t adv2 = batcher.tick(stream);
++    CK(cudaGetLastError());
++    CK(cudaStreamSynchronize(stream));
++    printf("tick2 advanced=%d  kvA=%d kvB=%d\n", adv2, batcher.peekKvCacheLength(laneA, stream),
++        batcher.peekKvCacheLength(laneB, stream));
++    if (adv2 != 2)
++    {
++        fprintf(stderr, "FATAL: tick2 expected to advance 2 lanes, got %d\n", adv2);
++        return 1;
++    }
++
++    auto LA_cc = batcher.getLogitsForTesting(laneA, stream);
++    auto LB_cc = batcher.getLogitsForTesting(laneB, stream);
++    CK(cudaStreamSynchronize(stream));
++
++    // Final CUDA-error scan across the concurrent run.
++    cudaError_t lastErr = cudaGetLastError();
++    bool cudaClean = (lastErr == cudaSuccess);
++    printf("CUDA last-error after concurrent run: %s => %s\n", cudaGetErrorString(lastErr),
++        cudaClean ? "CLEAN" : "ERROR");
++
++    batcher.evict(laneA, stream);
++    batcher.evict(laneB, stream);
++    CK(cudaStreamSynchronize(stream));
++
++    // ── THE ISOLATION GATE ───────────────────────────────────────────────────
++    printf("\n=== N=2 ASR ISOLATION GATE ===\n");
++    bool ok = cudaClean;
++
++    auto diffLane = [](std::vector<float> const& cc, std::vector<float> const& solo, char const* name) -> bool {
++        if (cc.empty() || solo.empty() || cc.size() != solo.size())
++        {
++            printf("lane %s: FAIL — logits empty / size mismatch (|cc|=%zu |solo|=%zu)\n", name, cc.size(),
++                solo.size());
++            return false;
++        }
++        double maxAbs = 0.0;
++        for (size_t i = 0; i < cc.size(); ++i)
++            maxAbs = std::max(maxAbs, std::fabs(static_cast<double>(cc[i]) - static_cast<double>(solo[i])));
++        int aCc = argmax(cc), aSolo = argmax(solo);
++        bool match = (aCc == aSolo) && (maxAbs < 1e-2);
++        printf("lane %s: argmax cc=%d solo=%d (%s)  max-abs diff = %.6e  => %s\n", name, aCc, aSolo,
++            aCc == aSolo ? "MATCH" : "MISMATCH", maxAbs, match ? "PASS" : "FAIL");
++        return match;
++    };
++
++    ok = diffLane(LA_cc, LA_solo, "A(0)") && ok;
++    ok = diffLane(LB_cc, LB_solo, "B(1)") && ok;
++    printf("0 CUDA errors across concurrent run: %s\n", cudaClean ? "YES" : "NO");
++
++    printf("\n=== M4 (N=2 ISOLATION) ACCEPTANCE: %s ===\n", ok ? "PASS" : "FAIL");
++    cudaStreamDestroy(stream);
++    return ok ? 0 : 1;
++}

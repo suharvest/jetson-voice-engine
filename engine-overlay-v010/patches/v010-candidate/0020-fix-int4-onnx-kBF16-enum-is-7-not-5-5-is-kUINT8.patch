@@ -1,0 +1,36 @@
+From 82d1b30744842422354ba9420efff5952246321f Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 17:05:36 +0800
+Subject: [PATCH] fix(int4-onnx): kBF16 enum is 7 not 5 (5 is kUINT8)
+
+The BF16-output dispatch emitted output_dtype=5 thinking it was kBF16, but
+nvinfer1::DataType 5 is kUINT8 (kBF16=7). TensorRT rejected the plugin output
+as an illegal UINT8 intermediate ('legalUINT8' assertion) at the down_proj
+node. The plugin C++ used the symbolic enum (correct); only the ONNX attribute
+value was wrong. Now emits 7.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+
+diff --git a/tensorrt_edgellm/onnx/dynamo_translations.py b/tensorrt_edgellm/onnx/dynamo_translations.py
+index 2eb459e880bd3b0311793becc854f11c95eeaf81..d03efef86c0479abfb3f5412730355c8229bcbea 100644
+--- a/tensorrt_edgellm/onnx/dynamo_translations.py
++++ b/tensorrt_edgellm/onnx/dynamo_translations.py
+@@ -317,9 +317,11 @@ def _int4_groupwise_gemm_v2_translation(
+     )
+ 
+ 
+-# nvinfer1::DataType::kBF16 == 5 (TensorRT enum). The plugin reads this int32
+-# attribute and routes to the FP32-accumulate / BF16-store kernels.
+-_TRT_DATATYPE_BF16 = 5
++# nvinfer1::DataType::kBF16 == 7 (TensorRT enum: kFLOAT=0 kHALF=1 kINT8=2 kINT32=3
++# kBOOL=4 kUINT8=5 kFP8=6 kBF16=7). The plugin reads this int32 attribute and routes
++# to the FP32-accumulate / BF16-store kernels. (NOTE: 5 is kUINT8 — using it makes
++# TensorRT reject the plugin output as an illegal UINT8 intermediate.)
++_TRT_DATATYPE_BF16 = 7
+ 
+ 
+ @script()
+-- 
+2.50.1 (Apple Git-155)
+

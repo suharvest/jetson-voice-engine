@@ -1,0 +1,174 @@
+From 0509a2e1aa8beb17f9cd09be2a162fafc10a6a5b Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:04:28 +0800
+Subject: [PATCH] use v010 native qwen3 tts voice clone
+
+Use the v0.10 Base voice-clone path (`cloneEncoderDir`) and forward
+`ref_audio`/`ref_text` to the native runtime, which owns reference encoding and
+ICL construction.
+
+The legacy `speaker_embedding_b64` request field remains accepted for protocol
+compatibility, but is deliberately not decoded: v0.10 has no host-side
+arbitrary speaker-embedding ABI. Requests containing it receive a warning and
+the field is ignored; callers must migrate to `ref_audio` with optional
+`ref_text`.
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ examples/omni/qwen3_tts_streaming_worker.cpp | 65 ++++++++++++--------
+ 1 file changed, 41 insertions(+), 24 deletions(-)
+
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index a2e6604..5bb52ff 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -2,7 +2,7 @@
+  * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+  *
+- * qwen3_tts_streaming_worker (v0.9.0 re-port, M1)
++ * qwen3_tts_streaming_worker (v0.10 native streaming + voice clone)
+  * -----------------------------------------------
+  * Standalone TTS streaming worker for Qwen3-TTS.
+  *
+@@ -17,20 +17,23 @@
+  * contract): ready / chunk (audio_b64, is_final) / done / error events with
+  * request_id+id, pool saturation error with status 4429.
+  *
+- * M1 deltas vs the v0.8.0 worker (see docs spec edgellm-v090-tts-re-port):
++ * Deltas vs the v0.8.0 worker:
+  *   * Native streaming: uniform streamingChunkFrames replaces the old
+  *     first/subsequent chunk surgery. `first_chunk_frames` is used as the
+  *     uniform chunk size (latency-critical knob); `chunk_frames` is still
+  *     accepted but folded into uniform chunking.
+- *   * Cancel: v0.9.0 has no runtime cancel mechanism yet (M3). Cancel lines
++ *   * Cancel: v0.10 cancel support is carried by patch 0028. Cancel lines
+  *     are acknowledged with tripped=false and error
+  *     "cancel_not_supported_yet"; generation runs to completion.
+- *   * Slots: every slot constructs its own runtime via the path-based ctor
+- *     (v0.9.0 has no shared-engine ctor yet — M3). max_slots=1 is the M1
+- *     validated configuration.
+- *   * `language` / `speaker_embedding_b64` request fields are accepted but
+- *     ignored (runtime support returns with the M2 patches); a warning is
+- *     logged to stderr when they are present.
++ *   * Slots: every slot constructs its own runtime (shared-engine reuse is
++ *     added by patch 0029).
++ *   * Qwen3-TTS Base voice clone uses v0.10's native reference-encoder path:
++ *     `cloneEncoderDir` points at the exported speaker/tokenizer encoders and
++ *     requests carry `ref_audio` plus optional `ref_text`.
++ *   * The historical `speaker_embedding_b64` field is intentionally not
++ *     decoded: v0.10 owns extraction and ICL construction on device. It is
++ *     accepted for protocol compatibility but logs a warning and is ignored;
++ *     callers must migrate to `ref_audio`/`ref_text`.
+  *
+  * Concurrency model (unchanged): N worker threads, each bound to ONE slot
+  * (runtime + stateless Code2Wav + CUDA stream). A runtime instance is never
+@@ -84,6 +87,7 @@ struct Args
+     std::string codePredictorEngineDir;
+     std::string code2wavEngineDir;
+     std::string tokenizerDir;
++    std::string cloneEncoderDir;
+     int32_t maxSlots{1}; //!< TTS slot-pool size. Default 1 == single-instance behavior (M1 validated config).
+     bool debug{false};
+ };
+@@ -95,6 +99,7 @@ enum OptionId : int
+     CODE_PREDICTOR_ENGINE_DIR,
+     CODE2WAV_ENGINE_DIR,
+     TOKENIZER_DIR,
++    CLONE_ENCODER_DIR,
+     MAX_SLOTS,
+     DEBUG,
+ };
+@@ -102,16 +107,18 @@ enum OptionId : int
+ void printUsage(char const* programName)
+ {
+     std::cerr << "Usage: " << programName << " --talkerEngineDir=<path> --code2wavEngineDir=<path>"
+-              << " [--codePredictorEngineDir=<path>] [--tokenizerDir=<path>] [--max_slots=<N>] [--debug]\n\n"
+-              << "Standalone Qwen3-TTS streaming worker (v0.9.0 native streaming API).\n"
++              << " [--codePredictorEngineDir=<path>] [--tokenizerDir=<path>]"
++              << " [--cloneEncoderDir=<path>] [--max_slots=<N>] [--debug]\n\n"
++              << "Standalone Qwen3-TTS streaming worker (v0.10 native streaming + voice clone).\n"
+               << "Reads JSON request lines from stdin and emits JSON events to stdout.\n"
+               << "--max_slots=<N> sets the TTS slot-pool size (default 1). Each slot is a\n"
+               << "  full TTS runtime + Code2Wav + CUDA stream + worker thread.\n"
+               << "Request schema:\n"
+               << "  {\"id\":\"...\",\"text\":\"...\",\"speaker\":\"Vivian\",\n"
++              << "   \"ref_audio\":\"/path/ref.wav\",\"ref_text\":\"optional transcript\",\n"
+               << "   \"stream\":true,\"first_chunk_frames\":8,\"chunk_frames\":10,\n"
+               << "   \"chunk_format\":\"pcm_s16le\",\"chunk_transport\":\"base64\"}\n"
+-              << "Cancel (M1: acknowledged but not supported yet):\n"
++              << "Cancel (handled by the cooperative-cancel patch):\n"
+               << "  {\"type\":\"cancel\",\"id\":\"...\"}\n";
+ }
+ 
+@@ -123,6 +130,7 @@ bool parseArgs(Args& args, int argc, char** argv)
+         {"codePredictorEngineDir", required_argument, 0, CODE_PREDICTOR_ENGINE_DIR},
+         {"code2wavEngineDir", required_argument, 0, CODE2WAV_ENGINE_DIR},
+         {"tokenizerDir", required_argument, 0, TOKENIZER_DIR},
++        {"cloneEncoderDir", required_argument, 0, CLONE_ENCODER_DIR},
+         {"max_slots", required_argument, 0, MAX_SLOTS},
+         {"debug", no_argument, 0, DEBUG},
+         {0, 0, 0, 0}};
+@@ -137,6 +145,7 @@ bool parseArgs(Args& args, int argc, char** argv)
+         case CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
+         case CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
+         case TOKENIZER_DIR: args.tokenizerDir = optarg; break;
++        case CLONE_ENCODER_DIR: args.cloneEncoderDir = optarg; break;
+         case MAX_SLOTS:
+         {
+             int const v = std::atoi(optarg);
+@@ -157,6 +166,17 @@ bool parseArgs(Args& args, int argc, char** argv)
+     {
+         args.tokenizerDir = args.talkerEngineDir;
+     }
++    // The exporter places Base clone encoders beside the component directories.
++    // Keep cloning opt-in for old bundles: an absent directory leaves the native
++    // runtime in its normal named-speaker/CustomVoice mode.
++    if (args.cloneEncoderDir.empty() && !args.talkerEngineDir.empty())
++    {
++        auto const candidate = std::filesystem::path(args.talkerEngineDir).parent_path() / "clone_encoders";
++        if (std::filesystem::is_directory(candidate))
++        {
++            args.cloneEncoderDir = candidate.string();
++        }
++    }
+     // Slot-pool size env fallback (matches the OVS EDGE_LLM_TTS_MAX_CONCURRENT
+     // convention). CLI --max_slots takes precedence when given (!= default 1).
+     if (args.maxSlots == 1)
+@@ -277,19 +297,15 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+     req.speakerName = item.value("speaker", "");
+     req.speakerId = item.value("speaker_id", -1);
+ 
+-    // M1: `language` (CustomVoice 9-row conditioning) and `speaker_embedding_b64`
+-    // (external voice-clone embedding) need the M2 runtime patches — the v0.9.0
+-    // TalkerGenerationRequest has no fields for them yet. Accept-and-warn so the
+-    // protocol surface stays stable for the consumer.
+-    if (!item.value("language", "").empty())
+-    {
+-        std::cerr << "[worker] warning: request field 'language' is not supported yet on v0.9.0 (M2); ignored"
+-                  << std::endl;
+-    }
++    // v0.10 native Base voice clone: the runtime loads reference audio through
++    // the on-device clone encoders and optionally builds an ICL prompt from its
++    // transcript. Do not turn this into a host-side embedding ABI.
++    req.refAudioPath = item.value("ref_audio", "");
++    req.refText = item.value("ref_text", "");
+     if (!item.value("speaker_embedding_b64", "").empty())
+     {
+-        std::cerr << "[worker] warning: request field 'speaker_embedding_b64' is not supported yet on v0.9.0 (M2); "
+-                     "ignored"
++        std::cerr << "[worker] warning: 'speaker_embedding_b64' is not supported by the v0.10 native voice-clone "
++                     "path; use 'ref_audio' and optional 'ref_text' (field ignored)"
+                   << std::endl;
+     }
+ 
+@@ -664,7 +680,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
+             CUDA_CHECK(cudaStreamCreate(&slot->stream));
+ 
+             slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+-                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
++                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, args.cloneEncoderDir,
++                slot->stream);
+ 
+             // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
+             // so concurrent slots never contend. useStateful only affects `ready` meta.

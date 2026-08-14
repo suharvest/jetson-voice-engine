@@ -1,0 +1,51 @@
+From aadb3540778e6b92a5db80ac79fd6fc44e28c307 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:02:53 +0800
+Subject: [PATCH] guard empty qwen3 tts prefill
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cpp/runtime/qwen3OmniTTSRuntime.cpp | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 8c30b6e..4a6c14e 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -1166,6 +1166,17 @@ bool Qwen3OmniTTSRuntime::projectToTalkerInput(rt::Tensor const& thinkerEmbed, i
+         "languageId=%d, prefixRows=%d",
+         seqLen, N, kAssistantPrefixLen, kAssistantTrailingSuffix, outputSeqLen, speakerId, languageId, prefixRows);
+ 
++    // Defensive guard: N <= 0 means the request carried no synthesizable assistant text after
++    // stripping the fixed role prefix/suffix (for example an empty/malformed prompt or a
++    // wrong-tokenizer chat template). Feeding such a prefill to the Talker produces garbage
++    // audio rather than silence, so reject it before projection.
++    if (N <= 0)
++    {
++        LOG_ERROR("projectToTalkerInput: no synthesizable text (N=%ld <= 0, seqLen=%ld); skipping Talker prefill", N,
++            seqLen);
++        return false;
++    }
++
+     // Project all tokens via text_projection MLP (Qwen3-Omni) or copy directly (Qwen3-Next Omni
+     // — Talker's own embed_tokens is already at talker hidden dim).
+     check::check(mProjectedBuffer.reshape({seqLen, hiddenSize}), "Tensor reshape failed");
+@@ -3252,6 +3263,18 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
+ 
+     // Step 6: Fill trailing text hidden states
+     int64_t const assistantSegLen = assistantSeg.endPos - assistantSeg.startPos;
++    // Defensive guard: the effective synthesizable text-token count is
++    // (assistantSegLen - kAssistantTrailingOffset). When it is <= 0 the assistant turn carried no
++    // real text after the fixed role prefix (empty/malformed prompt or a wrong-tokenizer chat
++    // template), so reject before building a malformed prefill.
++    int64_t const effectiveTextN = assistantSegLen - kAssistantTrailingOffset;
++    if (effectiveTextN <= 0)
++    {
++        LOG_ERROR("buildTalkerPrefillFromSegments: no synthesizable text (effective N=%ld <= 0, assistantSegLen=%ld, "
++                  "offset=%d); skipping Talker prefill",
++            effectiveTextN, assistantSegLen, kAssistantTrailingOffset);
++        return false;
++    }
+     trailingCount = std::min(static_cast<int32_t>(assistantSegLen - kAssistantTrailingOffset),
+         static_cast<int32_t>(trailingTextHidden.getShape()[0]) - 1);
+     if (trailingCount > 0)

@@ -1,0 +1,555 @@
+From 1bccbf59efcb3167ef7749371bbe304f750214bb Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:14:00 +0800
+Subject: [PATCH] share qwen3 tts engines across worker slots
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cpp/multimodal/code2WavRunner.cpp            | 42 ++++++++++--
+ cpp/multimodal/code2WavRunner.h              | 26 +++++++-
+ cpp/runtime/exec/engineExecutor.cpp          | 67 ++++++++++++++++----
+ cpp/runtime/exec/engineExecutor.h            | 39 +++++++++++-
+ cpp/runtime/qwen3OmniTTSRuntime.cpp          | 31 ++++++++-
+ cpp/runtime/qwen3OmniTTSRuntime.h            | 33 ++++++++++
+ examples/omni/qwen3_tts_streaming_worker.cpp | 49 ++++++++++----
+ 7 files changed, 249 insertions(+), 38 deletions(-)
+
+diff --git a/cpp/multimodal/code2WavRunner.cpp b/cpp/multimodal/code2WavRunner.cpp
+index 0a3c6f5..61ec0e2 100644
+--- a/cpp/multimodal/code2WavRunner.cpp
++++ b/cpp/multimodal/code2WavRunner.cpp
+@@ -99,6 +99,40 @@ Code2WavRunner::Code2WavRunner(std::string const& engineDir, cudaStream_t stream
+     LOG_INFO("Code2Wav runner initialized successfully");
+ }
+ 
++Code2WavRunner::Code2WavRunner(nvinfer1::ICudaEngine* borrowedEngine, std::string const& engineDir,
++    cudaStream_t stream, std::string const& checkpointDir)
++    : mBorrowedEngine(borrowedEngine)
++{
++    ELLM_CHECK(mBorrowedEngine != nullptr, "borrowed Code2Wav engine must not be null");
++
++    bool const configValid = validateAndFillConfig(engineDir);
++    ELLM_CHECK(configValid, "Failed to validate and fill config");
++
++    LOG_INFO("reusing borrowed (shared) Code2Wav engine (%d I/O tensors)", mBorrowedEngine->getNbIOTensors());
++
++    // Per-instance execution context created off the SHARED engine. The engine weights are
++    // read-only and safe to share; the context (activation memory) is NOT shared.
++    mCode2WavContext = std::unique_ptr<nvinfer1::IExecutionContext>(mBorrowedEngine->createExecutionContext());
++    ELLM_CHECK(mCode2WavContext, "Failed to create Code2Wav execution context on borrowed engine");
++
++    bool const profileSet = mCode2WavContext->setOptimizationProfileAsync(0, stream);
++    ELLM_CHECK(profileSet, "Failed to set optimization profile");
++    setNonBlockingAuxStreams(mCode2WavContext.get(), mBorrowedEngine, mAuxStreams);
++
++    // Engine weights may be supplied through the same checkpoint-backed inputs as the
++    // path constructor. Bind them to this slot's fresh context; the engine itself remains
++    // shared and read-only.
++    mExternalWeights.load(std::filesystem::path(engineDir), std::filesystem::path(engineDir) / "config.json",
++        stream, resolveCheckpointDir(checkpointDir));
++    mExternalWeights.bindToContext(*mBorrowedEngine, *mCode2WavContext, "code2wav");
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++
++    bool const bufferAllocated = allocateBuffer();
++    ELLM_CHECK(bufferAllocated, "Failed to allocate buffers");
++
++    LOG_INFO("Code2Wav runner initialized successfully (borrowed engine)");
++}
++
+ bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
+ {
+     std::string const configPath = engineDir + "/config.json";
+@@ -173,14 +207,14 @@ bool Code2WavRunner::validateAndFillConfig(std::string const& engineDir)
+ 
+ bool Code2WavRunner::allocateBuffer()
+ {
+-    if (!mCode2WavEngine || !mCode2WavContext)
++    if (!enginePtr() || !mCode2WavContext)
+     {
+         LOG_ERROR("Cannot allocate buffers - engine not loaded");
+         return false;
+     }
+ 
+     nvinfer1::Dims const codesShapeMax
+-        = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
++        = enginePtr()->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+ 
+     int64_t const maxSeqLen = codesShapeMax.d[2];
+     int64_t const maxWaveformLen = maxSeqLen * mConfig.upsampleRate;
+@@ -188,7 +222,7 @@ bool Code2WavRunner::allocateBuffer()
+     // Detect engine's actual waveform output dtype (FP16 for Qwen3-Omni code2wav,
+     // FP32 for Qwen3-TTS tokenizer_decoder). Allocating the wrong dtype reinterprets bytes
+     // and produces garbled audio.
+-    mWaveformDtype = mCode2WavEngine->getTensorDataType(binding_names::kCode2WavWaveform);
++    mWaveformDtype = enginePtr()->getTensorDataType(binding_names::kCode2WavWaveform);
+     LOG_INFO("Code2Wav waveform output dtype: %s",
+         mWaveformDtype == nvinfer1::DataType::kHALF        ? "FP16"
+             : mWaveformDtype == nvinfer1::DataType::kFLOAT ? "FP32"
+@@ -376,7 +410,7 @@ bool Code2WavRunner::generateWaveform(
+     int64_t const seqLen = math::cast<int64_t>(codes[0].size());
+     // Query engine's actual max profile (not mInputCodesDevice.getShape() which is mutated by prepareCodes).
+     nvinfer1::Dims const codesShapeMax
+-        = mCode2WavEngine->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
++        = enginePtr()->getProfileShape(binding_names::kCode2WavCodes, 0, nvinfer1::OptProfileSelector::kMAX);
+     int64_t const maxCodeLen = codesShapeMax.d[2];
+     int64_t waveformLen = 0;
+ 
+diff --git a/cpp/multimodal/code2WavRunner.h b/cpp/multimodal/code2WavRunner.h
+index 5a32ebd..222953c 100644
+--- a/cpp/multimodal/code2WavRunner.h
++++ b/cpp/multimodal/code2WavRunner.h
+@@ -64,6 +64,20 @@ public:
+     //! \param[in] checkpointDir Original checkpoint for runtime weight inputs
+     Code2WavRunner(std::string const& engineDir, cudaStream_t stream, std::string const& checkpointDir = "");
+ 
++    //! \brief Construct a runner over a borrowed, read-only Code2Wav engine.
++    //!
++    //! The engine is owned by another runner; this instance creates its own execution
++    //! context, external-weight bindings, and I/O buffers. The owner must outlive this
++    //! runner. The optional checkpoint directory follows the path constructor's semantics.
++    Code2WavRunner(nvinfer1::ICudaEngine* borrowedEngine, std::string const& engineDir, cudaStream_t stream,
++        std::string const& checkpointDir = "");
++
++    //! \brief Return the owned or borrowed engine, without transferring ownership.
++    nvinfer1::ICudaEngine* getEnginePtr() const noexcept
++    {
++        return mCode2WavEngine ? mCode2WavEngine.get() : mBorrowedEngine;
++    }
++
+     ~Code2WavRunner() noexcept = default;
+ 
+     //! \brief Generate audio waveform from RVQ codes (single sample)
+@@ -118,11 +132,17 @@ private:
+     bool runChunkedInference(
+         std::vector<std::vector<int32_t>> const& codes, rt::Tensor& outputWaveform, cudaStream_t stream);
+ 
++    nvinfer1::ICudaEngine* enginePtr() const noexcept
++    {
++        return mCode2WavEngine ? mCode2WavEngine.get() : mBorrowedEngine;
++    }
++
+     Code2WavConfig mConfig{}; //!< Code2Wav vocoder configuration
+     AuxStreamSet mAuxStreams{};
+-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< TensorRT runtime
+-    std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Code2Wav TensorRT engine
+-    std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Code2Wav execution context
++    std::unique_ptr<nvinfer1::IRuntime> mRuntime;                  //!< Null in borrowed mode
++    std::unique_ptr<nvinfer1::ICudaEngine> mCode2WavEngine;        //!< Null in borrowed mode
++    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};               //!< Non-owning shared engine
++    std::unique_ptr<nvinfer1::IExecutionContext> mCode2WavContext; //!< Per-instance execution context
+     ExternalWeightManager mExternalWeights{};                      //!< Checkpoint-backed engine weights
+     rt::Tensor mInputCodesDevice{};                                //!< [1, numQuantizers, seqLen] Input codes on GPU
+     rt::Tensor mOutputWaveform{};                                  //!< [1, 1, waveformLen] Output waveform
+diff --git a/cpp/runtime/exec/engineExecutor.cpp b/cpp/runtime/exec/engineExecutor.cpp
+index 1549aaa..4aa3602 100644
+--- a/cpp/runtime/exec/engineExecutor.cpp
++++ b/cpp/runtime/exec/engineExecutor.cpp
+@@ -115,6 +115,45 @@ std::unique_ptr<EngineExecutor> EngineExecutor::createForLLM(std::filesystem::pa
+     return std::unique_ptr<EngineExecutor>(new EngineExecutor(enginePath, std::move(registry)));
+ }
+ 
++EngineExecutor::EngineExecutor(nvinfer1::ICudaEngine* borrowedEngine, TensorRegistry registry)
++    : mBorrowedEngine(borrowedEngine)
++    , mRegistry(std::move(registry))
++{
++    ELLM_CHECK(mBorrowedEngine != nullptr, "borrowed engine must not be null");
++    LOG_INFO("reusing borrowed (shared) engine (%d I/O tensors)", mBorrowedEngine->getNbIOTensors());
++
++    // Per-instance execution context (kUSER_MANAGED) created off the SHARED engine. The engine
++    // weights are read-only and safe to share; the context (KV/workspace state) is NOT shared.
++    mContext = std::unique_ptr<nvinfer1::IExecutionContext>(
++        mBorrowedEngine->createExecutionContext(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED));
++    ELLM_CHECK(mContext != nullptr, "failed to create execution context on borrowed engine");
++
++    setNonBlockingAuxStreams(mContext.get(), mBorrowedEngine, mAuxStreams);
++
++    auto registerOptionalTreeMetadata = [&](char const* name) {
++        if (engineHasInputTensor(*mBorrowedEngine, name) && !mRegistry.contains(name))
++        {
++            mRegistry.addTensor({name, TensorIO::kInput, nvinfer1::DataType::kINT32,
++                {sym(&InferenceDims::batch), sym(&InferenceDims::attnMaskSeqLen)}});
++        }
++    };
++    registerOptionalTreeMetadata(binding_names::kTreeParentIds);
++    registerOptionalTreeMetadata(binding_names::kTreeDepths);
++    if (engineHasInputTensor(*mBorrowedEngine, binding_names::kSkipSoftmaxScale)
++        && !mRegistry.contains(binding_names::kSkipSoftmaxScale))
++    {
++        mRegistry.addTensor({binding_names::kSkipSoftmaxScale, TensorIO::kInput, nvinfer1::DataType::kINT8,
++            {sym(&InferenceDims::skipSoftmaxScaleLen)}});
++    }
++}
++
++std::unique_ptr<EngineExecutor> EngineExecutor::createForLLMBorrowed(nvinfer1::ICudaEngine* borrowedEngine,
++    LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim)
++{
++    auto registry = buildRegistryForLLM(cfg, specDecodeBaseOutputHiddenDim);
++    return std::unique_ptr<EngineExecutor>(new EngineExecutor(borrowedEngine, std::move(registry)));
++}
++
+ std::unique_ptr<EngineExecutor> EngineExecutor::createForDraft(
+     std::filesystem::path const& enginePath, DeploymentConfig const& bundle)
+ {
+@@ -199,10 +238,10 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
+     //
+     // LoRA weights are model-dependent and populated into the TensorMap by
+     // LoRAManager::refreshTensorMap() before prepare() is called.
+-    int32_t const numIO = mEngine->getNbIOTensors();
++    int32_t const numIO = enginePtr()->getNbIOTensors();
+     for (int32_t i = 0; i < numIO; ++i)
+     {
+-        char const* name = mEngine->getIOTensorName(i);
++        char const* name = enginePtr()->getIOTensorName(i);
+         if (mRegistry.contains(name))
+         {
+             // Already bound by bindAll above; leave alone.
+@@ -223,7 +262,7 @@ bool EngineExecutor::prepare(int32_t profileIndex, InferenceDims const& dims, Te
+             LOG_ERROR("setTensorAddress failed for binding '%s'", name);
+             return false;
+         }
+-        if (mEngine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
++        if (enginePtr()->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT)
+         {
+             if (!mContext->setInputShape(name, tensor->getTRTDims()))
+             {
+@@ -306,7 +345,7 @@ int64_t EngineExecutor::getRequiredContextMemorySize() const
+     // Use getDeviceMemorySizeV2() to get the max across ALL profiles.
+     // SpecDecode base engines have multiple profiles (prefill + verification) with
+     // different memory requirements. Using per-profile size can underallocate.
+-    return mEngine->getDeviceMemorySizeV2();
++    return enginePtr()->getDeviceMemorySizeV2();
+ }
+ 
+ bool EngineExecutor::setContextMemory(Tensor& sharedMem)
+@@ -317,28 +356,28 @@ bool EngineExecutor::setContextMemory(Tensor& sharedMem)
+ 
+ int32_t EngineExecutor::getNumIOTensors() const
+ {
+-    return mEngine->getNbIOTensors();
++    return enginePtr()->getNbIOTensors();
+ }
+ 
+ char const* EngineExecutor::getIOTensorName(int32_t index) const
+ {
+-    return mEngine->getIOTensorName(index);
++    return enginePtr()->getIOTensorName(index);
+ }
+ 
+ bool EngineExecutor::hasIOTensor(char const* name) const
+ {
+-    return engineHasIOTensor(*mEngine, name);
++    return engineHasIOTensor(*enginePtr(), name);
+ }
+ 
+ nvinfer1::DataType EngineExecutor::getBindingDataType(char const* name) const
+ {
+-    return mEngine->getTensorDataType(name);
++    return enginePtr()->getTensorDataType(name);
+ }
+ 
+ nvinfer1::Dims EngineExecutor::getProfileShape(
+     char const* name, int32_t profileIndex, nvinfer1::OptProfileSelector selector) const
+ {
+-    return mEngine->getProfileShape(name, profileIndex, selector);
++    return enginePtr()->getProfileShape(name, profileIndex, selector);
+ }
+ 
+ void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
+@@ -348,7 +387,7 @@ void EngineExecutor::setProfiler(nvinfer1::IProfiler* profiler) noexcept
+ 
+ nvinfer1::ICudaEngine const& EngineExecutor::getEngine() const noexcept
+ {
+-    return *mEngine;
++    return *enginePtr();
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -382,10 +421,10 @@ bool EngineExecutor::BindingSnapshot::operator==(BindingSnapshot const& rhs) con
+ size_t EngineExecutor::computeBindingHash() const
+ {
+     size_t seed = 0;
+-    int32_t const numIO = mEngine->getNbIOTensors();
++    int32_t const numIO = enginePtr()->getNbIOTensors();
+     for (int32_t i = 0; i < numIO; ++i)
+     {
+-        char const* name = mEngine->getIOTensorName(i);
++        char const* name = enginePtr()->getIOTensorName(i);
+         auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
+         nvinfer1::Dims const shape = mContext->getTensorShape(name);
+ 
+@@ -402,11 +441,11 @@ size_t EngineExecutor::computeBindingHash() const
+ EngineExecutor::BindingSnapshot EngineExecutor::snapshotBindings() const
+ {
+     BindingSnapshot snap;
+-    int32_t const numIO = mEngine->getNbIOTensors();
++    int32_t const numIO = enginePtr()->getNbIOTensors();
+     snap.bindings.reserve(numIO);
+     for (int32_t i = 0; i < numIO; ++i)
+     {
+-        char const* name = mEngine->getIOTensorName(i);
++        char const* name = enginePtr()->getIOTensorName(i);
+         auto const addr = reinterpret_cast<uintptr_t>(mContext->getTensorAddress(name));
+         nvinfer1::Dims const shape = mContext->getTensorShape(name);
+         snap.bindings.emplace_back(addr, shape);
+diff --git a/cpp/runtime/exec/engineExecutor.h b/cpp/runtime/exec/engineExecutor.h
+index bd9566a..0e1ad04 100644
+--- a/cpp/runtime/exec/engineExecutor.h
++++ b/cpp/runtime/exec/engineExecutor.h
+@@ -66,6 +66,32 @@ public:
+     static std::unique_ptr<EngineExecutor> createForLLM(std::filesystem::path const& enginePath,
+         LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
+ 
++    //! @brief Build an EngineExecutor that SHARES (borrows) an already-deserialized engine.
++    //!
++    //! Reuses a live, read-only ICudaEngine owned by another EngineExecutor (e.g. slot 0 of a
++    //! voice-worker slot pool) instead of re-deserializing the engine file, which removes the
++    //! per-slot copy of the (large, read-only) engine weights. This instance does NOT own the
++    //! borrowed engine; the owner must outlive every borrower. Every other resource — the
++    //! per-instance IExecutionContext (kUSER_MANAGED), the CUDA-graph cache, and (via the owning
++    //! runtime) the KV/RoPE/workspace tensors — is allocated fresh and is NOT shared, so concurrent
++    //! slots never contend on mutable state.
++    //!
++    //! @param borrowedEngine Non-owning pointer to a live deserialized engine (from getEnginePtr();
++    //!                        must not be null and must be the same engine/config pairing as the owner)
++    //! @param cfg LLM engine config (same as the owner) — used to build the TensorRegistry
++    //! @param specDecodeBaseOutputHiddenDim Optional spec-decode base hidden dim (match the owner)
++    //! @throws std::runtime_error if the per-instance execution context cannot be created
++    static std::unique_ptr<EngineExecutor> createForLLMBorrowed(nvinfer1::ICudaEngine* borrowedEngine,
++        LLMEngineConfig const& cfg, std::optional<int32_t> specDecodeBaseOutputHiddenDim = std::nullopt);
++
++    //! @brief Borrowed (non-owning) engine pointer, for sharing weights across slot-pool instances.
++    //! @return Raw pointer to the live ICudaEngine (owned via mEngine, or borrowed via mBorrowedEngine).
++    //! @note Read-only shared weights; callers must NOT delete it and must keep the owner alive.
++    nvinfer1::ICudaEngine* getEnginePtr() const noexcept
++    {
++        return mEngine ? mEngine.get() : mBorrowedEngine;
++    }
++
+     //! Build an EngineExecutor for a speculative decoding draft engine. The
+     //! factory chooses the draft binding registry from `bundle.specDecodeMode()`.
+     static std::unique_ptr<EngineExecutor> createForDraft(
+@@ -170,9 +196,18 @@ private:
+      */
+     EngineExecutor(std::filesystem::path const& enginePath, TensorRegistry registry);
+ 
++    //! Construct an executor with a fresh context over a non-owned engine.
++    EngineExecutor(nvinfer1::ICudaEngine* borrowedEngine, TensorRegistry registry);
++
++    nvinfer1::ICudaEngine* enginePtr() const noexcept
++    {
++        return mEngine ? mEngine.get() : mBorrowedEngine;
++    }
++
+     AuxStreamSet mAuxStreams{};
+-    std::unique_ptr<nvinfer1::IRuntime> mRuntime;
+-    std::unique_ptr<nvinfer1::ICudaEngine> mEngine;
++    std::unique_ptr<nvinfer1::IRuntime> mRuntime;   //!< Null in borrowed mode
++    std::unique_ptr<nvinfer1::ICudaEngine> mEngine; //!< Null in borrowed mode
++    nvinfer1::ICudaEngine* mBorrowedEngine{nullptr};
+     std::unique_ptr<nvinfer1::IExecutionContext> mContext;
+     TensorRegistry mRegistry;
+     int32_t mCurrentProfileIndex{-1};
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 2dd0368..c8847f7 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -146,6 +146,27 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
+     std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+     std::string const& checkpointDir)
+     : mStream(stream)
++{
++    initializeRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, cloneEncoderDir, stream, checkpointDir);
++}
++
++Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine,
++    nvinfer1::ICudaEngine* codePredictorEngine, std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::string const& tokenizerDir, std::string const& cloneEncoderDir,
++    cudaStream_t stream, std::string const& checkpointDir)
++    : mBorrowedTalkerEngine(talkerEngine)
++    , mBorrowedCodePredictorEngine(codePredictorEngine)
++    , mStream(stream)
++{
++    ELLM_CHECK(mBorrowedTalkerEngine != nullptr, "shared-engine ctor requires a non-null Talker engine");
++    ELLM_CHECK(mBorrowedCodePredictorEngine != nullptr, "shared-engine ctor requires a non-null CodePredictor engine");
++    LOG_INFO("Initializing Qwen3-Omni Talker runner with SHARED (borrowed) engines");
++    initializeRuntime(talkerEngineDir, codePredictorEngineDir, tokenizerDir, cloneEncoderDir, stream, checkpointDir);
++}
++
++void Qwen3OmniTTSRuntime::initializeRuntime(std::string const& talkerEngineDir,
++    std::string const& codePredictorEngineDir, std::string const& tokenizerDir,
++    std::string const& cloneEncoderDir, cudaStream_t stream, std::string const& checkpointDir)
+ {
+     NVTX_SCOPED_RANGE(nvtx_range, "TalkerRunner::init", nvtx_colors::YELLOW);
+     LOG_INFO("Initializing Qwen3-Omni Talker runner");
+@@ -351,7 +372,11 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+     try
+     {
+         mTalkerLLMConfig = rt::parseEngineConfig(talkerConfigPath);
+-        mTalkerExec = rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
++        // Borrowed mode reuses the owner's read-only engine while keeping a fresh
++        // execution context and all per-slot runtime state.
++        mTalkerExec = mBorrowedTalkerEngine != nullptr
++            ? rt::EngineExecutor::createForLLMBorrowed(mBorrowedTalkerEngine, mTalkerLLMConfig)
++            : rt::EngineExecutor::createForLLM(talkerEnginePath, mTalkerLLMConfig);
+         rt::validateAgainstEngine(mTalkerLLMConfig, *mTalkerExec, "qwen3_omni_talker");
+         std::unordered_map<std::string, std::string> emptyLoraMap;
+         mTalkerSharedRes = rt::SharedResources::createForLLM(mTalkerLLMConfig, emptyLoraMap, mStream);
+@@ -385,7 +410,9 @@ bool Qwen3OmniTTSRuntime::initializeEngineRunners(
+     try
+     {
+         mCodePredictorConfig = rt::parseEngineConfig(codePredictorConfigPath);
+-        mCodePredictorExec = rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
++        mCodePredictorExec = mBorrowedCodePredictorEngine != nullptr
++            ? rt::EngineExecutor::createForLLMBorrowed(mBorrowedCodePredictorEngine, mCodePredictorConfig)
++            : rt::EngineExecutor::createForLLM(codePredictorEnginePath, mCodePredictorConfig);
+         rt::validateAgainstEngine(mCodePredictorConfig, *mCodePredictorExec, "qwen3_omni_code_predictor");
+         std::unordered_map<std::string, std::string> emptyLoraMap;
+         mCodePredictorSharedRes = rt::SharedResources::createForLLM(mCodePredictorConfig, emptyLoraMap, mStream);
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index 3d3755c..661e0f8 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -142,6 +142,28 @@ public:
+         std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
+         std::string const& checkpointDir = "");
+ 
++    //! @brief Construct a TTS runtime over borrowed Talker and CodePredictor engines.
++    //!
++    //! Engine weights remain owned by the path-constructed runtime. This instance creates
++    //! fresh contexts, KV/cache/workspace state, and loads non-engine assets independently;
++    //! the owner must outlive every borrower.
++    Qwen3OmniTTSRuntime(nvinfer1::ICudaEngine* talkerEngine, nvinfer1::ICudaEngine* codePredictorEngine,
++        std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
++        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
++        std::string const& checkpointDir = "");
++
++    //! @brief Return non-owning Talker engine pointer for slot sharing.
++    nvinfer1::ICudaEngine* getTalkerEngine() const
++    {
++        return mTalkerExec ? mTalkerExec->getEnginePtr() : nullptr;
++    }
++
++    //! @brief Return non-owning CodePredictor engine pointer for slot sharing.
++    nvinfer1::ICudaEngine* getCodePredictorEngine() const
++    {
++        return mCodePredictorExec ? mCodePredictorExec->getEnginePtr() : nullptr;
++    }
++
+     //! @brief Destructor
+     ~Qwen3OmniTTSRuntime();
+ 
+@@ -484,6 +506,13 @@ public:
+ private:
+     // ========== Internal Methods ==========
+ 
++    //! Shared constructor body (both the path ctor and the shared-engine ctor delegate here).
++    //! When mBorrowedTalkerEngine / mBorrowedCodePredictorEngine are set (shared-engine ctor),
++    //! initializeEngineRunners builds borrowed EngineExecutors instead of deserializing.
++    void initializeRuntime(std::string const& talkerEngineDir, std::string const& codePredictorEngineDir,
++        std::string const& tokenizerDir, std::string const& cloneEncoderDir, cudaStream_t stream,
++        std::string const& checkpointDir);
++
+     void initializeTTSEmbeddings(cudaStream_t stream);
+ 
+     //! @param perBatchContextLengths Optional per-batch context lengths for padded batched prefill.
+@@ -847,6 +876,10 @@ private:
+ 
+     std::unique_ptr<tokenizer::Tokenizer> mTokenizer; //!< Tokenizer for text-to-token-ID conversion
+ 
++    // Borrowed (shared) engines for the shared-engine ctor. Non-owning; null in path-ctor mode.
++    nvinfer1::ICudaEngine* mBorrowedTalkerEngine{nullptr};        //!< Talker engine borrowed from another runtime
++    nvinfer1::ICudaEngine* mBorrowedCodePredictorEngine{nullptr}; //!< CodePredictor engine borrowed from another runtime
++
+     // Talker engine — migrated to EngineExecutor + supporting state
+     LLMEngineConfig mTalkerLLMConfig;                  //!< Talker LLM configuration (parsed from config.json)
+     std::unique_ptr<EngineExecutor> mTalkerExec;       //!< Talker engine executor
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index a6282db..684cd2e 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -369,10 +369,13 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+ // TTS slot-pool.
+ //
+ // Each TtsSlot is a self-contained, single-threaded TTS lane:
+-//   * runtime    — independent Qwen3OmniTTSRuntime (path-based ctor; v0.9.0
+-//                  has no shared-engine ctor yet — each slot deserializes its
+-//                  own Talker + CodePredictor engines. Weight sharing is M3.)
+-//   * code2wav   — independent (STATELESS) Code2WavRunner per slot.
++//   * runtime    — independent Qwen3OmniTTSRuntime. Slot 0 deserializes the
++//                  Talker + CodePredictor engines; slots 1..N-1 share those
++//                  ICudaEngines (shared-engine ctor). Each slot has its own
++//                  IExecutionContexts, KV/cache state, workspace tensors.
++//   * code2wav   — independent (STATELESS) Code2WavRunner per slot; slots
++//                  1..N-1 share slot 0's Code2Wav engine weights, contexts
++//                  and buffers stay per-slot.
+ //   * stream     — per-slot CUDA stream so independent slots can overlap.
+ //   * worker     — the ONE OS thread that drives this slot's runtime.
+ //   * queue/cv   — single-element handoff from the stdin reader to the worker.
+@@ -709,8 +712,10 @@ void slotWorkerLoop(TtsSlot* slot, bool useStateful, bool useAsyncVocode)
+     }
+ }
+ 
+-//! Build the N-slot pool. Each slot owns its runtime, Code2Wav context, CUDA
+-//! stream and worker thread; patch 0029 optionally shares read-only engines.
++//! Build the N-slot pool. Slot 0 deserializes the read-only engines; slots 1..N-1
++//! borrow those engines by default while retaining private contexts, buffers,
++//! KV/cache state, CUDA streams, and worker threads. Set
++//! EDGE_LLM_TTS_SHARED_ENGINE=0 for the independent-deserialization baseline.
+ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64_t& initMsOut)
+ {
+     int32_t const n = std::max(1, gMaxSlots);
+@@ -719,6 +724,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
+ 
+     bool const enableCudaGraph = std::getenv("EDGE_LLM_TTS_CUDA_GRAPH") == nullptr
+         || std::string(std::getenv("EDGE_LLM_TTS_CUDA_GRAPH")) != "0";
++    bool const useSharedEngine = std::getenv("EDGE_LLM_TTS_SHARED_ENGINE") == nullptr
++        || std::string(std::getenv("EDGE_LLM_TTS_SHARED_ENGINE")) != "0";
+ 
+     auto const initStart = std::chrono::steady_clock::now();
+     try
+@@ -730,13 +737,25 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
+             slot->inUse.store(false);
+             CUDA_CHECK(cudaStreamCreate(&slot->stream));
+ 
+-            slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
+-                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, args.cloneEncoderDir,
+-                slot->stream);
++            if (i > 0 && useSharedEngine)
++            {
++                Qwen3OmniTTSRuntime& owner = *slots[0]->runtime;
++                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(owner.getTalkerEngine(),
++                    owner.getCodePredictorEngine(), args.talkerEngineDir, args.codePredictorEngineDir,
++                    args.tokenizerDir, args.cloneEncoderDir, slot->stream);
++                slot->code2wav = std::make_unique<Code2WavRunner>(
++                    slots[0]->code2wav->getEnginePtr(), args.code2wavEngineDir, slot->stream);
++            }
++            else
++            {
++                slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
++                    args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, args.cloneEncoderDir,
++                    slot->stream);
+ 
+-            // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
+-            // so concurrent slots never contend. useStateful only affects `ready` meta.
+-            slot->code2wav = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, slot->stream);
++                // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
++                // so concurrent slots never contend. useStateful only affects `ready` meta.
++                slot->code2wav = std::make_unique<Code2WavRunner>(args.code2wavEngineDir, slot->stream);
++            }
+ 
+             if (enableCudaGraph && !slot->runtime->captureDecodingCUDAGraph(slot->stream))
+             {
+@@ -786,8 +805,12 @@ void destroySlotPool()
+             slotPtr->worker.join();
+         }
+     }
+-    for (auto& slotPtr : gPool->slots())
++    // Free slots in REVERSE order: slots 1..N-1 borrow slot 0's engines (shared-engine ctor),
++    // so every borrower's contexts must be destroyed before the owning slot 0 releases the engines.
++    auto& allSlots = gPool->slots();
++    for (auto it = allSlots.rbegin(); it != allSlots.rend(); ++it)
+     {
++        auto& slotPtr = *it;
+         slotPtr->code2wav.reset();
+         slotPtr->runtime.reset();
+         if (slotPtr->stream != nullptr)

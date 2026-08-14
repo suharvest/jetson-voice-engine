@@ -1,0 +1,4 @@
+https://github.com/NVIDIA/TensorRT-Edge-LLM.git
+# UPSTREAM_PIN (71dd1bae = tag v0.10.0) is a pure NVIDIA commit, so NVIDIA is
+# the canonical remote. Cross-wall / offline devices may override with
+# EDGELLM_UPSTREAM_REMOTE=<local checkout or bundle> (see build.sh).

@@ -1,0 +1,885 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Tue, 10 Jun 2026 00:00:00 +0000
+Subject: [PATCH] v080-0012: streaming-ASR DECODE-to-transcript hook + real-audio
+ spike (m6)
+
+The streaming-ASR path (AsrStreamingSessionRuntime) could chunk-prefill audio
+(byte-identical logits, proven by m1/R2) but could not emit a transcript: the
+autoregressive post-prefill decode loop lived inline in
+LLMInferenceRuntime::handleRequest. This patch extracts that loop into reusable
+members and wires it into the streaming session so real audio -> transcript
+works end to end.
+
+1. Extract the two handleRequest decode lambdas into private members
+   (allBatchesFinished, updateFinishStates) and the whole post-prefill decode
+   section into decodeToCompletion(context, strategy). handleRequest now calls
+   decodeToCompletion -> the one-shot path is the SAME code behind a call
+   (byte-identical: m1 64/63 and 64/32 R2 max-abs logit diff 0.0, argmax MATCH;
+   m2 lifecycle PASS). trajFutureStartId (an ALPAMAYO-only loop invariant) is
+   recomputed inside updateFinishStates.
+
+2. Add LLMInferenceRuntime::decodeAsrSessionToCompletion (resolves the vanilla
+   cachePrimingStrategy and runs decodeToCompletion) and getAsrSessionTranscript
+   (replicates the handleRequest output-extraction recipe: slice the generated
+   suffix from the evicted lane's BatchResult and decode with skipSpecialTokens).
+
+3. AsrStreamingSessionRuntime gains decodeToTranscript()/getTranscript(). Decode
+   is a SEPARATE step from the final appendChunk (NOT auto-run inside it) so the
+   final-chunk prefill state stays byte-identical to the prior decode-less
+   behavior the m1/m2 parity spikes assert (peekKvCacheLength / getLogitsForTesting
+   remain valid post-final-chunk; decodeToTranscript then evicts the lane).
+   beginAsrSession gains a maxGenerateLength param (default 256): the context was
+   previously initialized with maxGenLength=0, which is harmless for prefill-only
+   spikes but would finish the lane after the first decoded token.
+
+   Decode uses kVANILLA_DECODING decodeStep, NOT the chunk-prefill path, so the
+   v080-0004 single-token append-prefill guard (prefill-only, in appendChunkImpl)
+   never gates decode steps. Confirmed: m6 decodes 100+ tokens with no guard hit.
+
+4. New spike examples/llm/spike_v080_m6_audio_streaming.cpp drives a real WAV's
+   precomputed mel through the streaming session (encodeMelChunk ->
+   appendPrefillChunk(final) -> decodeToTranscript -> transcript). Single-chunk
+   mode (full WAV) and K-chunk mode (interleaved prompt).
+
+ACCEPTANCE (Orin NX, engines-v080 Qwen3-ASR-0.6B):
+  - zh_long_01 v0.8.0 STREAMING-audio transcript == v0.7.1 golden, CER 0.0000
+    (norm_zh, harness edit_distance), and == v0.8.0 one-shot byte-identical.
+  - zh_long_01/02/03 streaming == one-shot self-consistency CER 0.0000.
+  - one-shot regression intact: m1 64/63 + 64/32 (R2 diff 0.0, argmax MATCH,
+    R3 KV continuity PASS), m2 lifecycle all scenarios PASS.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+diff --git a/cpp/runtime/llmInferenceRuntime.h b/cpp/runtime/llmInferenceRuntime.h
+--- a/cpp/runtime/llmInferenceRuntime.h
++++ b/cpp/runtime/llmInferenceRuntime.h
+@@ -290,7 +290,27 @@
+     //! @param stream       CUDA stream.
+     //! @return True on success or no-op; false on failure.
+     bool initAsrSessionMRopeLane(int32_t lane, int32_t maxPositions, cudaStream_t stream);
++
++    //! @brief Drive the post-prefill decode loop to completion for a streaming-ASR session.
++    //! @details Called by AsrStreamingSessionRuntime AFTER the final chunk-prefill (which sampled
++    //!          the first token with sampleAfterPrefill=true). Resolves the vanilla decoding
++    //!          strategy (ASR thinker engines are non-speculative ⇒ cachePrimingStrategy is the
++    //!          default decoder) and runs decodeToCompletion, which autoregressively decodes to EOS
++    //!          / max-length and evicts the finished lane into context.completedBatches.
++    //! @param context The session context (must already hold the first sampled token in tokenIds).
++    //! @return True on success, false on a decode/eviction failure.
++    bool decodeAsrSessionToCompletion(DecodingInferenceContext& context);
+ 
++    //! @brief Detokenize the generated transcript for a finished streaming-ASR session.
++    //! @details Replicates the one-shot handleRequest output-extraction recipe: takes the single
++    //!          completed lane's BatchResult, slices the generated suffix (last `generateLength`
++    //!          tokens past the prompt) and decodes it with skipSpecialTokens=true. MUST be called
++    //!          after decodeAsrSessionToCompletion (the lane must have been evicted into
++    //!          context.completedBatches).
++    //! @param context The finished session context.
++    //! @return The decoded transcript, or empty string if no completed batch is present.
++    std::string getAsrSessionTranscript(DecodingInferenceContext& context) const;
++
+     //! @brief Run setUpForPrefillExecution once for an ASR session begin.
+     //! @details Thin pass-through so the session wrapper can reuse the exact LoRA / sys-prompt
+     //!          KV reuse / recurrent-zero / cache-length setup as one-shot handleRequest, while
+@@ -485,6 +505,29 @@
+     //! @throws std::runtime_error if a CUDA error occurs
+     bool performBatchEvict(DecodingInferenceContext& context, DecodingStrategy& strategy);
+ 
++    // ── Post-prefill decode loop (shared by one-shot handleRequest and streaming ASR) ──
++    //! @brief True iff every active batch lane has finished (or the active batch is empty).
++    //! @details Extracted verbatim from the handleRequest `checkAllFinished` local lambda so the
++    //!          streaming-ASR session (AsrStreamingSessionRuntime::decodeToCompletion via friend
++    //!          access) can drive the SAME termination test. Captures only `context`.
++    bool allBatchesFinished(DecodingInferenceContext& context) const;
++
++    //! @brief Apply EOS / max-length / stop-string finish-state transitions for this iteration.
++    //! @details Extracted verbatim from the handleRequest `updateFinishStates` local lambda
++    //!          (EOS via mTokenizer->getEosId(), max-length, Alpamayo traj_future_start, and the
++    //!          stop-string override pass). Latches each slot's terminalReason first-writer-wins.
++    void updateFinishStates(DecodingInferenceContext& context);
++
++    //! @brief Run the post-prefill autoregressive decode to completion on the given context.
++    //! @details This is the EXACT body of the handleRequest post-prefill decode section
++    //!          (initial decodePerSlot/updateFinishStates/emitChunks + evict-if-finished + the
++    //!          decodeStep while-loop + the final activeBatchSize==0 assertion). handleRequest now
++    //!          calls this so the one-shot path stays byte-identical; the streaming-ASR session
++    //!          calls it after its final chunk-prefill (which already sampled the first token) to
++    //!          decode to EOS. Uses kVANILLA_DECODING decodeStep — NOT the chunk-prefill path — so
++    //!          the v080-0004 single-token chunk guard (prefill-only) never applies to decode steps.
++    bool decodeToCompletion(DecodingInferenceContext& context, DecodingStrategy& strategy);
++
+     // Stage-specific metrics
+     metrics::LLMPrefillMetrics mPrefillMetrics;
+     metrics::SpecDecodeGenerationMetrics mSpecDecodeGenerationMetrics;
+diff --git a/cpp/runtime/llmInferenceRuntime.cpp b/cpp/runtime/llmInferenceRuntime.cpp
+--- a/cpp/runtime/llmInferenceRuntime.cpp
++++ b/cpp/runtime/llmInferenceRuntime.cpp
+@@ -617,143 +617,13 @@
+         mLastInputTokenIds = context.rawBatchedInputIds;
+         mHiddenStatesRegistry[0] = &prefillEmbedsBackup;
+         // Layer N (acceptHiddenLayer) is registered after the engine-output reshape below.
+-    }
+-
+-    // Lambda to check if all batches are finished
+-    auto checkAllFinished = [&]() {
+-        // Check if all batches have been evicted
+-        if (context.activeBatchSize == 0)
+-        {
+-            return true;
+-        }
+-        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+-        {
+-            if (!context.finishedStates[i])
+-            {
+-                return false;
+-            }
+-        }
+-        return true;
+-    };
+-
+-    // Used for Alpamayo 1
+-    int32_t trajFutureStartId = 0;
+-    if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+-    {
+-        trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
+     }
+-
+-    // Lambda to update finish states based on EOS and max_length. Latches
+-    // terminalReason atomically with the state flip — the !finishedStates guard
+-    // keeps first-writer-wins semantics relative to applyCancellationToFinishStates.
+-    auto updateFinishStates = [&]() {
+-        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+-        {
+-            if (context.finishedStates[i])
+-            {
+-                continue; // Respect first-writer-wins (cancel may have fired).
+-            }
+-            auto& s = context.slotStreams[i];
+-            // terminalReason is set for all slots; non-streaming slots surface it via
+-            // BatchResult.terminalReason → response.finishReasons.
+-            if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
+-            {
+-                if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
+-                    && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
+-                {
+-                    context.finishedStates[i] = 1;
+-                    s.terminalReason = FinishReason::kEndId;
+-                    LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);
+-                    continue;
+-                }
+-            }
+-            else
+-            {
+-                // Check EOS
+-                if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
+-                {
+-                    context.finishedStates[i] = 1;
+-                    s.terminalReason = FinishReason::kEndId;
+-                    LOG_DEBUG("Batch %d finished, reason: EOS", i);
+-                    continue;
+-                }
+-            }
+-            // Check max length
+-            if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
+-            {
+-                context.finishedStates[i] = 1;
+-                s.terminalReason = FinishReason::kLength;
+-                LOG_DEBUG(
+-                    "Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
+-                continue;
+-            }
+-        }
+ 
+-        // Stop-string override pass — runs after EOS/length so it can override
+-        // kEndId/kLength (user-relevant cause). Cancel/error still win because
+-        // decodePerSlot skipped the match when those reasons were latched.
+-        for (int32_t i = 0; i < context.activeBatchSize; ++i)
+-        {
+-            auto& s = context.slotStreams[i];
+-            if (s.stopMatchedThisIter && s.terminalReason != FinishReason::kCancelled
+-                && s.terminalReason != FinishReason::kError)
+-            {
+-                context.finishedStates[i] = 1;
+-                s.terminalReason = FinishReason::kStopWords;
+-                LOG_DEBUG("Batch %d finished, reason: stop_words", i);
+-            }
+-        }
+-    };
+-
+-    // Post-prefill per-iter pipeline:
+-    //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
+-    applyCancellationToFinishStates(context);
+-    decodePerSlot(context, *mTokenizer);
+-    updateFinishStates();
+-    emitChunks(context);
+-
+-    // If everything finished during prefill, evict once so activeBatchSize reaches 0
+-    if (checkAllFinished() && context.activeBatchSize > 0)
++    // Post-prefill autoregressive decode to completion. Extracted verbatim into a member
++    // (decodeToCompletion) so the streaming-ASR session can drive the same loop after its final
++    // chunk-prefill. The one-shot path is byte-identical — same code, now behind a call.
++    if (!decodeToCompletion(context, decodingStrategy))
+     {
+-        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
+-        if (!batchEvictStatus)
+-        {
+-            LOG_ERROR("Failed to perform batch eviction.");
+-            return false;
+-        }
+-    }
+-
+-    while (!checkAllFinished())
+-    {
+-        // Observe any consumer cancels at the top of the iteration so they land
+-        // first in the per-slot terminalReason latch.
+-        applyCancellationToFinishStates(context);
+-
+-        if (!decodingStrategy.decodeStep(context))
+-        {
+-            LOG_ERROR("Failed to decode tokens with %s decoding strategy.", decodingStrategy.name());
+-            return false;
+-        }
+-
+-        // Per-iter pipeline: decode → finalize finish state → emit chunks.
+-        decodePerSlot(context, *mTokenizer);
+-        updateFinishStates();
+-        emitChunks(context);
+-        context.generationRound += 1;
+-
+-        // Perform batch eviction if needed (after verification, before updating finish states)
+-        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
+-        if (!batchEvictStatus)
+-        {
+-            LOG_ERROR("Failed to perform batch eviction.");
+-            return false;
+-        }
+-    }
+-
+-    if (context.activeBatchSize != 0)
+-    {
+-        LOG_ERROR("Eviction failure, there should be no active batch at the end of the inference. activeBatchSize: %d",
+-            context.activeBatchSize);
+         return false;
+     }
+ 
+@@ -892,8 +762,160 @@
+         check::check(outputHiddenStates.reshape({activeBatchSize, prefillSequenceLength, mDeployment.base.hiddenSize}),
+             "Tensor reshape failed");
+         mHiddenStatesRegistry[request.acceptHiddenLayer] = &outputHiddenStates;
++    }
++
++    return true;
++}
++
++// Check if all active batches are finished (or the active batch is empty). Extracted verbatim
++// from the former handleRequest `checkAllFinished` local lambda.
++bool LLMInferenceRuntime::allBatchesFinished(DecodingInferenceContext& context) const
++{
++    // Check if all batches have been evicted
++    if (context.activeBatchSize == 0)
++    {
++        return true;
++    }
++    for (int32_t i = 0; i < context.activeBatchSize; ++i)
++    {
++        if (!context.finishedStates[i])
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Update finish states based on EOS and max_length. Latches terminalReason atomically with the
++// state flip — the !finishedStates guard keeps first-writer-wins semantics relative to
++// applyCancellationToFinishStates. Extracted verbatim from the former handleRequest
++// `updateFinishStates` local lambda (trajFutureStartId is recomputed here; it was a loop-invariant
++// in handleRequest and only matters for the ALPAMAYO1 action model).
++void LLMInferenceRuntime::updateFinishStates(DecodingInferenceContext& context)
++{
++    // Used for Alpamayo 1
++    int32_t trajFutureStartId = 0;
++    if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
++    {
++        trajFutureStartId = static_cast<int32_t>(mTokenizer->getTokenId("<|traj_future_start|>"));
++    }
++
++    for (int32_t i = 0; i < context.activeBatchSize; ++i)
++    {
++        if (context.finishedStates[i])
++        {
++            continue; // Respect first-writer-wins (cancel may have fired).
++        }
++        auto& s = context.slotStreams[i];
++        // terminalReason is set for all slots; non-streaming slots surface it via
++        // BatchResult.terminalReason → response.finishReasons.
++        if (mActionRunner && mActionRunner->getModelType() == action::ActionModelType::ALPAMAYO1)
++        {
++            if (context.tokenIds[i].size() > 1 && trajFutureStartId >= 0
++                && context.tokenIds[i][context.tokenIds[i].size() - 2] == trajFutureStartId)
++            {
++                context.finishedStates[i] = 1;
++                s.terminalReason = FinishReason::kEndId;
++                LOG_DEBUG("Batch %d finished, reason: traj_future_start", i);
++                continue;
++            }
++        }
++        else
++        {
++            // Check EOS
++            if (!context.tokenIds[i].empty() && context.tokenIds[i].back() == mTokenizer->getEosId())
++            {
++                context.finishedStates[i] = 1;
++                s.terminalReason = FinishReason::kEndId;
++                LOG_DEBUG("Batch %d finished, reason: EOS", i);
++                continue;
++            }
++        }
++        // Check max length
++        if (context.currentGenerateLengths[i] >= context.maxGenerateLength)
++        {
++            context.finishedStates[i] = 1;
++            s.terminalReason = FinishReason::kLength;
++            LOG_DEBUG("Batch %d finished, total tokens=%d, reason: max_length", i, context.currentGenerateLengths[i]);
++            continue;
++        }
++    }
++
++    // Stop-string override pass — runs after EOS/length so it can override
++    // kEndId/kLength (user-relevant cause). Cancel/error still win because
++    // decodePerSlot skipped the match when those reasons were latched.
++    for (int32_t i = 0; i < context.activeBatchSize; ++i)
++    {
++        auto& s = context.slotStreams[i];
++        if (s.stopMatchedThisIter && s.terminalReason != FinishReason::kCancelled
++            && s.terminalReason != FinishReason::kError)
++        {
++            context.finishedStates[i] = 1;
++            s.terminalReason = FinishReason::kStopWords;
++            LOG_DEBUG("Batch %d finished, reason: stop_words", i);
++        }
++    }
++}
++
++// Run the post-prefill autoregressive decode to completion on `context`. EXACT body of the former
++// handleRequest post-prefill decode section. handleRequest calls this so the one-shot path is
++// byte-identical; AsrStreamingSessionRuntime calls it (friend access) after the final chunk-prefill
++// has sampled the first token, to decode to EOS. Decode steps use kVANILLA_DECODING decodeStep, NOT
++// the chunk-prefill path, so the v080-0004 single-token chunk guard (prefill-only) never applies.
++bool LLMInferenceRuntime::decodeToCompletion(DecodingInferenceContext& context, DecodingStrategy& decodingStrategy)
++{
++    // Post-prefill per-iter pipeline:
++    //   cancel → decode (emitDelta + stop match) → finalize (EOS/length/stop) → emit
++    applyCancellationToFinishStates(context);
++    decodePerSlot(context, *mTokenizer);
++    updateFinishStates(context);
++    emitChunks(context);
++
++    // If everything finished during prefill, evict once so activeBatchSize reaches 0
++    if (allBatchesFinished(context) && context.activeBatchSize > 0)
++    {
++        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
++        if (!batchEvictStatus)
++        {
++            LOG_ERROR("Failed to perform batch eviction.");
++            return false;
++        }
+     }
+ 
++    while (!allBatchesFinished(context))
++    {
++        // Observe any consumer cancels at the top of the iteration so they land
++        // first in the per-slot terminalReason latch.
++        applyCancellationToFinishStates(context);
++
++        if (!decodingStrategy.decodeStep(context))
++        {
++            LOG_ERROR("Failed to decode tokens with %s decoding strategy.", decodingStrategy.name());
++            return false;
++        }
++
++        // Per-iter pipeline: decode → finalize finish state → emit chunks.
++        decodePerSlot(context, *mTokenizer);
++        updateFinishStates(context);
++        emitChunks(context);
++        context.generationRound += 1;
++
++        // Perform batch eviction if needed (after verification, before updating finish states)
++        bool const batchEvictStatus = performBatchEvict(context, decodingStrategy);
++        if (!batchEvictStatus)
++        {
++            LOG_ERROR("Failed to perform batch eviction.");
++            return false;
++        }
++    }
++
++    if (context.activeBatchSize != 0)
++    {
++        LOG_ERROR("Eviction failure, there should be no active batch at the end of the inference. activeBatchSize: %d",
++            context.activeBatchSize);
++        return false;
++    }
++
+     return true;
+ }
+ 
+@@ -1783,6 +1805,38 @@
+     return runBaseModelPrefillChunk(context, chunkTokenIds, audioEmbeds, sampleAfterPrefill);
+ }
+ 
++bool LLMInferenceRuntime::decodeAsrSessionToCompletion(DecodingInferenceContext& context)
++{
++    // ASR thinker engines are non-speculative, so cachePrimingStrategy() resolves to the default
++    // (vanilla) decoder — the same strategy the one-shot path would select for a greedy ASR request.
++    // decodeToCompletion drives kVANILLA_DECODING decodeStep to EOS; the v080-0004 single-token
++    // chunk guard is prefill-only and never applies to these decode steps.
++    DecodingStrategy& strategy = mDecoderRegistry->cachePrimingStrategy();
++    return decodeToCompletion(context, strategy);
++}
++
++std::string LLMInferenceRuntime::getAsrSessionTranscript(DecodingInferenceContext& context) const
++{
++    if (context.completedBatches.empty())
++    {
++        LOG_ERROR("getAsrSessionTranscript: no completed batch (did you call decodeAsrSessionToCompletion?)");
++        return {};
++    }
++    // Single-session/single-lane: take the first (only) completed batch and extract the generated
++    // suffix exactly as handleRequest does for response.outputTexts.
++    auto const& batchResult = context.completedBatches.begin()->second;
++    int32_t const genLength = batchResult.generateLength;
++    int32_t const totalLength = static_cast<int32_t>(batchResult.tokenIds.size());
++    if (totalLength < genLength || genLength <= 0)
++    {
++        LOG_ERROR("getAsrSessionTranscript: invalid lengths total=%d gen=%d", totalLength, genLength);
++        return {};
++    }
++    std::vector<int32_t> const generatedIds(
++        batchResult.tokenIds.begin() + (totalLength - genLength), batchResult.tokenIds.end());
++    return mTokenizer->decode(generatedIds, /*skipSpecialTokens=*/true);
++}
++
+ int32_t LLMInferenceRuntime::peekKvCacheLength(int32_t lane, cudaStream_t stream)
+ {
+     auto& cacheMgr = *mSharedResources->cacheManagers[0];
+diff --git a/cpp/runtime/asrStreamingSessionRuntime.h b/cpp/runtime/asrStreamingSessionRuntime.h
+--- a/cpp/runtime/asrStreamingSessionRuntime.h
++++ b/cpp/runtime/asrStreamingSessionRuntime.h
+@@ -24,6 +24,7 @@
+ 
+ #include <cstdint>
+ #include <mutex>
++#include <string>
+ #include <vector>
+ 
+ namespace trt_edgellm
+@@ -170,8 +171,13 @@
+     //!                       text-only session (no audio scratch allocated).
+     //! @param stream         CUDA stream.
+     //! @return True on success, false otherwise.
++    //! @param maxGenerateLength Upper bound on decoded (generated) tokens for this session's
++    //!                       transcript. Passed to the context so the post-final-chunk decode loop
++    //!                       (decodeToCompletion) terminates on length if EOS is never sampled.
++    //!                       Defaults to 256 (matches the one-shot ASR request default). MUST be > 0
++    //!                       — a value of 0 would finish the lane after the first sampled token.
+     bool beginAsrSession(std::vector<int32_t> const& promptTokenIds, int32_t maxPositions,
+-        int32_t maxAudioTokensPerChunk, cudaStream_t stream);
++        int32_t maxAudioTokensPerChunk, cudaStream_t stream, int32_t maxGenerateLength = 256);
+ 
+     //! @brief Append one prefill chunk to the active session.
+     //! @details Encodes the mel chunk (when provided) into per-chunk audio embeddings, then runs
+@@ -190,6 +196,24 @@
+     //! @brief Append a text-only chunk (no audio).
+     bool appendChunk(std::vector<int32_t> const& chunkTokenIds, bool isFinalChunk, cudaStream_t stream);
+ 
++    //! @brief Decode the finished session to a transcript (autoregressive decode to EOS).
++    //! @details Call AFTER the final appendChunk (status()==kFinished, first token already sampled).
++    //!          Drives the post-prefill decode loop to completion via the runtime and detokenizes
++    //!          the generated suffix into getTranscript(). This evicts the lane, so per-lane
++    //!          introspection (peekKvCacheLength / getLogitsForTesting) is no longer meaningful
++    //!          afterward — run those BEFORE decodeToTranscript if needed. Kept separate from
++    //!          appendChunk so the final-chunk prefill state stays byte-identical to the prior
++    //!          (decode-less) behavior the parity spikes assert.
++    //! @return True on success, false if not finished or on a decode failure.
++    bool decodeToTranscript(cudaStream_t stream);
++
++    //! @brief Decoded transcript for a finished session.
++    //! @details Populated by decodeToTranscript(). Empty before that call or on a decode failure.
++    std::string const& getTranscript() const noexcept
++    {
++        return mTranscript;
++    }
++
+     //! @brief End the session: reset the runtime for new sequences and clear session context.
+     //! @details Phase 3 uses the full-batch reset (single session/lane). See TODO(phase4).
+     //! @param stream CUDA stream.
+@@ -239,6 +263,7 @@
+ 
+     DecodingInferenceContext mContext; //!< Session-scoped inference context.
+     rt::Tensor mChunkAudioEmbedding;   //!< Reusable FP16 buffer for per-chunk encoded audio.
++    std::string mTranscript;           //!< Decoded transcript, populated by the final appendChunk.
+ 
+     //! @brief Carried trailing token of a previous non-final TEXT chunk (v080-0004).
+     //! @details Single-token append-prefill guard: the AttentionPlugin routes a qSeqLen==1
+diff --git a/cpp/runtime/asrStreamingSessionRuntime.cpp b/cpp/runtime/asrStreamingSessionRuntime.cpp
+--- a/cpp/runtime/asrStreamingSessionRuntime.cpp
++++ b/cpp/runtime/asrStreamingSessionRuntime.cpp
+@@ -127,8 +127,8 @@
+ {
+ }
+ 
+-bool AsrStreamingSessionRuntime::beginAsrSession(
+-    std::vector<int32_t> const& promptTokenIds, int32_t maxPositions, int32_t maxAudioTokensPerChunk, cudaStream_t stream)
++bool AsrStreamingSessionRuntime::beginAsrSession(std::vector<int32_t> const& promptTokenIds, int32_t maxPositions,
++    int32_t maxAudioTokensPerChunk, cudaStream_t stream, int32_t maxGenerateLength)
+ {
+     if (mStatus != AsrSessionStatus::kIdle)
+     {
+@@ -163,8 +163,19 @@
+ 
+     // Phase 3: a single session over a single active lane. Initialize a fresh context with
+     // activeBatchSize=1 mapped to lane 0 of the runtime's tensors. (Multi-lane mapping is Phase 4.)
++    if (maxGenerateLength <= 0)
++    {
++        LOG_ERROR("beginAsrSession: maxGenerateLength must be > 0 (got %d)", maxGenerateLength);
++        if (mLaneManager != nullptr)
++        {
++            mLaneManager->release(mLane);
++            mLane = -1;
++        }
++        return false;
++    }
++
+     mContext = DecodingInferenceContext{};
+-    mContext.initialize(/*batchSize=*/1, /*maxGenLength=*/0, std::nullopt, rt::OptionalInputTensors{},
++    mContext.initialize(/*batchSize=*/1, /*maxGenLength=*/maxGenerateLength, std::nullopt, rt::OptionalInputTensors{},
+         /*loraName=*/"", stream);
+ 
+     // Seed raw input IDs with the prompt prefix so setUpForPrefillExecution computes correct
+@@ -204,6 +215,7 @@
+     mMaxPositions = maxPositions;
+     mAppendedTokens = 0;
+     mChunkCount = 0;
++    mTranscript.clear();
+     mStatus = AsrSessionStatus::kActive;
+     LOG_INFO("beginAsrSession: lane=%d maxPositions=%d promptTokens=%zu", mLane, maxPositions, promptTokenIds.size());
+     return true;
+@@ -365,11 +377,38 @@
+     ++mChunkCount;
+     if (isFinalChunk)
+     {
++        // The final chunk-prefill sampled the first generated token (sampleAfterPrefill). Do NOT
++        // decode/evict here — that would tear down the lane and break post-final introspection
++        // (peekKvCacheLength / getLogitsForTesting) that callers may run on the finished session
++        // (and that the m1/m2 parity spikes assert). Decoding to a transcript is an explicit
++        // separate step: call decodeToTranscript().
+         mStatus = AsrSessionStatus::kFinished;
+     }
+     return true;
+ }
+ 
++bool AsrStreamingSessionRuntime::decodeToTranscript(cudaStream_t /*stream*/)
++{
++    if (mStatus != AsrSessionStatus::kFinished)
++    {
++        LOG_ERROR("decodeToTranscript: session not finished (status=%d); append the final chunk first",
++            static_cast<int32_t>(mStatus));
++        return false;
++    }
++    // The final chunk-prefill already sampled the first generated token. Drive the post-prefill
++    // autoregressive decode to EOS via the runtime (decodeToCompletion under the hood), then
++    // detokenize the generated suffix. Decode uses the vanilla decodeStep path, so the single-token
++    // append-prefill guard (prefill-only) never gates these steps. This evicts the lane into the
++    // session context's completedBatches — peekKvCacheLength is no longer meaningful afterward.
++    if (!mRuntime.decodeAsrSessionToCompletion(mContext))
++    {
++        LOG_ERROR("decodeToTranscript: decodeToCompletion failed");
++        return false;
++    }
++    mTranscript = mRuntime.getAsrSessionTranscript(mContext);
++    return true;
++}
++
+ void AsrStreamingSessionRuntime::endAsrSession(cudaStream_t stream)
+ {
+     if (mStatus == AsrSessionStatus::kIdle)
+@@ -394,6 +433,7 @@
+     mAppendedTokens = 0;
+     mChunkCount = 0;
+     mPendingTextTail.clear();
++    mTranscript.clear();
+     mStatus = AsrSessionStatus::kIdle;
+ }
+ 
+diff --git a/examples/llm/CMakeLists.txt b/examples/llm/CMakeLists.txt
+--- a/examples/llm/CMakeLists.txt
++++ b/examples/llm/CMakeLists.txt
+@@ -99,3 +99,15 @@
+   target_link_libraries(spike_v080_m4_concurrent_lanes PRIVATE
+     "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
+ endif()
++
++add_executable(spike_v080_m6_audio_streaming spike_v080_m6_audio_streaming.cpp)
++target_link_libraries(spike_v080_m6_audio_streaming PRIVATE edgellmCore exampleUtils
++                                                            commonLibraryExt)
++target_include_directories(
++  spike_v080_m6_audio_streaming PRIVATE ${COMMON_INCLUDE_DIRS}
++                                        ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m6_audio_streaming)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m6_audio_streaming PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
+diff --git a/examples/llm/spike_v080_m6_audio_streaming.cpp b/examples/llm/spike_v080_m6_audio_streaming.cpp
+--- a/examples/llm/spike_v080_m6_audio_streaming.cpp
++++ b/examples/llm/spike_v080_m6_audio_streaming.cpp
+@@ -0,0 +1,244 @@
++// Phase 3c empirical spike — REAL AUDIO end-to-end through the v0.8.0 streaming-ASR
++// runtime to a decoded transcript (the genuine remaining gap closed by patch v080-0012).
++//
++// Pipeline exercised:
++//   beginAsrSession(prompt prefix) → appendChunk(audio-pad slice + mel chunk(s)) →
++//   final appendChunk (sampleAfterPrefill) → mRuntime.decodeAsrSessionToCompletion
++//   (decodeToCompletion: autoregressive decode to EOS) → getAsrSessionTranscript →
++//   getTranscript().
++//
++// Two modes:
++//   --chunks 1   (default): the WHOLE WAV mel is fed as a SINGLE final audio chunk. This
++//                isolates the DECODE-to-transcript hook on real audio (no chunk-boundary
++//                question). Transcript MUST match the v0.7.1 golden (CER, after harness
++//                normalize done by the python wrapper).
++//   --chunks K>1: the mel is split into K contiguous windows (the .cN safetensors emitted
++//                by gen_mel_np.py) and fed as K appendChunk calls, interleaving the ASR
++//                prompt prefix on chunk 0 and audio_end + assistant suffix on the final
++//                chunk. Tests streaming(chunked) == oneshot(single) self-consistency.
++//
++// Prompt token layout (Qwen3-ASR, IDs verified against the engine tokenizer.json + config.json):
++//   prefix  = <|im_start|>user\n           = [151644, 872, 198]
++//   audio   = <|audio_start|> Nx<|audio_pad|> <|audio_end|> = [151669, (151676)*N, 151670]
++//   suffix  = <|im_end|>\n<|im_start|>assistant\n = [151645, 198, 151644, 77091, 198]
++// audio_token_id (151676), audio_start (151669), audio_end (151670) are read here as
++// constants; the runtime's embedding preprocessor binds the per-chunk audio embeddings to the
++// 151676 positions (audio_token_id from config.json).
++
++#include "common/tensor.h"
++#include "common/trtUtils.h"
++#include "runtime/asrStreamingSessionRuntime.h"
++#include "runtime/audioUtils.h"
++#include "runtime/llmInferenceRuntime.h"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++using namespace trt_edgellm;
++
++#define CK(x)                                                                                                          \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        auto _e = (x);                                                                                                 \
++        if (_e != cudaSuccess)                                                                                         \
++        {                                                                                                              \
++            fprintf(stderr, "CUDA err %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(_e));                       \
++            std::exit(2);                                                                                              \
++        }                                                                                                              \
++    } while (0)
++
++namespace
++{
++constexpr int32_t kImStart = 151644;
++constexpr int32_t kUser = 872;
++constexpr int32_t kNl = 198;
++constexpr int32_t kAudioStart = 151669;
++constexpr int32_t kAudioPad = 151676;
++constexpr int32_t kAudioEnd = 151670;
++constexpr int32_t kImEnd = 151645;
++constexpr int32_t kAssistant = 77091;
++
++// Probe a mel chunk through the audio encoder to learn how many audio tokens (151676 pads)
++// it produces. Reshapes `scratch` to [N, featureDim]; returns N.
++int32_t probeAudioTokens(rt::LLMInferenceRuntime& rt, std::string const& melPath, rt::Tensor& scratch,
++    cudaStream_t stream)
++{
++    rt::audioUtils::AudioData mel;
++    mel.melSpectrogramPath = melPath;
++    mel.melSpectrogramFormat = "safetensors";
++    if (!rt.encodeAudioChunk(mel, scratch, stream))
++    {
++        fprintf(stderr, "probeAudioTokens: encodeAudioChunk failed for %s\n", melPath.c_str());
++        return -1;
++    }
++    CK(cudaStreamSynchronize(stream));
++    return static_cast<int32_t>(scratch.getShape()[0]);
++}
++
++rt::AudioChunk makeAudioChunk(std::string const& melPath)
++{
++    rt::AudioChunk c;
++    c.data.melSpectrogramPath = melPath;
++    c.data.melSpectrogramFormat = "safetensors";
++    c.hasAudio = true;
++    return c;
++}
++} // namespace
++
++int main(int argc, char** argv)
++{
++    std::string llmDir = "/home/harvest/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines-v080/llm";
++    std::string audioDir = "/home/harvest/tensorrt-edgellm-workspace/Qwen3-ASR-0.6B/engines-v080/audio";
++    std::string melPath; // full-WAV mel safetensors (single-chunk mode)
++    int32_t numChunks = 1;
++    int32_t maxGenLen = 256;
++    int32_t maxAudioTokensPerChunk = 2048; // worst-case sizing for the per-chunk scratch
++
++    for (int i = 1; i < argc; ++i)
++    {
++        std::string a = argv[i];
++        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string{}; };
++        if (a == "--llm")
++            llmDir = next();
++        else if (a == "--audio")
++            audioDir = next();
++        else if (a == "--mel")
++            melPath = next();
++        else if (a == "--chunks")
++            numChunks = std::atoi(next().c_str());
++        else if (a == "--max-gen")
++            maxGenLen = std::atoi(next().c_str());
++        else if (a == "--max-audio-tokens")
++            maxAudioTokensPerChunk = std::atoi(next().c_str());
++    }
++    if (melPath.empty())
++    {
++        fprintf(stderr, "usage: %s --mel <full.safetensors> [--chunks K] [--llm DIR] [--audio DIR]\n", argv[0]);
++        fprintf(stderr, "  --chunks 1 uses --mel directly; --chunks K reads <mel>.c0 .. <mel>.c{K-1}\n");
++        return 2;
++    }
++
++    auto pluginHandles = loadEdgellmPluginLib();
++    cudaStream_t stream;
++    CK(cudaStreamCreate(&stream));
++
++    std::unordered_map<std::string, std::string> loraMap;
++    std::unique_ptr<rt::LLMInferenceRuntime> runtime;
++    try
++    {
++        runtime = std::make_unique<rt::LLMInferenceRuntime>(llmDir, audioDir, loraMap, stream);
++    }
++    catch (std::exception const& e)
++    {
++        fprintf(stderr, "FATAL: runtime construction failed: %s\n", e.what());
++        return 2;
++    }
++    printf("runtime constructed (llm=%s audio=%s)\n", llmDir.c_str(), audioDir.c_str());
++    printf("maxSessionBatchSize=%d  chunks=%d  maxGenLen=%d\n", runtime->maxSessionBatchSize(), numChunks, maxGenLen);
++
++    // Driver-side scratch used only to PROBE per-chunk audio-token counts (re-encoded inside
++    // appendChunk for the real binding). Sized to the worst case once.
++    rt::Tensor probeScratch;
++    if (!runtime->allocateChunkAudioEmbedding(probeScratch, maxAudioTokensPerChunk))
++    {
++        fprintf(stderr, "FATAL: allocateChunkAudioEmbedding failed\n");
++        return 2;
++    }
++
++    // Resolve per-chunk mel paths + probe their audio-token counts.
++    std::vector<std::string> melPaths;
++    if (numChunks <= 1)
++    {
++        melPaths.push_back(melPath);
++    }
++    else
++    {
++        for (int i = 0; i < numChunks; ++i)
++            melPaths.push_back(melPath + ".c" + std::to_string(i));
++    }
++    std::vector<int32_t> nTokens(melPaths.size(), 0);
++    int32_t totalAudioTokens = 0;
++    for (size_t i = 0; i < melPaths.size(); ++i)
++    {
++        nTokens[i] = probeAudioTokens(*runtime, melPaths[i], probeScratch, stream);
++        if (nTokens[i] < 0)
++            return 1;
++        totalAudioTokens += nTokens[i];
++        printf("chunk %zu mel=%s -> audioTokens=%d\n", i, melPaths[i].c_str(), nTokens[i]);
++    }
++    printf("total audio tokens across %zu chunk(s) = %d\n", melPaths.size(), totalAudioTokens);
++
++    // maxPositions must cover prefix + audio_start + N pads + audio_end + suffix (+ slack).
++    int32_t const maxPositions = totalAudioTokens + 64;
++
++    rt::AsrStreamingSessionRuntime sess(*runtime, /*lane*/ 0);
++    if (!sess.beginAsrSession(/*promptTokenIds*/ {}, maxPositions, maxAudioTokensPerChunk, stream, maxGenLen))
++    {
++        fprintf(stderr, "FATAL: beginAsrSession failed\n");
++        return 1;
++    }
++
++    // Feed chunks. Chunk 0 carries the prompt prefix + audio_start; the final chunk carries
++    // audio_end + the assistant suffix and triggers decodeToCompletion.
++    int32_t const lastIdx = static_cast<int32_t>(melPaths.size()) - 1;
++    for (int32_t i = 0; i <= lastIdx; ++i)
++    {
++        std::vector<int32_t> slice;
++        if (i == 0)
++        {
++            slice.push_back(kImStart);
++            slice.push_back(kUser);
++            slice.push_back(kNl);
++            slice.push_back(kAudioStart);
++        }
++        for (int32_t k = 0; k < nTokens[i]; ++k)
++            slice.push_back(kAudioPad);
++        if (i == lastIdx)
++        {
++            slice.push_back(kAudioEnd);
++            slice.push_back(kImEnd);
++            slice.push_back(kNl);
++            slice.push_back(kImStart);
++            slice.push_back(kAssistant);
++            slice.push_back(kNl);
++        }
++        rt::AudioChunk chunk = makeAudioChunk(melPaths[i]);
++        bool const isFinal = (i == lastIdx);
++        if (!sess.appendChunk(slice, chunk, isFinal, stream))
++        {
++            fprintf(stderr, "FATAL: appendChunk %d (final=%d, sliceLen=%zu) failed\n", i, isFinal, slice.size());
++            return 1;
++        }
++        CK(cudaStreamSynchronize(stream));
++        printf("appended chunk %d (final=%d) sliceLen=%zu kv=%d\n", i, isFinal, slice.size(),
++            sess.peekKvCacheLength(stream));
++    }
++
++    if (sess.status() != rt::AsrSessionStatus::kFinished)
++    {
++        fprintf(stderr, "FATAL: session not finished after final chunk (status=%d)\n",
++            static_cast<int32_t>(sess.status()));
++        return 1;
++    }
++
++    // Explicit decode-to-EOS step (this evicts the lane, so peekKvCacheLength was read above).
++    if (!sess.decodeToTranscript(stream))
++    {
++        fprintf(stderr, "FATAL: decodeToTranscript failed\n");
++        return 1;
++    }
++    std::string const transcript = sess.getTranscript();
++    printf("\n=== TRANSCRIPT (chunks=%d) ===\n%s\n=== END TRANSCRIPT ===\n", numChunks, transcript.c_str());
++
++    sess.endAsrSession(stream);
++    cudaStreamDestroy(stream);
++    return transcript.empty() ? 1 : 0;
++}
+
+-- 
+2.43.0
+

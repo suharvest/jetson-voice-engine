@@ -1,0 +1,744 @@
+### cpp/runtime/llmInferenceRuntime.cpp
+--- a/cpp/runtime/llmInferenceRuntime.cpp
++++ b/cpp/runtime/llmInferenceRuntime.cpp
+@@ -1854,6 +1854,102 @@
+     return hostLen;
+ }
+ 
++void LLMInferenceRuntime::restoreKvCacheLength(int32_t lane, int32_t savedLen, cudaStream_t stream)
++{
++    // Mirror of the D2H read in peekKvCacheLength: write the saved int32 BACK into the shared
++    // device KV-length tensor at [lane] (1-element H2D). KV memory itself is untouched — the
++    // speculative tail past savedLen is dead and is overwritten by the next append.
++    auto& cacheMgr = *mSharedResources->cacheManagers[0];
++    rt::Tensor& kvLengths = cacheMgr.getKVCacheLengths(); // device INT32 [*]
++    if (lane < 0 || lane >= cacheMgr.maxBatchSize())
++    {
++        LOG_ERROR("restoreKvCacheLength: lane=%d out of range [0, %d)", lane, cacheMgr.maxBatchSize());
++        return;
++    }
++    CUDA_CHECK(cudaMemcpyAsync(kvLengths.dataPointer<int32_t>() + lane, &savedLen, sizeof(int32_t),
++        cudaMemcpyHostToDevice, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++}
++
++DecodePeekResult LLMInferenceRuntime::peekAsrSessionTranscript(
++    DecodingInferenceContext& context, int32_t lane, int32_t maxNewTokens, cudaStream_t stream)
++{
++    // Serialize the whole peek against any other engine step (shared PipelineIO).
++    std::lock_guard<std::mutex> execLock(mEngineExecMutex);
++
++    DecodePeekResult result;
++
++    auto& cacheMgr = *mSharedResources->cacheManagers[0];
++    if (lane < 0 || lane >= context.activeBatchSize)
++    {
++        LOG_ERROR("peekAsrSessionTranscript: lane=%d out of range [0, %d)", lane, context.activeBatchSize);
++        return result;
++    }
++
++    // ── SNAPSHOT (BEFORE any mutation) ───────────────────────────────────────
++    // The decode+evict path mutates the ENTIRE context (tokenIds/currentGenerateLengths/
++    // finishedStates/effectivePrefillLengths/slotStreams/batchIndexMapping/completedBatches/
++    // generationRound/activeBatchSize and more — see performBatchEvict), so we copy the whole
++    // struct. DecodingInferenceContext is value-copyable (all std::vector / unordered_map / POD;
++    // OptionalInputTensor is a copyable reference_wrapper; SlotStreamState holds the channel by
++    // shared_ptr). We also snapshot the device KV-length for `lane` and the cache-manager active
++    // batch size, which performBatchEvict drives to 0.
++    DecodingInferenceContext const snapshot = context; // full deep copy of the value-typed fields
++    int32_t const savedKvLen = peekKvCacheLength(lane, stream);
++    int32_t const savedCacheActiveBatch = cacheMgr.getActiveBatchSize();
++    if (savedKvLen < 0)
++    {
++        LOG_ERROR("peekAsrSessionTranscript: failed to read saved KV length for lane=%d", lane);
++        return result;
++    }
++
++    // Bound the speculative decode to maxNewTokens past whatever is already generated, by
++    // temporarily clamping maxGenerateLength (updateFinishStates terminates a lane once
++    // currentGenerateLengths[lane] >= maxGenerateLength).
++    int32_t const baseGen = context.currentGenerateLengths.empty() ? 0 : context.currentGenerateLengths[lane];
++    int32_t const cap = baseGen + (maxNewTokens > 0 ? maxNewTokens : 1);
++    if (context.maxGenerateLength > cap)
++    {
++        context.maxGenerateLength = cap;
++    }
++
++    // ── SPECULATIVE DECODE TO EOS (MUTATES + EVICTS the lane) ─────────────────
++    // Reuse the exact greedy step decodeAsrSessionToCompletion uses (vanilla / cache-priming
++    // strategy; ASR thinker engines are non-speculative). This drives the same per-step kernels
++    // as the committing path, but every field it touches is restored below.
++    DecodingStrategy& strategy = mDecoderRegistry->cachePrimingStrategy();
++    bool const decodeOk = decodeToCompletion(context, strategy);
++
++    if (decodeOk)
++    {
++        result.transcript = getAsrSessionTranscript(context);
++        if (!context.completedBatches.empty())
++        {
++            result.generatedTokens = context.completedBatches.begin()->second.generateLength;
++        }
++        result.ok = true;
++    }
++    else
++    {
++        LOG_ERROR("peekAsrSessionTranscript: speculative decodeToCompletion failed; restoring state anyway");
++    }
++
++    // ── HARD-RESTORE (TOTAL) ─────────────────────────────────────────────────
++    // 1) CPU context: overwrite with the pre-peek snapshot (resurrects tokenIds[lane],
++    //    currentGenerateLengths, finishedStates, effectivePrefillLengths, slotStreams,
++    //    batchIndexMapping, completedBatches, generationRound, activeBatchSize, maxGenerateLength).
++    context = snapshot;
++    // 2) Cache-manager active batch size (evict drove it to 0).
++    cacheMgr.setActiveBatchSize(savedCacheActiveBatch);
++    // 3) Device KV-length tensor for `lane` (evict compacted it away). The KV CONTENT at row
++    //    `lane` was never overwritten — compactBatch only relocates RETAINED lanes; an evicted
++    //    single lane's source row is left physically resident — so restoring the length fully
++    //    resurrects the committed cache.
++    restoreKvCacheLength(lane, savedKvLen, stream);
++
++    return result;
++}
++
+ void LLMInferenceRuntime::resetForSessionEnd(cudaStream_t stream)
+ {
+     // Phase 3: single session/lane → reuse the existing full-batch reset.
+### cpp/runtime/llmInferenceRuntime.h
+--- a/cpp/runtime/llmInferenceRuntime.h
++++ b/cpp/runtime/llmInferenceRuntime.h
+@@ -40,6 +40,7 @@
+ #include "runtime/streaming.h"
+ #include "tokenizer/tokenizer.h"
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <tuple>
+ #include <unordered_map>
+@@ -84,6 +85,19 @@
+     }
+ };
+ 
++//! @brief Result of a NON-EVICTING speculative peek decode (Phase 1 incremental-KV).
++//! @details Produced by LLMInferenceRuntime::peekAsrSessionTranscript. The peek snapshots the
++//!          full mutated decode state, drives a greedy decode-to-EOS to obtain a transcript, then
++//!          HARD-RESTORES every snapshotted field + the device KV-length tensor so the live
++//!          session lane is byte-identical to its pre-peek state. The session can therefore keep
++//!          appending chunks afterward, unlike decodeAsrSessionToCompletion (which evicts).
++struct DecodePeekResult
++{
++    std::string transcript;        //!< Decoded greedy transcript (skipSpecialTokens=true).
++    int32_t generatedTokens{0};    //!< Number of tokens the peek decode produced.
++    bool ok{false};                //!< True if the peek decoded and restored successfully.
++};
++
+ /*!
+  * @brief Unified LLM inference runtime with optional speculative decoding
+  *
+@@ -327,6 +341,34 @@
+     //! @return The committed KV length for the lane, or -1 on error.
+     int32_t peekKvCacheLength(int32_t lane, cudaStream_t stream);
+ 
++    //! @brief Restore one lane's committed KV-cache length to a previously-saved value.
++    //! @details Mirror of the D2H read in peekKvCacheLength: writes the saved int32 back into the
++    //!          shared device KV-length tensor at [lane] via a 1-element H2D cudaMemcpy. Does NOT
++    //!          touch KV memory — any speculative tail past the restored length is dead and is
++    //!          overwritten by the next append. Used to undo a non-evicting peek decode.
++    //! @param lane     Lane (batch row) whose KV length to restore.
++    //! @param savedLen The committed KV length captured BEFORE the speculative decode.
++    //! @param stream   CUDA stream (synchronized before return).
++    void restoreKvCacheLength(int32_t lane, int32_t savedLen, cudaStream_t stream);
++
++    //! @brief NON-EVICTING speculative peek: greedy-decode the lane to EOS to obtain a transcript,
++    //!        then HARD-RESTORE the full mutated decode state (so the session can keep appending).
++    //! @details Phase 1 incremental-KV primitive. SNAPSHOTS the entire DecodingInferenceContext
++    //!          plus the device KV-length tensor for `lane` and the cache-manager active batch
++    //!          size, drives decodeToCompletion (which mutates+evicts), then restores every field
++    //!          so the live session is byte-identical to its pre-peek state. The KV-cache CONTENT
++    //!          at the lane's row is never destroyed by eviction (compactBatch only relocates
++    //!          RETAINED lanes; an evicted single lane's row is left physically resident), so a
++    //!          length+context restore fully resurrects the lane. The entire peek is serialized
++    //!          under the engine exec mutex (shared PipelineIO).
++    //! @param context       The live (NOT-yet-finished-into-completedBatches) session context.
++    //! @param lane          Physical lane (batch row) the session occupies.
++    //! @param maxNewTokens  Upper bound on tokens the peek decode may generate.
++    //! @param stream        CUDA stream.
++    //! @return A DecodePeekResult; .ok is false on a decode/restore failure.
++    DecodePeekResult peekAsrSessionTranscript(
++        DecodingInferenceContext& context, int32_t lane, int32_t maxNewTokens, cudaStream_t stream);
++
+     //! @brief Reset the runtime for new sequences at session end.
+     //! @details Phase 3 uses the existing full-batch resetForNewSequences (single session/lane).
+     //!          A per-lane reset is Phase 4 (spec R1) so concurrent sessions can be torn down
+@@ -411,6 +453,7 @@
+     std::unique_ptr<MultimodalRunner> mAudioRunner{nullptr};       //!< Audio multimodal runner (optional)
+     std::unique_ptr<Alpamayo1ActionRunner> mActionRunner{nullptr}; //!< Action/diffusion head runner (optional)
+     std::unique_ptr<tokenizer::Tokenizer> mTokenizer;              //!< Tokenizer
++    mutable std::mutex mEngineExecMutex; //!< Serializes engine-step peeks (shared PipelineIO).
+     hash_utils::HashMap<std::tuple<std::string, std::string>, SystemPromptKVCache>
+         mSystemPromptKVCacheBase;          //!< System prompt KVCache for base model
+     std::string mEmptyLoraWeightsName{""}; //!< Empty LoRA weights name for default case
+### cpp/runtime/asrStreamingSessionRuntime.cpp
+--- a/cpp/runtime/asrStreamingSessionRuntime.cpp
++++ b/cpp/runtime/asrStreamingSessionRuntime.cpp
+@@ -387,6 +387,73 @@
+     return true;
+ }
+ 
++DecodePeekResult AsrStreamingSessionRuntime::peekTranscriptWithSuffix(
++    std::vector<int32_t> const& suffixTokenIds, int32_t maxNewTokens, cudaStream_t stream)
++{
++    DecodePeekResult result;
++    if (mStatus != AsrSessionStatus::kActive)
++    {
++        LOG_ERROR("peekTranscriptWithSuffix: session not active (status=%d)", static_cast<int32_t>(mStatus));
++        return result;
++    }
++    if (suffixTokenIds.empty())
++    {
++        LOG_ERROR("peekTranscriptWithSuffix: empty suffix");
++        return result;
++    }
++
++    // ── SNAPSHOT the FULL durable session state BEFORE the speculative suffix-append ──
++    // appendChunkImpl(suffix, isFinal=true) mutates: mContext (tokenIds + device KV length via
++    // appendPrefillChunk + sampled token), mStatus->kFinished, mAppendedTokens, mChunkCount,
++    // mPendingTextTail. The inner peek then snapshots/decodes/restores ITS OWN decode (back to the
++    // post-suffix-append state). We restore the rest back to the pre-suffix-append state here, so
++    // the durable state after this whole call equals the state before it.
++    DecodingInferenceContext const ctxSnapshot = mContext;
++    AsrSessionStatus const statusSnapshot = mStatus;
++    int32_t const appendedSnapshot = mAppendedTokens;
++    int32_t const chunkCountSnapshot = mChunkCount;
++    std::vector<int32_t> const pendingTailSnapshot = mPendingTextTail;
++    int32_t const savedKvLen = mRuntime.peekKvCacheLength(mLane, stream);
++    if (savedKvLen < 0)
++    {
++        LOG_ERROR("peekTranscriptWithSuffix: failed to read saved KV length for lane=%d", mLane);
++        return result;
++    }
++
++    // ── SPECULATIVE SUFFIX-APPEND (audio_end + assistant suffix as a FINAL text chunk) ──
++    // Samples a token, transitions to kFinished — exactly the state the Phase-1 peek decodes from.
++    if (!appendChunkImpl(suffixTokenIds, /*mel=*/nullptr, /*isFinalChunk=*/true, stream))
++    {
++        LOG_ERROR("peekTranscriptWithSuffix: speculative suffix append failed; restoring");
++        // appendChunkImpl only mutates member state AFTER appendPrefillChunk succeeds, so a failed
++        // append leaves mContext/cursors intact. But the device KV length may have advanced if the
++        // prefill committed before a later step failed; restore it defensively.
++        mContext = ctxSnapshot;
++        mStatus = statusSnapshot;
++        mAppendedTokens = appendedSnapshot;
++        mChunkCount = chunkCountSnapshot;
++        mPendingTextTail = pendingTailSnapshot;
++        mRuntime.restoreKvCacheLength(mLane, savedKvLen, stream);
++        return result;
++    }
++
++    // ── NON-EVICTING PEEK DECODE (Phase-1 primitive; snapshots/restores its own decode) ──
++    result = mRuntime.peekAsrSessionTranscript(mContext, mLane, maxNewTokens, stream);
++
++    // ── HARD-RESTORE to the PRE-suffix-append durable state ──
++    // Undo the speculative suffix-append: CPU context + cursors + status + the device KV length the
++    // suffix prefill grew (the KV content past savedKvLen is dead and overwritten by the next real
++    // delta append — same mechanism as the Phase-1 peek restore).
++    mContext = ctxSnapshot;
++    mStatus = statusSnapshot;
++    mAppendedTokens = appendedSnapshot;
++    mChunkCount = chunkCountSnapshot;
++    mPendingTextTail = pendingTailSnapshot;
++    mRuntime.restoreKvCacheLength(mLane, savedKvLen, stream);
++
++    return result;
++}
++
+ bool AsrStreamingSessionRuntime::decodeToTranscript(cudaStream_t /*stream*/)
+ {
+     if (mStatus != AsrSessionStatus::kFinished)
+### cpp/runtime/asrStreamingSessionRuntime.h
+--- a/cpp/runtime/asrStreamingSessionRuntime.h
++++ b/cpp/runtime/asrStreamingSessionRuntime.h
+@@ -251,6 +251,46 @@
+         return mRuntime.getLogitsForTesting(mLane, stream);
+     }
+ 
++    //! @brief NON-EVICTING speculative peek of the current (mid-session) transcript.
++    //! @details Thin wrapper over LLMInferenceRuntime::peekAsrSessionTranscript for THIS session's
++    //!          lane. Snapshots + greedy-decodes-to-EOS + hard-restores the decode state, so the
++    //!          session stays live and can keep appending chunks afterward (unlike decodeToTranscript,
++    //!          which evicts). Phase 1 incremental-KV primitive.
++    //! @param maxNewTokens Upper bound on tokens the peek decode may generate.
++    //! @param stream       CUDA stream.
++    //! @return A DecodePeekResult; .ok is false on a decode/restore failure.
++    DecodePeekResult peekTranscript(int32_t maxNewTokens, cudaStream_t stream)
++    {
++        return mRuntime.peekAsrSessionTranscript(mContext, mLane, maxNewTokens, stream);
++    }
++
++    //! @brief Phase 2b CRUX: NON-EVICTING peek of the transcript-so-far from a MID-AUDIO session.
++    //! @details In multi-hop delta streaming the live KV ends mid-audio (no audio_end/suffix), so
++    //!          the model cannot transcribe from it directly. This SPECULATIVELY appends the
++    //!          audio_end + assistant suffix as a final chunk (sampling a token, status->kFinished),
++    //!          runs the Phase-1 non-evicting peek decode, then FULLY RESTORES the session to its
++    //!          exact pre-call state — undoing BOTH the speculative suffix-append (KV length +
++    //!          context + status + cursors) AND the peek's decode. After this call the durable
++    //!          session state is byte-identical to before it, so the next hop's delta append sees
++    //!          exactly the post-step-2 KV as if the peek never happened. Keeps the Phase-1 primitive
++    //!          (peekAsrSessionTranscript) untouched; the speculative suffix-append + restore is done
++    //!          here, in the session layer, under the runtime's engine mutex (via the inner peek).
++    //!          MUST be called with status()==kActive (a live, NOT-yet-finalized session).
++    //! @param suffixTokenIds The audio_end + assistant suffix to speculatively append (text-only).
++    //! @param maxNewTokens   Upper bound on tokens the peek decode may generate.
++    //! @param stream         CUDA stream.
++    //! @return A DecodePeekResult; .ok is false on append/decode/restore failure.
++    DecodePeekResult peekTranscriptWithSuffix(
++        std::vector<int32_t> const& suffixTokenIds, int32_t maxNewTokens, cudaStream_t stream);
++
++    //! @brief Read-only access to the session's DecodingInferenceContext (testing/parity surface).
++    //! @details Lets the Phase-1 peek gate assert byte-identity of tokenIds/currentGenerateLengths/
++    //!          activeBatchSize/completedBatches across non-evicting peeks. Not for production use.
++    DecodingInferenceContext const& contextForTesting() const noexcept
++    {
++        return mContext;
++    }
++
+ private:
+     LLMInferenceRuntime& mRuntime;
+     SessionLaneManager* mLaneManager{nullptr}; //!< When set, owns lane acquire/release.
+### native/edgellm_voice_worker/qwen3_asr_worker.cpp
+--- a/native/edgellm_voice_worker/qwen3_asr_worker.cpp
++++ b/native/edgellm_voice_worker/qwen3_asr_worker.cpp
+@@ -689,15 +689,433 @@
+     }
+ }
+ 
++// ===========================================================================
++// Phase 2a: alternate finalize path via AsrStreamingSessionRuntime (single hop).
++//
++// Gated by env OVS_ASR_SESSION_PATH=1 (default OFF -> runOneShotCore unchanged).
++// When ON, the FULL utterance is driven through the streaming-session runtime as
++// a SINGLE chunk (mirrors examples/llm/spike_v080_m6_audio_streaming.cpp --chunks 1):
++//   beginAsrSession -> appendChunk(full mel, isFinal=true) -> decodeToTranscript
++//   -> getTranscript -> endAsrSession.
++// The mel consumed is the SAME `.safetensors` the one-shot path would feed via
++// requestFileParser (extracted from the request envelope below), and the audio-pad
++// token layout matches the one-shot prompt exactly (Qwen3-ASR config.json):
++//   prefix = <|im_start|>user\n      = [151644, 872, 198]
++//   audio  = <|audio_start|> Nx<|audio_pad|> <|audio_end|> = [151669, 151676*N, 151670]
++//   suffix = <|im_end|>\n<|im_start|>assistant\n = [151645, 198, 151644, 77091, 198]
++// (audio_*_token_id read from engines-v080/llm/config.json: start=151669, pad=151676,
++//  end=151670; chat template default_system_prompt is empty -> no system block, just
++//  like the one-shot user-message prompt.) N is derived from the REAL audio by probing
++// the encoder (encodeAudioChunk -> outEmbedding.getShape()[0]), never hardcoded.
++//
++// This is OFFLINE single-hop EQUIVALENCE validation only (Phase 2a). Delta/multi-hop
++// /partial extraction is Phase 2b.
++// ===========================================================================
++namespace asrSessionPath
++{
++constexpr int32_t kImStart = 151644;
++constexpr int32_t kUser = 872;
++constexpr int32_t kNl = 198;
++constexpr int32_t kAudioStart = 151669;
++constexpr int32_t kAudioPad = 151676;
++constexpr int32_t kAudioEnd = 151670;
++constexpr int32_t kImEnd = 151645;
++constexpr int32_t kAssistant = 77091;
++constexpr int32_t kMaxAudioTokensPerChunk = 2048; // worst-case per-chunk scratch size (matches m6).
++
++//! True iff OVS_ASR_SESSION_PATH=1 (cached once; default OFF). When OFF the worker
++//! is byte-identical to v080-0021 #10 — runOneShotCore is the unchanged golden path.
++bool enabled()
++{
++    static bool const on = []() {
++        char const* p = std::getenv("OVS_ASR_SESSION_PATH");
++        return p != nullptr && std::string(p) == "1";
++    }();
++    return on;
++}
++
++//! Dig the audio mel `.safetensors` path out of the one-shot request envelope
++//! (requests[0].messages[*].content[*] with type=="audio"). Returns "" if none.
++std::string extractMelPath(Json const& input)
++{
++    if (!input.contains("requests") || !input["requests"].is_array() || input["requests"].empty())
++        return std::string();
++    Json const& r0 = input["requests"][0];
++    if (!r0.contains("messages") || !r0["messages"].is_array())
++        return std::string();
++    for (Json const& msg : r0["messages"])
++    {
++        if (!msg.contains("content") || !msg["content"].is_array())
++            continue;
++        for (Json const& c : msg["content"])
++        {
++            if (c.contains("type") && c["type"] == "audio" && c.contains("audio") && c["audio"].is_string())
++                return c["audio"].get<std::string>();
++        }
++    }
++    return std::string();
++}
++
++//! Drive the full mel through AsrStreamingSessionRuntime as a SINGLE hop and return
++//! the bare transcript. Throws on any session-runtime failure. activeBatchSize=1.
++std::string runSingleHop(std::string const& melPath, rt::LLMInferenceRuntime& runtime, int32_t maxGenerateLength,
++    cudaStream_t stream)
++{
++    // 1) Probe the encoder to learn N (== number of <|audio_pad|> tokens this mel yields).
++    rt::Tensor probeScratch;
++    if (!runtime.allocateChunkAudioEmbedding(probeScratch, kMaxAudioTokensPerChunk))
++        throw std::runtime_error("session_path: allocateChunkAudioEmbedding failed");
++    rt::audioUtils::AudioData melDesc;
++    melDesc.melSpectrogramPath = melPath;
++    melDesc.melSpectrogramFormat = "safetensors";
++    if (!runtime.encodeAudioChunk(melDesc, probeScratch, stream))
++        throw std::runtime_error("session_path: encodeAudioChunk (probe) failed for " + melPath);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    int32_t const nTokens = static_cast<int32_t>(probeScratch.getShape()[0]);
++    if (nTokens <= 0)
++        throw std::runtime_error("session_path: probe produced 0 audio tokens");
++
++    // 2) maxPositions covers prefix(4) + N pads + suffix(6) + slack (matches m6: N + 64).
++    int32_t const maxPositions = nTokens + 64;
++
++    // 3) Single-session over lane 0 (Phase 3 single-lane; activeBatchSize == 1).
++    rt::AsrStreamingSessionRuntime sess(runtime, /*lane*/ 0);
++    if (!sess.beginAsrSession(/*promptTokenIds*/ {}, maxPositions, kMaxAudioTokensPerChunk, stream, maxGenerateLength))
++        throw std::runtime_error("session_path: beginAsrSession failed");
++
++    // 4) SINGLE chunk = the whole audio. Carries the full prompt: prefix + audio_start,
++    //    then N audio pads, then audio_end + assistant suffix; isFinal=true samples a token.
++    std::vector<int32_t> slice;
++    slice.push_back(kImStart);
++    slice.push_back(kUser);
++    slice.push_back(kNl);
++    slice.push_back(kAudioStart);
++    for (int32_t k = 0; k < nTokens; ++k)
++        slice.push_back(kAudioPad);
++    slice.push_back(kAudioEnd);
++    slice.push_back(kImEnd);
++    slice.push_back(kNl);
++    slice.push_back(kImStart);
++    slice.push_back(kAssistant);
++    slice.push_back(kNl);
++
++    rt::AudioChunk chunk;
++    chunk.data.melSpectrogramPath = melPath;
++    chunk.data.melSpectrogramFormat = "safetensors";
++    chunk.hasAudio = true;
++    if (!sess.appendChunk(slice, chunk, /*isFinalChunk*/ true, stream))
++    {
++        sess.endAsrSession(stream);
++        throw std::runtime_error("session_path: appendChunk (final) failed");
++    }
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    if (sess.status() != rt::AsrSessionStatus::kFinished)
++    {
++        sess.endAsrSession(stream);
++        throw std::runtime_error("session_path: session not finished after final chunk");
++    }
++
++    // 5) Decode-to-EOS, read transcript, then end the session (full-batch reset, Phase 3).
++    if (!sess.decodeToTranscript(stream))
++    {
++        sess.endAsrSession(stream);
++        throw std::runtime_error("session_path: decodeToTranscript failed");
++    }
++    std::string const transcript = sess.getTranscript();
++    sess.endAsrSession(stream);
++    return transcript;
++}
++
++//! Session-path analogue of runOneShotCore: same input/output envelope, but the
++//! transcript is produced by the streaming-session single-hop instead of
++//! handleRequest. Returns the SAME Json shape so all callers / the A/B gate compare
++//! apples-to-apples. The output_text carries the bare transcript exactly as the
++//! audio head emits it (lang tag included) — identical to handleRequest's outputTexts.
++Json runSessionCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream)
++{
++    Json response;
++    auto const requestStart = std::chrono::steady_clock::now();
++    try
++    {
++        std::string const id = input.value("id", "");
++        int64_t const maxGenLenOverride = input.value("max_generate_length_override", -1);
++        int64_t maxGenLen = input.value("max_generate_length", 256);
++        if (maxGenLenOverride > 0) maxGenLen = maxGenLenOverride;
++        if (maxGenLen <= 0) maxGenLen = 256;
++
++        std::string const melPath = extractMelPath(input);
++        if (melPath.empty())
++            throw std::runtime_error("session_path: no audio mel path in request");
++
++        std::string const text = runSingleHop(melPath, runtime, static_cast<int32_t>(maxGenLen), stream);
++
++        Json responses = Json::array();
++        responses.push_back(Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", text}});
++        double const totalMs
++            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
++        response = Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
++            {"total_ms", totalMs}, {"path", "session"}};
++    }
++    catch (std::exception const& e)
++    {
++        response = Json{{"event", "error"}, {"ok", false}, {"error", e.what()}, {"path", "session"}};
++    }
++    return response;
++}
++} // namespace asrSessionPath
++
++// ===========================================================================
++// Phase 2b: MULTI-HOP DELTA streaming path with non-evicting peek partials.
++//
++// Gated by env OVS_ASR_STREAM_DELTA=1 (default OFF; orthogonal to OVS_ASR_SESSION_PATH).
++// Splits a clip's mel into K disjoint hops (the .cN delta slices from gen_mel_np.py) and
++// drives them through AsrStreamingSessionRuntime as a TRUE incremental-KV stream:
++//   begin(prompt-open: prefix + audio_start, NO audio_end/suffix yet)
++//   hop k<K-1 (non-final): appendChunk(delta pads + delta mel, isFinal=false)  [O(delta) work]
++//                          -> peekTranscriptWithSuffix(...) -> emit `partial`   [non-evicting]
++//   hop K-1   (final):     appendChunk(last delta pads + audio_end + suffix, isFinal=true)
++//                          -> decodeToTranscript -> `final` (REAL, no restore) -> endAsrSession
++//
++// The (encode+append) wall time per hop is logged SEPARATELY from the peek-decode time so the
++// O(N) (flat per-hop append) vs O(N^2) (cumulative re-decode) win is observable (G2). Per-hop
++// pre-peek vs post-peek KV length + tokenIds + activeBatch are captured to prove zero peek
++// residue across interleaved appends (G3). The FINAL transcript must be byte-identical to the
++// one-shot golden (G1).
++//
++// Single-token guard (v080-0004): a non-final delta whose audio_pad count would be 1 is BUFFERED
++// and merged into the next hop (audio deltas are ~>=100 pads in practice, but guarded anyway).
++// ===========================================================================
++namespace asrStreamDelta
++{
++using namespace asrSessionPath; // reuse the token-id constants + kMaxAudioTokensPerChunk.
++
++//! True iff OVS_ASR_STREAM_DELTA=1 (cached once; default OFF).
++bool enabled()
++{
++    static bool const on = []() {
++        char const* p = std::getenv("OVS_ASR_STREAM_DELTA");
++        return p != nullptr && std::string(p) == "1";
++    }();
++    return on;
++}
++
++//! Probe one delta mel through the encoder to learn its audio-token count (nk pads).
++int32_t probeDelta(rt::LLMInferenceRuntime& runtime, std::string const& melPath, rt::Tensor& scratch,
++    cudaStream_t stream)
++{
++    rt::audioUtils::AudioData mel;
++    mel.melSpectrogramPath = melPath;
++    mel.melSpectrogramFormat = "safetensors";
++    if (!runtime.encodeAudioChunk(mel, scratch, stream))
++        return -1;
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    return static_cast<int32_t>(scratch.getShape()[0]);
++}
++
++//! Drive the multi-hop delta stream. Emits per-hop `partial` + `hop_metric` events on `out`,
++//! returns the FINAL bare transcript (lang tag included; same shape as runSessionCore).
++//! `deltaMels` are the K disjoint .cN mel slices, in order.
++Json runDelta(std::vector<std::string> const& deltaMels, rt::LLMInferenceRuntime& runtime,
++    int32_t maxGenLen, cudaStream_t stream, std::string const& id)
++{
++    auto const reqStart = std::chrono::steady_clock::now();
++    Json perHop = Json::array();
++
++    // 1) Probe every delta to learn nk, total tokens, and to apply the single-token guard.
++    rt::Tensor probeScratch;
++    if (!runtime.allocateChunkAudioEmbedding(probeScratch, kMaxAudioTokensPerChunk))
++        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: allocateChunkAudioEmbedding failed"}};
++    int32_t const K = static_cast<int32_t>(deltaMels.size());
++    std::vector<int32_t> nTok(K, 0);
++    int32_t total = 0;
++    for (int32_t i = 0; i < K; ++i)
++    {
++        nTok[i] = probeDelta(runtime, deltaMels[i], probeScratch, stream);
++        if (nTok[i] < 0)
++            return Json{{"event", "error"}, {"ok", false}, {"error", "delta: probe failed for " + deltaMels[i]}};
++        total += nTok[i];
++    }
++    int32_t const maxPositions = total + 64;
++
++    // 2) begin (prompt-open only: prefix + audio_start). No audio_end / suffix yet.
++    rt::AsrStreamingSessionRuntime sess(runtime, /*lane*/ 0);
++    if (!sess.beginAsrSession(/*promptTokenIds*/ {}, maxPositions, kMaxAudioTokensPerChunk, stream, maxGenLen))
++        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: beginAsrSession failed"}};
++
++    int32_t const lane = 0;
++    int32_t const lastIdx = K - 1;
++    std::vector<int32_t> const suffix
++        = {kAudioEnd, kImEnd, kNl, kImStart, kAssistant, kNl}; // speculative + real suffix.
++
++    int32_t bufferedPads = 0; // single-token guard carry (count of audio pads merged into next hop).
++
++    for (int32_t i = 0; i <= lastIdx; ++i)
++    {
++        bool const isFinal = (i == lastIdx);
++        int32_t padCount = nTok[i] + bufferedPads;
++
++        // Single-token guard: never let a NON-FINAL append be exactly 1 audio pad -> buffer + merge.
++        if (!isFinal && padCount == 1)
++        {
++            bufferedPads = padCount;
++            perHop.push_back(Json{{"hop", i}, {"buffered", true}, {"pads", nTok[i]},
++                {"note", "single-token-guard: deferred to next hop"}});
++            continue;
++        }
++        bufferedPads = 0;
++
++        // Build this hop's token slice.
++        std::vector<int32_t> slice;
++        if (i == 0)
++        {
++            slice.push_back(kImStart);
++            slice.push_back(kUser);
++            slice.push_back(kNl);
++            slice.push_back(kAudioStart);
++        }
++        for (int32_t k = 0; k < padCount; ++k)
++            slice.push_back(kAudioPad);
++        if (isFinal)
++            for (int32_t t : suffix)
++                slice.push_back(t);
++
++        rt::AudioChunk chunk;
++        chunk.data.melSpectrogramPath = deltaMels[i];
++        chunk.data.melSpectrogramFormat = "safetensors";
++        chunk.hasAudio = true;
++
++        // ── G2: time (encodeMelChunk + appendChunk) ONLY (the O(N) work). ──
++        auto const t0 = std::chrono::steady_clock::now();
++        bool const ok = sess.appendChunk(slice, chunk, isFinal, stream);
++        CUDA_CHECK(cudaStreamSynchronize(stream));
++        auto const t1 = std::chrono::steady_clock::now();
++        double const appendMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
++        if (!ok)
++        {
++            sess.endAsrSession(stream);
++            return Json{{"event", "error"}, {"ok", false},
++                {"error", "delta: appendChunk hop " + std::to_string(i) + " failed"}};
++        }
++
++        if (!isFinal)
++        {
++            // ── G3: pre-peek durable state snapshot. ──
++            auto const& ctxPre = sess.contextForTesting();
++            int32_t const kvPre = sess.peekKvCacheLength(stream);
++            std::vector<int32_t> const tokPre = ctxPre.tokenIds.at(lane);
++            int32_t const abPre = ctxPre.activeBatchSize;
++
++            // ── PEEK-WITH-SUFFIX (the CRUX): non-evicting partial from a MID-AUDIO session. ──
++            auto const p0 = std::chrono::steady_clock::now();
++            rt::DecodePeekResult pr = sess.peekTranscriptWithSuffix(suffix, maxGenLen, stream);
++            CUDA_CHECK(cudaStreamSynchronize(stream));
++            auto const p1 = std::chrono::steady_clock::now();
++            double const peekMs = std::chrono::duration<double, std::milli>(p1 - p0).count();
++
++            // ── G3: post-peek durable state (must equal pre-peek -> zero residue). ──
++            auto const& ctxPost = sess.contextForTesting();
++            int32_t const kvPost = sess.peekKvCacheLength(stream);
++            std::vector<int32_t> const tokPost = ctxPost.tokenIds.at(lane);
++            int32_t const abPost = ctxPost.activeBatchSize;
++            bool const residueFree = (kvPost == kvPre) && (tokPost == tokPre) && (abPost == abPre);
++
++            std::string const partial = stripLangTag(pr.transcript);
++            std::cout << Json{{"event", "partial"}, {"id", id}, {"hop", i}, {"text", partial}}.dump()
++                      << std::endl;
++
++            perHop.push_back(Json{{"hop", i}, {"final", false}, {"pads", padCount}, {"kv", kvPre},
++                {"append_ms", appendMs}, {"peek_ms", peekMs}, {"peek_ok", pr.ok},
++                {"partial", partial},
++                {"g3_kv_pre", kvPre}, {"g3_kv_post", kvPost}, {"g3_tok_pre", tokPre.size()},
++                {"g3_tok_post", tokPost.size()}, {"g3_tok_eq", (tokPost == tokPre)},
++                {"g3_ab_pre", abPre}, {"g3_ab_post", abPost}, {"g3_residue_free", residueFree}});
++        }
++        else
++        {
++            int32_t const kvFinal = sess.peekKvCacheLength(stream);
++            perHop.push_back(Json{{"hop", i}, {"final", true}, {"pads", padCount}, {"kv", kvFinal},
++                {"append_ms", appendMs}});
++        }
++    }
++
++    // 3) Final REAL decode (no restore) -> transcript -> end.
++    if (sess.status() != rt::AsrSessionStatus::kFinished)
++    {
++        sess.endAsrSession(stream);
++        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: not finished after final hop"}};
++    }
++    if (!sess.decodeToTranscript(stream))
++    {
++        sess.endAsrSession(stream);
++        return Json{{"event", "error"}, {"ok", false}, {"error", "delta: final decodeToTranscript failed"}};
++    }
++    std::string const finalText = sess.getTranscript();
++    sess.endAsrSession(stream);
++
++    double const totalMs
++        = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - reqStart).count();
++    Json responses = Json::array();
++    responses.push_back(Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", finalText}});
++    return Json{{"id", id}, {"event", "done"}, {"ok", true}, {"responses", responses},
++        {"total_ms", totalMs}, {"path", "stream_delta"}, {"per_hop", perHop}};
++}
++
++//! Dig the delta mel list out of the request (top-level "delta_mels": [paths...]).
++std::vector<std::string> extractDeltaMels(Json const& input)
++{
++    std::vector<std::string> out;
++    if (input.contains("delta_mels") && input["delta_mels"].is_array())
++        for (Json const& m : input["delta_mels"])
++            if (m.is_string())
++                out.push_back(m.get<std::string>());
++    return out;
++}
++
++//! Session-delta analogue of runSessionCore: same envelope, multi-hop delta path.
++Json runDeltaCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream)
++{
++    try
++    {
++        std::string const id = input.value("id", "");
++        int64_t maxGenLen = input.value("max_generate_length", 256);
++        int64_t const ovr = input.value("max_generate_length_override", -1);
++        if (ovr > 0) maxGenLen = ovr;
++        if (maxGenLen <= 0) maxGenLen = 256;
++
++        std::vector<std::string> deltas = extractDeltaMels(input);
++        if (deltas.empty())
++            return Json{{"event", "error"}, {"ok", false},
++                {"error", "stream_delta: no delta_mels[] in request"}, {"path", "stream_delta"}};
++        return runDelta(deltas, runtime, static_cast<int32_t>(maxGenLen), stream, id);
++    }
++    catch (std::exception const& e)
++    {
++        return Json{{"event", "error"}, {"ok", false}, {"error", e.what()}, {"path", "stream_delta"}};
++    }
++}
++} // namespace asrStreamDelta
++
+ //! Core one-shot engine step: parse the `requests` payload, run handleRequest on
+ //! each, and return the assembled response Json. This is the PROVEN golden path
+ //! (CER 0.0000 + byte-identity). Both the legacy event-less one-shot path AND the
+ //! streaming `end`/finalize path call this, so finalize inherits exact parity.
+ //! NOT internally synchronized — callers must hold gEngineExecMutex (shared
+ //! PipelineIO is mutated by handleRequest).
++//!
++//! Phase 2a: when OVS_ASR_SESSION_PATH=1 this delegates to the session single-hop
++//! path (asrSessionPath::runSessionCore) instead — an OFFLINE A/B equivalence
++//! surface. Default (flag OFF) is unchanged: handleRequest, byte-identical to before.
+ Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t stream,
+     std::unordered_map<std::string, std::string>& loraWeightsMap)
+ {
++    if (asrStreamDelta::enabled())
++    {
++        return asrStreamDelta::runDeltaCore(std::move(input), runtime, stream);
++    }
++    if (asrSessionPath::enabled())
++    {
++        return asrSessionPath::runSessionCore(std::move(input), runtime, stream);
++    }
+     Json response;
+     std::filesystem::path tempPath;
+     auto const requestStart = std::chrono::steady_clock::now();

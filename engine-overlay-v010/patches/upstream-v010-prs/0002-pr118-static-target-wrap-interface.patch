@@ -1,0 +1,30 @@
+From 0876c93832c898836ec74ede059fd5fc4e31def9 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 19:21:43 +0800
+Subject: [PATCH] fix(v0.10): propagate CuTe wrap through static targets
+
+Retain only the v0.10.0 delta: static target INTERFACE --wrap propagation. The shim link itself is already propagated by upstream.
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cmake/CuteDsl.cmake | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/cmake/CuteDsl.cmake b/cmake/CuteDsl.cmake
+index c707a61..0ec9efa 100644
+--- a/cmake/CuteDsl.cmake
++++ b/cmake/CuteDsl.cmake
+@@ -1059,7 +1059,12 @@ function(cute_dsl_setup)
+     # 11.4.
+     if(_cute_dsl_cuda_ver VERSION_GREATER_EQUAL 12.0 AND _cute_dsl_cuda_ver
+                                                          VERSION_LESS 12.8)
+-      target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      if(_tgt_type STREQUAL "STATIC_LIBRARY")
++        target_link_options(${_tgt} INTERFACE
++                            "-Wl,--wrap=_cudaLaunchKernelEx")
++      else()
++        target_link_options(${_tgt} PRIVATE "-Wl,--wrap=_cudaLaunchKernelEx")
++      endif()
+     endif()
+   endforeach()
+ 

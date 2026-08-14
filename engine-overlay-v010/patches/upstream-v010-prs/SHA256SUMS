@@ -1,0 +1,4 @@
+36a956bd142458a8908dac7a4f9dc6ebd05f43c2ccafb469e6894c51abb2e56d  0001-pr118-respect-explicit-cuda-architectures.patch
+cb75f65923d56c3a15cb4a8fae5b8fae9ff92fcd2664240a621db8a0f146d57d  0002-pr118-static-target-wrap-interface.patch
+a4998c42c30ecc9428747e8dc7070d4e058a429666d3fb77094d1aad7c327a55  0003-pr146-normalize-linear-mrope.patch
+2c48378fbfdcffda742bfe9de27b04bbfd8e81a9ac85e73b39e279a882d262c9  0004-pr149-checkpoint-dtype.patch

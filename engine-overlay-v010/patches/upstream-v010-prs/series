@@ -1,0 +1,7 @@
+# Four upstreamable fixes rebased onto NVIDIA TensorRT-Edge-LLM v0.10.0.
+# FP4 guard, pre-10.7 stream reader, and legacy FMHA patches are retired:
+# v0.10.0 already carries those fixes.
+0001-pr118-respect-explicit-cuda-architectures.patch
+0002-pr118-static-target-wrap-interface.patch
+0003-pr146-normalize-linear-mrope.patch
+0004-pr149-checkpoint-dtype.patch

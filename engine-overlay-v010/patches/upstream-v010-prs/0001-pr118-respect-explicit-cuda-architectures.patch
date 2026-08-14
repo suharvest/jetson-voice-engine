@@ -1,0 +1,40 @@
+From d3537fc3768750d11471a168f1c7ad41b6831667 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 25 Jul 2026 19:21:41 +0800
+Subject: [PATCH] fix: Respect explicit CUDA architectures
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ CMakeLists.txt | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a0dc0e2..dfe8b59 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -15,6 +15,16 @@
+ 
+ cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
+ 
++# Record whether the user explicitly requested CUDA architectures before
++# project() runs. enable_language(CUDA) initializes CMAKE_CUDA_ARCHITECTURES to
++# a compiler default, so testing it afterwards cannot distinguish a
++# user-provided value from that default.
++set(_EDGELLM_USER_CUDA_ARCHS FALSE)
++if(DEFINED CMAKE_CUDA_ARCHITECTURES
++   AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
++  set(_EDGELLM_USER_CUDA_ARCHS TRUE)
++endif()
++
+ project(
+   tensorrt_edgellm_sdk
+   VERSION 0.10.0
+@@ -82,7 +92,7 @@ endif()
+ set_ifndef(CUDA_CTK_VERSION 12.8)
+ set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
+ 
+-if(NOT AARCH64_BUILD)
++if(NOT _EDGELLM_USER_CUDA_ARCHS AND NOT AARCH64_BUILD)
+   set(CMAKE_CUDA_ARCHITECTURES 80;86;89)
+   if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
+     list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)

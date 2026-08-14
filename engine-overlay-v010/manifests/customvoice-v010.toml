@@ -1,0 +1,59 @@
+# Active CustomVoice v0.10.0 build contract.
+[upstream]
+version = "v0.10.0"
+pin = "71dd1bae032e70771265917ec74d3ff4cad07a10"
+remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
+
+[proposed_upstream_patches]
+directory = "patches/upstream-v010-prs"
+series = "patches/upstream-v010-prs/series"
+lock = "patches/upstream-v010-prs/LOCK"
+checksums = "patches/upstream-v010-prs/SHA256SUMS"
+count = 4
+series_sha256 = "9c366ab2e23e79e100d0d209edad0f5137feed1f88fbaab29b8959b913ede5ee"
+lock_sha256 = "1d34836757eeac6e423ff7b97261f127a93ba6edc4634cbfa5387f7fda49d9f3"
+checksums_sha256 = "7d78dbdd53065b3601dc9cb7fc0c868d0641167e620ba4c219087e2497608144"
+
+[patches]
+directory = "patches/v010-candidate"
+series = "patches/v010-candidate/series"
+checksums = "patches/v010-candidate/SHA256SUMS"
+count = 32
+sparse_numbering = true
+series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
+checksums_sha256 = "de6990fbba76cfbb40573a39b24648eff2476712301a68bb4944375d95eb8b2c"
+
+[target]
+device = "jetson-orin-nx"
+sm = "87"
+cuda = "12.6"
+tensorrt = "10.3"
+l4t = "36.4.3"
+jetpack = "6.2"
+embedded_target = "jetson-orin"
+aarch64_build = true
+
+[build]
+type = "Release"
+enable_cute_dsl = "OFF"
+worker = "qwen3_tts_streaming_worker"
+max_batch_size = 2
+
+[model]
+id = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+precision = "int4"
+components = ["talker", "code_predictor", "code2wav"]
+
+[artifacts]
+root = "/opt/edgellm-v010"
+required = [
+  "libNvInfer_edgellm_plugin.so",
+  "bin/qwen3_tts_streaming_worker",
+  "engines/tts_customvoice_int4/talker/llm.engine",
+  "engines/tts_customvoice_int4/talker/DRIVER_REVISION",
+  "engines/tts_customvoice_int4/talker/PROVENANCE.md",
+  "engines/tts_customvoice_fp16/code_predictor/llm.engine",
+  "engines/tts_customvoice_fp16/code2wav/code2wav/code2wav.engine",
+]
+provenance_required = true
+sha256_required = true

@@ -1,0 +1,677 @@
+diff --git a/cpp/runtime/hybridCacheManager.h b/cpp/runtime/hybridCacheManager.h
+--- a/cpp/runtime/hybridCacheManager.h
++++ b/cpp/runtime/hybridCacheManager.h
+@@ -165,6 +165,27 @@
+     //! @param stream CUDA stream.
+     void resetForNewSequences(rt::Tensor const& reuseKVCacheLengths, cudaStream_t stream);
+ 
++    //! Reset ONLY the named lanes (batch rows) to empty, WITHOUT reshaping the shared
++    //! KV-length tensor (spec R1). Unlike resetForNewSequences (which reshapes the whole
++    //! active batch and is the one-shot path), this zeroes each named lane's KV length
++    //! in-place via a per-element device memset, so co-resident lanes are byte-untouched.
++    //! mKVCacheAllEmpty becomes conservatively false (other lanes may still be non-empty).
++    //! @param batchIdxs Lane indices to reset; each must be in [0, maxBatchSize).
++    //! @param stream    CUDA stream.
++    void resetLanes(std::vector<int32_t> const& batchIdxs, cudaStream_t stream);
++
++    //! Set ONE lane's committed KV length to an explicit value WITHOUT reshaping the shared
++    //! tensor (spec R1). Per-element device memcpy into mDeviceKVCacheLengths[batchIdx].
++    //! Marks the cache non-empty when length > 0.
++    //! @param batchIdx Lane index, in [0, maxBatchSize).
++    //! @param length   New KV length for the lane (>= 0).
++    //! @param stream   CUDA stream.
++    void setLaneLength(int32_t batchIdx, int32_t length, cudaStream_t stream);
++
++    //! @brief Maximum number of physical lanes (batch rows) this cache manager allocates.
++    //! @return The configured maxBatchSize (the full KV-length tensor capacity).
++    int32_t maxBatchSize() const noexcept;
++
+     //! Commit sequence lengths after prefill (element-wise increment from a GPU tensor).
+     //! @param newContextLengths GPU INT32 tensor of context lengths, shape [activeBatchSize].
+     //! @param stream CUDA stream.
+diff --git a/cpp/runtime/hybridCacheManager.cpp b/cpp/runtime/hybridCacheManager.cpp
+--- a/cpp/runtime/hybridCacheManager.cpp
++++ b/cpp/runtime/hybridCacheManager.cpp
+@@ -273,6 +273,53 @@
+         reuseKVCacheLengths.getMemoryCapacity(), cudaMemcpyHostToDevice, stream));
+ }
+ 
++void HybridCacheManager::resetLanes(std::vector<int32_t> const& batchIdxs, cudaStream_t stream)
++{
++    // Per-lane reset (spec R1). Zero each named lane's KV length WITHOUT reshaping the shared
++    // tensor: the full mDeviceKVCacheLengths buffer is allocated at maxBatchSize capacity and
++    // never freed (see ctor), so element [batchIdx] is always addressable for any valid lane,
++    // regardless of the current logical activeBatchSize. resetForNewSequences (the one-shot path)
++    // is the ONLY method that reshapes; touching it here would corrupt co-resident lanes.
++    if (batchIdxs.empty())
++    {
++        return;
++    }
++    int32_t* const base = mDeviceKVCacheLengths.dataPointer<int32_t>();
++    for (int32_t const idx : batchIdxs)
++    {
++        check::check(idx >= 0 && idx < mConfig.maxBatchSize,
++            "HybridCacheManager::resetLanes: lane index out of range [0, maxBatchSize).");
++        // Single-element device memset: zero exactly lane `idx`'s INT32 KV length, nothing else.
++        CUDA_CHECK(cudaMemsetAsync(base + idx, 0, sizeof(int32_t), stream));
++    }
++    // Conservative: other (un-reset) lanes may still hold committed KV, so the cache is NOT
++    // globally empty. (resetForNewSequences can set true because it reseeds the whole batch.)
++    mKVCacheAllEmpty = false;
++}
++
++void HybridCacheManager::setLaneLength(int32_t batchIdx, int32_t length, cudaStream_t stream)
++{
++    check::check(batchIdx >= 0 && batchIdx < mConfig.maxBatchSize,
++        "HybridCacheManager::setLaneLength: lane index out of range [0, maxBatchSize).");
++    check::check(length >= 0, "HybridCacheManager::setLaneLength: length must be non-negative.");
++    int32_t* const slot = mDeviceKVCacheLengths.dataPointer<int32_t>() + batchIdx;
++    if (length == 0)
++    {
++        CUDA_CHECK(cudaMemsetAsync(slot, 0, sizeof(int32_t), stream));
++    }
++    else
++    {
++        // Host->device copy of the single length value (no reshape; lane-addressed).
++        CUDA_CHECK(cudaMemcpyAsync(slot, &length, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
++        mKVCacheAllEmpty = false;
++    }
++}
++
++int32_t HybridCacheManager::maxBatchSize() const noexcept
++{
++    return mConfig.maxBatchSize;
++}
++
+ void HybridCacheManager::commitSequenceLength(rt::Tensor const& newContextLengths, cudaStream_t stream)
+ {
+     check::check(newContextLengths.getDataType() == DataType::kINT32,
+diff --git a/cpp/runtime/asrStreamingSessionRuntime.h b/cpp/runtime/asrStreamingSessionRuntime.h
+--- a/cpp/runtime/asrStreamingSessionRuntime.h
++++ b/cpp/runtime/asrStreamingSessionRuntime.h
+@@ -23,6 +23,7 @@
+ #include "runtime/state/decodingInferenceContext.h"
+ 
+ #include <cstdint>
++#include <mutex>
+ #include <vector>
+ 
+ namespace trt_edgellm
+@@ -47,6 +48,78 @@
+     bool hasAudio{false};           //!< When false, the chunk is text-only.
+ };
+ 
++//! @brief Which subsystem owns a lane (for the static ASR/TTS partition).
++enum class LaneOwnerKind
++{
++    kNone, //!< Free lane.
++    kAsr,  //!< Owned by a streaming-ASR session.
++    kTts   //!< Owned by a TTS slot.
++};
++
++/*!
++ * @brief Static-partition lane allocator over a shared HybridCacheManager's batch rows (spec R1).
++ *
++ * v0.8.0 has ONE process-lifetime HybridCacheManager per engine (SharedResources::cacheManagers),
++ * not per-session. To let concurrent ASR sessions (and later TTS slots) co-reside without a
++ * full-batch reset clobbering each other, lanes are statically partitioned:
++ *   ASR -> [0, asrMax)   TTS -> [asrMax, asrMax + ttsMax)
++ * with asrMax + ttsMax <= maxBatchSize. acquire() hands out a free lane within the owner's
++ * partition; release() returns it. The physical laneId IS the HybridCacheManager batch row, so a
++ * per-lane teardown is HybridCacheManager::resetLanes({laneId}) — NOT the reshaping one-shot reset.
++ *
++ * Thread-safe (internal mutex); the engine step itself is serialized elsewhere (shared PipelineIO).
++ */
++class SessionLaneManager
++{
++public:
++    //! @brief One physical lane's bookkeeping.
++    struct LaneRecord
++    {
++        LaneOwnerKind ownerKind{LaneOwnerKind::kNone}; //!< Owning subsystem (or kNone if free).
++        int64_t ownerId{-1};                           //!< Caller-supplied owner id (session/slot).
++        int32_t slotId{-1};                            //!< Logical slot id within the partition.
++        bool inUse{false};                             //!< Whether this lane is currently allocated.
++        int32_t kvLength{0};                           //!< Last-known committed KV length (advisory).
++    };
++
++    //! @param maxBatchSize Physical lane capacity of the shared cache manager.
++    //! @param asrMax       Lanes reserved for ASR ([0, asrMax)).
++    //! @param ttsMax       Lanes reserved for TTS ([asrMax, asrMax + ttsMax)).
++    SessionLaneManager(int32_t maxBatchSize, int32_t asrMax, int32_t ttsMax);
++
++    //! @brief Reserve a free lane in the owner's partition.
++    //! @return Physical laneId (== HybridCacheManager batch row), or -1 if the partition is full.
++    int32_t acquire(LaneOwnerKind ownerKind, int64_t ownerId);
++
++    //! @brief Release a previously-acquired lane back to its partition.
++    void release(int32_t laneId);
++
++    //! @brief Record the advisory KV length for a lane (introspection only).
++    void setKvLength(int32_t laneId, int32_t kvLength);
++
++    //! @brief Snapshot of a lane's record (for tests / introspection).
++    LaneRecord recordOf(int32_t laneId) const;
++
++    //! @brief First lane index of the TTS partition (== asrMax).
++    int32_t ttsBase() const noexcept
++    {
++        return mAsrMax;
++    }
++
++    //! @brief Physical lane capacity.
++    int32_t maxBatchSize() const noexcept
++    {
++        return mMaxBatchSize;
++    }
++
++private:
++    mutable std::mutex mMutex;
++    int32_t mMaxBatchSize{0};
++    int32_t mAsrMax{0};
++    int32_t mTtsMax{0};
++    std::vector<LaneRecord> mLanes;
++};
++
+ /*!
+  * @brief Composition wrapper that turns the one-shot LLMInferenceRuntime into a
+  *        chunked streaming-ASR session (spec §6.2 / §2).
+@@ -73,6 +146,12 @@
+     //! @param lane    Physical batch lane this session occupies (Phase 3: 0).
+     explicit AsrStreamingSessionRuntime(LLMInferenceRuntime& runtime, int32_t lane = 0) noexcept;
+ 
++    //! @param runtime     The underlying request runtime (must outlive this wrapper).
++    //! @param laneManager Lane allocator (must outlive this wrapper); a lane is acquired in
++    //!                    beginAsrSession and released in endAsrSession.
++    //! @param ownerId     Caller session id for lane bookkeeping.
++    AsrStreamingSessionRuntime(LLMInferenceRuntime& runtime, SessionLaneManager& laneManager, int64_t ownerId) noexcept;
++
+     AsrStreamingSessionRuntime(AsrStreamingSessionRuntime const&) = delete;
+     AsrStreamingSessionRuntime& operator=(AsrStreamingSessionRuntime const&) = delete;
+ 
+@@ -150,6 +229,8 @@
+ 
+ private:
+     LLMInferenceRuntime& mRuntime;
++    SessionLaneManager* mLaneManager{nullptr}; //!< When set, owns lane acquire/release.
++    int64_t mOwnerId{-1};
+     int32_t mLane{0};
+     int32_t mMaxPositions{0};
+     int32_t mAppendedTokens{0};
+diff --git a/cpp/runtime/asrStreamingSessionRuntime.cpp b/cpp/runtime/asrStreamingSessionRuntime.cpp
+--- a/cpp/runtime/asrStreamingSessionRuntime.cpp
++++ b/cpp/runtime/asrStreamingSessionRuntime.cpp
+@@ -18,6 +18,7 @@
+ #include "runtime/asrStreamingSessionRuntime.h"
+ #include "common/logger.h"
+ 
++#include <stdexcept>
+ #include <utility>
+ 
+ namespace trt_edgellm
+@@ -25,12 +26,107 @@
+ namespace rt
+ {
+ 
++// ── SessionLaneManager (spec R1) ─────────────────────────────────────────────
++
++SessionLaneManager::SessionLaneManager(int32_t maxBatchSize, int32_t asrMax, int32_t ttsMax)
++    : mMaxBatchSize(maxBatchSize)
++    , mAsrMax(asrMax)
++    , mTtsMax(ttsMax)
++    , mLanes(static_cast<size_t>(maxBatchSize < 0 ? 0 : maxBatchSize))
++{
++    if (maxBatchSize < 0 || asrMax < 0 || ttsMax < 0)
++    {
++        throw std::invalid_argument("SessionLaneManager: negative size argument.");
++    }
++    if (asrMax + ttsMax > maxBatchSize)
++    {
++        throw std::invalid_argument("SessionLaneManager: asrMax + ttsMax exceeds maxBatchSize.");
++    }
++}
++
++int32_t SessionLaneManager::acquire(LaneOwnerKind ownerKind, int64_t ownerId)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    int32_t begin = 0;
++    int32_t end = 0;
++    if (ownerKind == LaneOwnerKind::kAsr)
++    {
++        begin = 0;
++        end = mAsrMax;
++    }
++    else if (ownerKind == LaneOwnerKind::kTts)
++    {
++        begin = mAsrMax;
++        end = mAsrMax + mTtsMax;
++    }
++    else
++    {
++        return -1; // kNone is not allocatable.
++    }
++    int32_t slot = 0;
++    for (int32_t lane = begin; lane < end; ++lane)
++    {
++        if (!mLanes[lane].inUse)
++        {
++            mLanes[lane].ownerKind = ownerKind;
++            mLanes[lane].ownerId = ownerId;
++            mLanes[lane].slotId = slot;
++            mLanes[lane].inUse = true;
++            mLanes[lane].kvLength = 0;
++            return lane;
++        }
++        ++slot;
++    }
++    return -1; // partition full
++}
++
++void SessionLaneManager::release(int32_t laneId)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    if (laneId < 0 || laneId >= mMaxBatchSize)
++    {
++        LOG_ERROR("SessionLaneManager::release: laneId=%d out of range [0, %d)", laneId, mMaxBatchSize);
++        return;
++    }
++    mLanes[laneId] = LaneRecord{};
++}
++
++void SessionLaneManager::setKvLength(int32_t laneId, int32_t kvLength)
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    if (laneId < 0 || laneId >= mMaxBatchSize)
++    {
++        return;
++    }
++    mLanes[laneId].kvLength = kvLength;
++}
++
++SessionLaneManager::LaneRecord SessionLaneManager::recordOf(int32_t laneId) const
++{
++    std::lock_guard<std::mutex> lock(mMutex);
++    if (laneId < 0 || laneId >= mMaxBatchSize)
++    {
++        return LaneRecord{};
++    }
++    return mLanes[laneId];
++}
++
++
+ AsrStreamingSessionRuntime::AsrStreamingSessionRuntime(LLMInferenceRuntime& runtime, int32_t lane) noexcept
+     : mRuntime(runtime)
+     , mLane(lane)
+ {
+ }
+ 
++AsrStreamingSessionRuntime::AsrStreamingSessionRuntime(
++    LLMInferenceRuntime& runtime, SessionLaneManager& laneManager, int64_t ownerId) noexcept
++    : mRuntime(runtime)
++    , mLaneManager(&laneManager)
++    , mOwnerId(ownerId)
++    , mLane(-1) // assigned by the lane manager in beginAsrSession
++{
++}
++
+ bool AsrStreamingSessionRuntime::beginAsrSession(
+     std::vector<int32_t> const& promptTokenIds, int32_t maxPositions, int32_t maxAudioTokensPerChunk, cudaStream_t stream)
+ {
+@@ -41,10 +137,27 @@
+         return false;
+     }
+ 
++    if (mLaneManager != nullptr)
++    {
++        // Phase 4 (spec R1): reserve a physical lane from the ASR partition. The laneId IS the
++        // HybridCacheManager batch row used for MRope/prefill and torn down per-lane on end.
++        mLane = mLaneManager->acquire(LaneOwnerKind::kAsr, mOwnerId);
++        if (mLane < 0)
++        {
++            LOG_ERROR("beginAsrSession: no free ASR lane (partition full)");
++            return false;
++        }
++    }
++
+     int32_t const maxBatch = mRuntime.maxSessionBatchSize();
+     if (mLane < 0 || mLane >= maxBatch)
+     {
+         LOG_ERROR("beginAsrSession: lane=%d out of range [0, %d)", mLane, maxBatch);
++        if (mLaneManager != nullptr)
++        {
++            mLaneManager->release(mLane);
++            mLane = -1;
++        }
+         return false;
+     }
+ 
+@@ -263,8 +376,19 @@
+     {
+         return;
+     }
+-    // Phase 3: full-batch reset (single session/lane). TODO(phase4): per-lane reset.
+-    mRuntime.resetForSessionEnd(stream);
++    if (mLaneManager != nullptr)
++    {
++        // Phase 4 (spec R1): targeted per-lane teardown — resets ONLY this lane's KV length
++        // (memset, no reshape) so co-resident lanes are untouched, then returns the lane.
++        mRuntime.resetSessionLane(mLane, stream);
++        mLaneManager->release(mLane);
++        mLane = -1;
++    }
++    else
++    {
++        // Phase 3 fallback: single session/lane → full-batch reset (one-shot reshape path).
++        mRuntime.resetForSessionEnd(stream);
++    }
+     mContext = DecodingInferenceContext{};
+     mMaxPositions = 0;
+     mAppendedTokens = 0;
+diff --git a/cpp/runtime/llmInferenceRuntime.h b/cpp/runtime/llmInferenceRuntime.h
+--- a/cpp/runtime/llmInferenceRuntime.h
++++ b/cpp/runtime/llmInferenceRuntime.h
+@@ -316,6 +316,21 @@
+     //               so an ASR session can be torn down without disturbing co-resident lanes.
+     void resetForSessionEnd(cudaStream_t stream);
+ 
++    //! @brief Per-lane session teardown (spec R1, Phase 4).
++    //! @details Resets ONLY the given lane's KV length to 0 via HybridCacheManager::resetLanes
++    //!          (a per-element device memset, NO reshape) so a single ASR session can be torn
++    //!          down without disturbing any co-resident lane. This is the Phase-4 replacement
++    //!          for the full-batch resetForSessionEnd when a SessionLaneManager owns the lane.
++    //! @param lane   Physical lane (batch row) to reset, in [0, cacheManagerMaxBatchSize()).
++    //! @param stream CUDA stream (synchronized before return).
++    void resetSessionLane(int32_t lane, cudaStream_t stream);
++
++    //! @brief Physical lane capacity of the shared base HybridCacheManager (spec R1).
++    //! @details Used to construct a SessionLaneManager partition. May exceed the per-request
++    //!          active batch size; it is the full KV-length tensor capacity.
++    //! @return The base cache manager's maxBatchSize.
++    int32_t cacheManagerMaxBatchSize() const;
++
+     //! @brief Number of physical batch lanes this runtime supports (KV capacity dimension).
+     int32_t maxSessionBatchSize() const noexcept
+     {
+diff --git a/cpp/runtime/llmInferenceRuntime.cpp b/cpp/runtime/llmInferenceRuntime.cpp
+--- a/cpp/runtime/llmInferenceRuntime.cpp
++++ b/cpp/runtime/llmInferenceRuntime.cpp
+@@ -1814,6 +1814,21 @@
+     CUDA_CHECK(cudaStreamSynchronize(stream));
+ }
+ 
++void LLMInferenceRuntime::resetSessionLane(int32_t lane, cudaStream_t stream)
++{
++    // Phase 4 (spec R1): targeted per-lane teardown. resetLanes zeroes ONLY this lane's KV length
++    // via a single-element device memset (no reshape), so co-resident lanes are byte-untouched —
++    // unlike resetForSessionEnd, which reshapes the whole active batch (one-shot path).
++    auto& cacheMgr = *mSharedResources->cacheManagers[0];
++    cacheMgr.resetLanes({lane}, stream);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++}
++
++int32_t LLMInferenceRuntime::cacheManagerMaxBatchSize() const
++{
++    return mSharedResources->cacheManagers[0]->maxBatchSize();
++}
++
+ std::vector<float> LLMInferenceRuntime::getLogitsForTesting(int32_t lane, cudaStream_t stream)
+ {
+     auto const& logits = mPipelineIO->outputLogits; // device FP32 [activeBatchSize, outputVocabSize]
+diff --git a/examples/llm/CMakeLists.txt b/examples/llm/CMakeLists.txt
+--- a/examples/llm/CMakeLists.txt
++++ b/examples/llm/CMakeLists.txt
+@@ -75,3 +75,15 @@
+   target_link_libraries(spike_v080_m2_session_lifecycle PRIVATE
+     "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
+ endif()
++
++add_executable(spike_v080_m3_lane_isolation spike_v080_m3_lane_isolation.cpp)
++target_link_libraries(spike_v080_m3_lane_isolation PRIVATE edgellmCore exampleUtils
++                                                           commonLibraryExt)
++target_include_directories(
++  spike_v080_m3_lane_isolation PRIVATE ${COMMON_INCLUDE_DIRS}
++                                       ${CMAKE_SOURCE_DIR}/examples/utils)
++add_cross_build_link_options(spike_v080_m3_lane_isolation)
++if(TARGET trt_edgellm_cutedsl_cudart_shim)
++  target_link_libraries(spike_v080_m3_lane_isolation PRIVATE
++    "-Wl,--whole-archive" trt_edgellm_cutedsl_cudart_shim "-Wl,--no-whole-archive")
++endif()
+diff --git a/examples/llm/spike_v080_m3_lane_isolation.cpp b/examples/llm/spike_v080_m3_lane_isolation.cpp
+new file mode 100644
+--- /dev/null
++++ b/examples/llm/spike_v080_m3_lane_isolation.cpp
+@@ -0,0 +1,234 @@
++// Phase 4 empirical spike — R1 lane-isolation GATE on the v0.8.0 per-lane KV reset.
++//
++// Proves the spec-R1 invariant: HybridCacheManager::resetLanes({0}) zeroes ONLY lane 0's KV
++// length and touches NO other lane's KV-cache bytes or length — i.e. it is a per-element memset,
++// NOT the reshaping full-batch resetForNewSequences that corrupts co-resident lanes.
++//
++// This is OPTION (a) from the Phase-4 plan: drive the resetLanes MECHANISM directly against a
++// manually-constructed 2-lane HybridCacheManager. No engine forward / no ASR session is needed —
++// the isolation property lives entirely in the cache manager's length tensor + KV slabs, so a
++// hand-built 2-lane cache manager is the cleanest, most direct proof (the production ASR engine
++// on this box was built maxBatchSize=1 and cannot host 2 live lanes; a full 2-session run is
++// Phase 5). It also smoke-tests SessionLaneManager acquire/release partitioning.
++//
++// Layout of the combined KV cache for the single attention layer:
++//   [maxBatchSize=2, 2(K/V), numKVHeads=1, maxSeqLen=8, headDim=4]  dtype kHALF
++//   => each lane's contiguous slab = 2*1*8*4 = 64 halves = 128 bytes.
++//
++// Procedure:
++//   1) Build a 2-lane HybridCacheManager (1 attn layer, 0 mamba).
++//   2) Seed lane 0 KV bytes = 0xAA, lane 1 KV bytes = 0xBB (distinct device fills).
++//   3) setLaneLength(0, 5), setLaneLength(1, 7).
++//   4) CAPTURE lane 1: KV-length (peek device length[1]) + a KV-byte sample (D2H of lane 1 slab).
++//   5) resetLanes({0}).
++//   6) RE-CAPTURE lane 1: length + KV bytes.
++//   ASSERT: lane1 length UNCHANGED (7==7); lane1 KV bytes UNCHANGED (all 0xBB, byte-equal);
++//           lane0 length now 0; lane0 KV bytes UNCHANGED (memset hits length only, not KV slab).
++//
++// Exit 0 = PASS, non-zero = FAIL.
++
++#include "common/tensor.h"
++#include "runtime/asrStreamingSessionRuntime.h" // SessionLaneManager
++#include "runtime/hybridCacheManager.h"
++
++#include <NvInfer.h>
++#include <cuda_runtime.h>
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <vector>
++
++using namespace trt_edgellm;
++
++#define CK(x)                                                                                                          \
++    do                                                                                                                 \
++    {                                                                                                                  \
++        auto _e = (x);                                                                                                 \
++        if (_e != cudaSuccess)                                                                                         \
++        {                                                                                                              \
++            fprintf(stderr, "CUDA err %s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(_e));                       \
++            std::exit(3);                                                                                              \
++        }                                                                                                              \
++    } while (0)
++
++namespace
++{
++constexpr int32_t kMaxBatch = 2;
++constexpr int32_t kNumKVHeads = 1;
++constexpr int32_t kHeadDim = 4;
++constexpr int32_t kMaxSeqLen = 8;
++constexpr int32_t kLaneHalves = 2 * kNumKVHeads * kMaxSeqLen * kHeadDim; // 64
++constexpr size_t kLaneBytes = static_cast<size_t>(kLaneHalves) * sizeof(uint16_t); // 128
++
++// Read one lane's committed KV length from the shared device length tensor.
++int32_t peekLen(rt::HybridCacheManager& mgr, int32_t lane, cudaStream_t stream)
++{
++    rt::Tensor& lens = mgr.getKVCacheLengths();
++    int32_t host = -1;
++    CK(cudaMemcpyAsync(&host, lens.dataPointer<int32_t>() + lane, sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
++    CK(cudaStreamSynchronize(stream));
++    return host;
++}
++
++// Download one lane's raw KV-cache slab bytes (layer 0).
++std::vector<uint8_t> sampleKVBytes(rt::HybridCacheManager& mgr, int32_t lane, cudaStream_t stream)
++{
++    rt::Tensor& kv = mgr.getCombinedKVCache(/*absLayerIdx=*/0); // [maxBatch,2,heads,seq,headDim] kHALF
++    auto const* base = static_cast<uint8_t const*>(kv.rawPointer());
++    std::vector<uint8_t> host(kLaneBytes);
++    CK(cudaMemcpyAsync(host.data(), base + static_cast<size_t>(lane) * kLaneBytes, kLaneBytes,
++        cudaMemcpyDeviceToHost, stream));
++    CK(cudaStreamSynchronize(stream));
++    return host;
++}
++
++void fillLaneKV(rt::HybridCacheManager& mgr, int32_t lane, uint8_t pattern, cudaStream_t stream)
++{
++    rt::Tensor& kv = mgr.getCombinedKVCache(0);
++    auto* base = static_cast<uint8_t*>(kv.rawPointer());
++    CK(cudaMemsetAsync(base + static_cast<size_t>(lane) * kLaneBytes, pattern, kLaneBytes, stream));
++    CK(cudaStreamSynchronize(stream));
++}
++
++bool allEqual(std::vector<uint8_t> const& v, uint8_t pat)
++{
++    for (auto b : v)
++    {
++        if (b != pat)
++        {
++            return false;
++        }
++    }
++    return true;
++}
++} // namespace
++
++int main()
++{
++    cudaStream_t stream;
++    CK(cudaStreamCreate(&stream));
++
++    // ── Build a 2-lane HybridCacheManager (1 attention layer, no mamba). ──
++    rt::HybridCacheManager::Config cfg;
++    cfg.maxBatchSize = kMaxBatch;
++    cfg.layerTypes = {rt::HybridCacheManager::LayerType::kAttention};
++
++    cfg.kvConfig.numAttentionLayers = 1;
++    cfg.kvConfig.maxBatchSize = kMaxBatch;
++    cfg.kvConfig.maxSequenceLength = kMaxSeqLen;
++    cfg.kvConfig.kvCacheType = nvinfer1::DataType::kHALF;
++    cfg.kvConfig.layerConfigs = {rt::KVLayerConfig{kNumKVHeads, kHeadDim}};
++
++    cfg.mambaConfig.numRecurrentLayers = 0;
++
++    rt::HybridCacheManager mgr(cfg, stream);
++    CK(cudaStreamSynchronize(stream));
++
++    printf("[m3] maxBatchSize()=%d (want %d)\n", mgr.maxBatchSize(), kMaxBatch);
++    if (mgr.maxBatchSize() != kMaxBatch)
++    {
++        fprintf(stderr, "[m3] FAIL: maxBatchSize mismatch\n");
++        return 1;
++    }
++
++    // Make BOTH lanes active so the length tensor is logically [2] (mirrors a 2-session batch).
++    rt::Tensor reuse({kMaxBatch}, rt::DeviceType::kCPU, nvinfer1::DataType::kINT32, "reuse");
++    reuse.dataPointer<int32_t>()[0] = 0;
++    reuse.dataPointer<int32_t>()[1] = 0;
++    mgr.resetForNewSequences(reuse, stream); // one-shot path: activeBatch=2, both empty
++    CK(cudaStreamSynchronize(stream));
++
++    // Seed distinct KV bytes + lengths per lane.
++    fillLaneKV(mgr, 0, 0xAA, stream);
++    fillLaneKV(mgr, 1, 0xBB, stream);
++    mgr.setLaneLength(0, 5, stream);
++    mgr.setLaneLength(1, 7, stream);
++    CK(cudaStreamSynchronize(stream));
++
++    // ── CAPTURE (before resetLanes). ──
++    int32_t len0_before = peekLen(mgr, 0, stream);
++    int32_t len1_before = peekLen(mgr, 1, stream);
++    std::vector<uint8_t> kv1_before = sampleKVBytes(mgr, 1, stream);
++    std::vector<uint8_t> kv0_before = sampleKVBytes(mgr, 0, stream);
++    printf("[m3] BEFORE resetLanes({0}): len0=%d len1=%d  lane1KV[0..3]=%02x %02x %02x %02x\n",
++        len0_before, len1_before, kv1_before[0], kv1_before[1], kv1_before[2], kv1_before[3]);
++
++    // ── THE GATE: reset ONLY lane 0. ──
++    mgr.resetLanes({0}, stream);
++    CK(cudaStreamSynchronize(stream));
++
++    // ── RE-CAPTURE (after resetLanes). ──
++    int32_t len0_after = peekLen(mgr, 0, stream);
++    int32_t len1_after = peekLen(mgr, 1, stream);
++    std::vector<uint8_t> kv1_after = sampleKVBytes(mgr, 1, stream);
++    std::vector<uint8_t> kv0_after = sampleKVBytes(mgr, 0, stream);
++    printf("[m3] AFTER  resetLanes({0}): len0=%d len1=%d  lane1KV[0..3]=%02x %02x %02x %02x\n",
++        len0_after, len1_after, kv1_after[0], kv1_after[1], kv1_after[2], kv1_after[3]);
++
++    bool ok = true;
++
++    // (1) lane 1 KV LENGTH unchanged.
++    if (len1_after != len1_before || len1_after != 7)
++    {
++        fprintf(stderr, "[m3] FAIL: lane1 length changed (%d -> %d, want 7)\n", len1_before, len1_after);
++        ok = false;
++    }
++    // (2) lane 1 KV BYTES unchanged (byte-equal, still all 0xBB).
++    if (kv1_after != kv1_before || !allEqual(kv1_after, 0xBB))
++    {
++        fprintf(stderr, "[m3] FAIL: lane1 KV bytes changed by resetLanes({0})\n");
++        ok = false;
++    }
++    // (3) lane 0 KV LENGTH now 0.
++    if (len0_after != 0)
++    {
++        fprintf(stderr, "[m3] FAIL: lane0 length not reset (got %d, want 0)\n", len0_after);
++        ok = false;
++    }
++    // (4) lane 0 KV BYTES untouched — resetLanes resets length only, NOT the KV slab.
++    if (kv0_after != kv0_before || !allEqual(kv0_after, 0xAA))
++    {
++        fprintf(stderr, "[m3] FAIL: lane0 KV bytes unexpectedly modified (length-only reset expected)\n");
++        ok = false;
++    }
++    // (5) not-all-empty after a partial reset.
++    if (mgr.getKVCacheAllEmpty())
++    {
++        fprintf(stderr, "[m3] FAIL: getKVCacheAllEmpty()==true after partial resetLanes (lane1 still has KV)\n");
++        ok = false;
++    }
++
++    if (!ok)
++    {
++        fprintf(stderr, "[m3] LANE-ISOLATION GATE FAILED\n");
++        return 1;
++    }
++    printf("[m3] LANE-ISOLATION GATE PASS: lane1 length+bytes UNCHANGED after resetLanes({0}); lane0 length=0; "
++           "lane0 KV bytes intact; allEmpty=false.\n");
++
++    // ── SessionLaneManager partition smoke. ──
++    rt::SessionLaneManager lanes(/*maxBatchSize=*/4, /*asrMax=*/2, /*ttsMax=*/2);
++    int32_t a0 = lanes.acquire(rt::LaneOwnerKind::kAsr, 100);
++    int32_t a1 = lanes.acquire(rt::LaneOwnerKind::kAsr, 101);
++    int32_t a2 = lanes.acquire(rt::LaneOwnerKind::kAsr, 102); // partition full -> -1
++    int32_t t0 = lanes.acquire(rt::LaneOwnerKind::kTts, 200);
++    printf("[m3] SessionLaneManager: asr=%d,%d (3rd=%d) tts=%d (ttsBase=%d)\n", a0, a1, a2, t0, lanes.ttsBase());
++    if (a0 != 0 || a1 != 1 || a2 != -1 || t0 != 2)
++    {
++        fprintf(stderr, "[m3] FAIL: lane partition allocation wrong\n");
++        return 1;
++    }
++    lanes.release(a0);
++    int32_t a0b = lanes.acquire(rt::LaneOwnerKind::kAsr, 103); // reuse freed lane 0
++    if (a0b != 0)
++    {
++        fprintf(stderr, "[m3] FAIL: released ASR lane not reused (got %d)\n", a0b);
++        return 1;
++    }
++    printf("[m3] SessionLaneManager: release/re-acquire ASR lane -> %d OK\n", a0b);
++
++    printf("[m3] ALL PASS\n");
++    return 0;
++}

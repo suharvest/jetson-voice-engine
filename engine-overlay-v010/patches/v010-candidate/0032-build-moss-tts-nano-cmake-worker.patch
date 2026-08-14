@@ -1,0 +1,102 @@
+From 78112230e5f3b7fcccb23e960fcbf09925c7a1e0 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:15:13 +0800
+Subject: [PATCH] wire moss tts nano worker into cmake
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cpp/workers/build_moss_worker.sh              |  7 ++-
+ examples/omni/CMakeLists.txt                  | 61 +++++++++++++++++++
+ .../omni}/moss_tts_nano_worker.cpp            |  0
+ 3 files changed, 66 insertions(+), 2 deletions(-)
+ rename {cpp/workers => examples/omni}/moss_tts_nano_worker.cpp (100%)
+
+diff --git a/cpp/workers/build_moss_worker.sh b/cpp/workers/build_moss_worker.sh
+index d1d3749..bf9bba9 100755
+--- a/cpp/workers/build_moss_worker.sh
++++ b/cpp/workers/build_moss_worker.sh
+@@ -1,6 +1,9 @@
+ #!/usr/bin/env bash
+-# Standalone build script for moss_tts_nano_worker on orin-nx.
+-# Bypasses CMake (which is blocked by pre-existing gdn_decode.h CUDA 12.6 conflict).
++# LEGACY (v0.7.x line): standalone build script for moss_tts_nano_worker.
++# On the v0.9.0 branch the worker moved to examples/omni/moss_tts_nano_worker.cpp
++# and builds via the CMake target `moss_tts_nano_worker` (examples/omni/CMakeLists.txt);
++# use that instead. Kept only as a reference for the original orin-nx link recipe.
++# Bypassed CMake (which was blocked by pre-existing gdn_decode.h CUDA 12.6 conflict).
+ # See docs/playbooks/tts-model-edge-port-playbook.md.
+ 
+ set -euo pipefail
+diff --git a/examples/omni/CMakeLists.txt b/examples/omni/CMakeLists.txt
+index 6c1689d..38a4d99 100644
+--- a/examples/omni/CMakeLists.txt
++++ b/examples/omni/CMakeLists.txt
+@@ -57,3 +57,64 @@ add_cross_build_link_options(qwen3_tts_streaming_worker)
+ set_target_properties(
+   qwen3_tts_streaming_worker PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                         ${CMAKE_BINARY_DIR}/examples/omni)
++
++# MOSS-TTS-Nano standalone JSON-line worker (re-port from v0.7.x line
++# 3c6c263, formerly cpp/workers/moss_tts_nano_worker.cpp built via
++# build_moss_worker.sh). Needs onnxruntime (voice-clone codec-encode path)
++# and SentencePiece (tokenizer); target is skipped when either is missing
++# so the default build never breaks.
++set(MOSS_ORT_ROOT
++    "$ENV{ORT_ROOT}"
++    CACHE PATH "onnxruntime install root for moss_tts_nano_worker")
++find_path(
++  MOSS_ORT_INCLUDE_DIR onnxruntime_cxx_api.h
++  HINTS ${MOSS_ORT_ROOT}/include /usr/local/onnxruntime/include
++        $ENV{HOME}/ort-from-container/include
++  PATH_SUFFIXES onnxruntime)
++find_library(
++  MOSS_ORT_LIBRARY onnxruntime
++  HINTS ${MOSS_ORT_ROOT}/lib /usr/local/onnxruntime/lib
++        $ENV{HOME}/ort-from-container/lib)
++find_path(MOSS_SP_INCLUDE_DIR sentencepiece_processor.h)
++find_library(MOSS_SP_LIBRARY sentencepiece)
++
++if(MOSS_ORT_INCLUDE_DIR
++   AND MOSS_ORT_LIBRARY
++   AND MOSS_SP_INCLUDE_DIR
++   AND MOSS_SP_LIBRARY)
++  add_executable(moss_tts_nano_worker moss_tts_nano_worker.cpp)
++
++  target_include_directories(
++    moss_tts_nano_worker
++    PRIVATE ${COMMON_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/examples/utils
++            ${MOSS_ORT_INCLUDE_DIR} ${MOSS_SP_INCLUDE_DIR})
++
++  target_link_libraries(
++    moss_tts_nano_worker PRIVATE edgellmCore exampleUtils commonLibraryExt
++                                 ${MOSS_ORT_LIBRARY} ${MOSS_SP_LIBRARY})
++
++  if(TARGET trt_edgellm_cutedsl_cudart_shim)
++    target_link_libraries(moss_tts_nano_worker
++                          PRIVATE trt_edgellm_cutedsl_cudart_shim)
++    target_link_options(
++      moss_tts_nano_worker PRIVATE -Wl,-u,cudaLibraryLoadData
++      -Wl,-u,cudaLibraryUnload -Wl,-u,cudaLibraryGetKernel
++      -Wl,-u,cudaKernelSetAttributeForDevice)
++  endif()
++
++  add_cross_build_link_options(moss_tts_nano_worker)
++
++  # rpath so the worker finds libonnxruntime.so next to a non-system install.
++  get_filename_component(MOSS_ORT_LIBDIR ${MOSS_ORT_LIBRARY} DIRECTORY)
++  set_target_properties(
++    moss_tts_nano_worker
++    PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/examples/omni
++               BUILD_RPATH ${MOSS_ORT_LIBDIR}
++               INSTALL_RPATH ${MOSS_ORT_LIBDIR})
++else()
++  message(
++    STATUS
++      "moss_tts_nano_worker skipped (onnxruntime/sentencepiece not found: "
++      "ORT inc=${MOSS_ORT_INCLUDE_DIR} lib=${MOSS_ORT_LIBRARY} "
++      "SP inc=${MOSS_SP_INCLUDE_DIR} lib=${MOSS_SP_LIBRARY})")
++endif()
+diff --git a/cpp/workers/moss_tts_nano_worker.cpp b/examples/omni/moss_tts_nano_worker.cpp
+similarity index 100%
+rename from cpp/workers/moss_tts_nano_worker.cpp
+rename to examples/omni/moss_tts_nano_worker.cpp

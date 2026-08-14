@@ -1,0 +1,17 @@
+71dd1bae032e70771265917ec74d3ff4cad07a10
+# = NVIDIA TensorRT-Edge-LLM tag v0.10.0. PURE NVIDIA commit; no fork content.
+#
+# Active v0.10 migration scaffold (2026-08-14):
+#   patches/upstream-v010-prs/series (4 exact proposed-upstream rebases)
+#   + addon/
+#   + patches/v010-candidate/series (32 sparse rebased product patches).
+#
+# v0.10.0 already contains the FP4 guard and pre-10.7 reader fallback, and it
+# replaces the legacy FMHA backend with CuTe DSL FMHA-v2. The overlay retains
+# only explicit CUDA architectures,
+# MRoPE normalization, destination dtype, and the missing static-target
+# INTERFACE --wrap propagation. See patches/PATCH-STATE-v010.md.
+#
+# v0.8.0/v0.9.0/v0.9.1 profiles, manifests, patches, images, and engine
+# directories are retained as rollback/history. Never combine their plugin,
+# worker, or engine binaries with this v0.10.0 chain.

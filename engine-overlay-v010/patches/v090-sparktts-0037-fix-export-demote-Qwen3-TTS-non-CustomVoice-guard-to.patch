@@ -1,0 +1,37 @@
+From aafa7c56d6f0676d910fd86bd8eac9281c41263f Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Sat, 4 Jul 2026 01:09:27 +0800
+Subject: [PATCH 37/38] fix(export): demote Qwen3-TTS non-CustomVoice guard to
+ a warning (base export path)
+
+The hard p.error() in main() blocked exporting Qwen3-TTS BASE
+checkpoints (tts_model_type != "custom_voice") even though the
+Talker/CodePredictor/Code2Wav export stages handle them. Demote it to a
+logger.warning, mirroring the v0.8.0 port's ba9ecdb guard->warning
+semantics. Applied verbatim from the P3a working-copy diff validated
+during the wsl2 export run.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MHEXK41deYx6375K4q3MQb
+
+diff --git a/tensorrt_edgellm/scripts/export.py b/tensorrt_edgellm/scripts/export.py
+index e05794a..cffd20b 100644
+--- a/tensorrt_edgellm/scripts/export.py
++++ b/tensorrt_edgellm/scripts/export.py
+@@ -1952,8 +1952,11 @@ def main() -> None:
+ 
+     if (model_type == "qwen3_tts"
+             and config.get("tts_model_type") != "custom_voice"):
+-        p.error("Only Qwen3-TTS CustomVoice checkpoints are supported. "
+-                f"Got tts_model_type={config.get('tts_model_type')!r}.")
++        logger.warning(
++            "Qwen3-TTS non-CustomVoice checkpoint (tts_model_type=%r): exporting "
++            "Talker/CodePredictor/Code2Wav for the BASE path (P3a local patch, "
++            "mirrors v0.8.0 port commit ba9ecdb).",
++            config.get('tts_model_type'))
+ 
+     if args.eagle_base and args.mtp:
+         p.error("--eagle-base and --mtp cannot be enabled together")
+-- 
+2.50.1 (Apple Git-155)
+

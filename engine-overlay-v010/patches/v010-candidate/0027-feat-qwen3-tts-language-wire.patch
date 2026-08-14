@@ -1,0 +1,33 @@
+From a2b76cc7615eedbe5636711fc71e734315578fed Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:06:19 +0800
+Subject: [PATCH] wire qwen3 tts language through worker
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ examples/omni/qwen3_tts_streaming_worker.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
+index 5bb52ff..bae92ff 100644
+--- a/examples/omni/qwen3_tts_streaming_worker.cpp
++++ b/examples/omni/qwen3_tts_streaming_worker.cpp
+@@ -34,6 +34,8 @@
+  *     decoded: v0.10 owns extraction and ICL construction on device. It is
+  *     accepted for protocol compatibility but logs a warning and is ignored;
+  *     callers must migrate to `ref_audio`/`ref_text`.
++ *   * `language` is passed to v0.10's native CustomVoice language resolver;
++ *     omitted/empty preserves the no-language prefix.
+  *
+  * Concurrency model (unchanged): N worker threads, each bound to ONE slot
+  * (runtime + stateless Code2Wav + CUDA stream). A runtime instance is never
+@@ -296,6 +298,9 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+     req.repetitionPenalty = item.value("repetition_penalty", 1.05f);
+     req.speakerName = item.value("speaker", "");
+     req.speakerId = item.value("speaker_id", -1);
++    // v0.10 already carries CustomVoice language conditioning in the native
++    // TalkerGenerationRequest; this is only the protocol-to-runtime wiring.
++    req.languageName = item.value("language", "");
+ 
+     // v0.10 native Base voice clone: the runtime loads reference audio through
+     // the on-device clone encoders and optionally builds an ICL prompt from its

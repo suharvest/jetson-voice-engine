@@ -1,0 +1,29 @@
+From 56e7aa8ef2d3faad565f4d599dc0634c00b782a2 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 15:03:19 +0800
+Subject: [PATCH 18/40] fix(config): read mixed_precision_with_quant from
+ checkpoint config.json
+
+from_pretrained now parses mixed_precision_with_quant (mirrors mixed_precision)
+so a quantized checkpoint can opt into the INT4 + BF16-residual path via its
+config.json. Default False -> unchanged.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_013XsZpWRubKjuZDyZqx3q4E
+---
+ tensorrt_edgellm/config.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tensorrt_edgellm/config.py b/tensorrt_edgellm/config.py
+index c47bdc2..11b43e2 100644
+--- a/tensorrt_edgellm/config.py
++++ b/tensorrt_edgellm/config.py
+@@ -989,6 +989,8 @@ class ModelConfig:
+             torch_dtype=llm_dict.get("torch_dtype",
+                                      llm_dict.get("dtype", "bfloat16")),
+             mixed_precision=bool(llm_dict.get("mixed_precision", False)),
++            mixed_precision_with_quant=bool(
++                llm_dict.get("mixed_precision_with_quant", False)),
+             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
+             sliding_window_size=sliding_window_size,
+             use_vision_bidirectional_attention=

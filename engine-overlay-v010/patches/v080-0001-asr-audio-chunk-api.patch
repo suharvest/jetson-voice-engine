@@ -1,0 +1,520 @@
+diff --git a/cpp/multimodal/audioRunner.cpp b/cpp/multimodal/audioRunner.cpp
+index cc7d53b..0a871cf 100644
+--- a/cpp/multimodal/audioRunner.cpp
++++ b/cpp/multimodal/audioRunner.cpp
+@@ -337,153 +337,174 @@ bool Qwen3OmniAudioRunner::loadMelSpectrogramFromFile(
+     return true;
+ }
+ 
+-bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
+-    std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
++// Shared per-audio encoder forward pass. Used by:
++//   - preprocessAudio (one-shot path, looped over audioBuffers)
++//   - encodeMelChunk  (streaming path, single chunk)
++// No text/MRope side effects; only fills `mAudioEmbedding` and the encoder's
++// scratch tensors. Bit-exact equivalent of the original inline loop body.
++bool Qwen3OmniAudioRunner::encodeOneAudioImpl(
++    rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream)
+ {
+-    if (audioBuffers.empty())
++    if (!mAudioEngine || !mAudioContext)
+     {
+-        return true;
++        LOG_ERROR("Audio encoder not loaded");
++        return false;
+     }
+ 
+-    if (!mAudioEngine || !mAudioContext)
++    rt::Tensor melSpec;
++
++    // Load pre-computed mel-spectrogram
++    // Audio preprocessing (Mel-spectrogram computation) must be done externally
++    // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
++    if (audio.melSpectrogramPath.empty())
+     {
+-        LOG_ERROR("Audio encoder not loaded");
++        LOG_ERROR(
++            "Pre-computed mel-spectrogram path is required. "
++            "Audio preprocessing must be done externally using Python or other pipelines.");
+         return false;
+     }
+ 
+-    // Process each audio clip
+-    for (auto const& audio : audioBuffers)
++    if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+     {
+-        rt::Tensor melSpec;
++        LOG_ERROR("Failed to load mel-spectrogram from file");
++        return false;
++    }
+ 
+-        // Load pre-computed mel-spectrogram
+-        // Audio preprocessing (Mel-spectrogram computation) must be done externally
+-        // using dedicated audio processing libraries (e.g., librosa, torchaudio) in Python
+-        if (audio.melSpectrogramPath.empty())
+-        {
+-            LOG_ERROR(
+-                "Pre-computed mel-spectrogram path is required. "
+-                "Audio preprocessing must be done externally using Python or other pipelines.");
+-            return false;
+-        }
++    int64_t const timeSteps = melSpec.getShape()[2];
++    LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
+ 
+-        if (!loadMelSpectrogramFromFile(audio.melSpectrogramPath, audio.melSpectrogramFormat, melSpec, stream))
+-        {
+-            LOG_ERROR("Failed to load mel-spectrogram from file");
+-            return false;
+-        }
++    // Preprocess for audio encoder
++    std::vector<int64_t> afterCNNLens;
++    if (!audioUtils::preprocessAudioForEncoder(
++            melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
++    {
++        LOG_ERROR("Failed to preprocess audio for encoder");
++        return false;
++    }
+ 
+-        int64_t const timeSteps = melSpec.getShape()[2];
+-        LOG_DEBUG("Mel-spectrogram shape: [%ld, %ld, %ld]", melSpec.getShape()[0], melSpec.getShape()[1], timeSteps);
++    // Convert mask to indices
++    if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
++    {
++        LOG_ERROR("Failed to convert mask to indices");
++        return false;
++    }
+ 
+-        // Preprocess for audio encoder
+-        std::vector<int64_t> afterCNNLens;
+-        if (!audioUtils::preprocessAudioForEncoder(
+-                melSpec, mConfig.nWindow, mPaddedFeature, mPaddedMaskAfterCNN, afterCNNLens, stream))
+-        {
+-            LOG_ERROR("Failed to preprocess audio for encoder");
+-            return false;
+-        }
++    LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
++        mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
+ 
+-        // Convert mask to indices
+-        if (!audioUtils::convertMaskToIndices(mPaddedMaskAfterCNN, mPaddedMaskIndices, stream))
+-        {
+-            LOG_ERROR("Failed to convert mask to indices");
+-            return false;
+-        }
++    // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
++    if (!audioUtils::createChunkwiseAttentionMask(
++            afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
++    {
++        LOG_ERROR("Failed to create attention mask");
++        return false;
++    }
+ 
+-        LOG_DEBUG("Mask shape: [%ld, %ld], Indices shape: [%ld, %ld]", mPaddedMaskAfterCNN.getShape()[0],
+-            mPaddedMaskAfterCNN.getShape()[1], mPaddedMaskIndices.getShape()[0], mPaddedMaskIndices.getShape()[1]);
++    LOG_DEBUG("Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
+ 
+-        // Create attention mask with merged windows (matching PyTorch cu_seqlens logic)
+-        if (!audioUtils::createChunkwiseAttentionMask(
+-                afterCNNLens, mConfig.nWindow, mConfig.nWindowInfer, mAudioAttentionMask, stream))
+-        {
+-            LOG_ERROR("Failed to create attention mask");
+-            return false;
+-        }
++    // Calculate total audio tokens
++    int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
+ 
+-        LOG_DEBUG(
+-            "Created attention mask [%ld, %ld]", mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1]);
++    // Reshape output buffer
++    if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
++    {
++        LOG_ERROR("Failed to reshape audio output");
++        return false;
++    }
+ 
+-        // Calculate total audio tokens
+-        int64_t const totalAudioTokens = mPaddedMaskIndices.getShape()[0];
++    LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
+ 
+-        // Reshape output buffer
+-        if (!mAudioEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
+-        {
+-            LOG_ERROR("Failed to reshape audio output");
+-            return false;
+-        }
++    // Set input shapes
++    if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set padded features input shape");
++        return false;
++    }
+ 
+-        LOG_DEBUG("Reshaped audio output to [%ld, %d]", totalAudioTokens, mConfig.audioFeatureDim);
++    if (!mAudioContext->setInputShape(
++            binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set padded mask indices input shape");
++        return false;
++    }
+ 
+-        // Set input shapes
+-        if (!mAudioContext->setInputShape(binding_names::kAudioPaddedFeatures, mPaddedFeature.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set padded features input shape");
+-            return false;
+-        }
++    if (!mAudioContext->setInputShape(binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
++    {
++        LOG_ERROR("Failed to set attention mask input shape");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setInputShape(
+-                binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set padded mask indices input shape");
+-            return false;
+-        }
++    // Set tensor addresses
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
++    {
++        LOG_ERROR("Failed to set padded features input address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setInputShape(
+-                binding_names::kAudioAttentionMask, mAudioAttentionMask.getShape().getTRTDims()))
+-        {
+-            LOG_ERROR("Failed to set attention mask input shape");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
++    {
++        LOG_ERROR("Failed to set padded mask indices input address");
++        return false;
++    }
+ 
+-        // Set tensor addresses
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedFeatures, mPaddedFeature.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set padded features input address");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
++    {
++        LOG_ERROR("Failed to set attention mask input address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioPaddedMaskIndices, mPaddedMaskIndices.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set padded mask indices input address");
+-            return false;
+-        }
++    if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
++    {
++        LOG_ERROR("Failed to set audio output address");
++        return false;
++    }
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioAttentionMask, mAudioAttentionMask.rawPointer()))
+-        {
+-            LOG_ERROR("Failed to set attention mask input address");
+-            return false;
+-        }
++    // Execute audio encoder
++    LOG_DEBUG(
++        "Executing audio encoder with shapes: "
++        "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
++        mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
++        mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
++        mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
+ 
+-        if (!mAudioContext->setTensorAddress(binding_names::kAudioOutput, mAudioEmbedding.rawPointer()))
++    {
++        TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
++
++        if (!mAudioContext->enqueueV3(stream))
+         {
+-            LOG_ERROR("Failed to set audio output address");
++            LOG_ERROR("Audio encoder inference failed");
+             return false;
+         }
++    }
+ 
+-        // Execute audio encoder
+-        LOG_DEBUG(
+-            "Executing audio encoder with shapes: "
+-            "input=[%ld,%ld,%ld], indices=[%ld,2], mask=[%ld,%ld], output=[%ld,%ld]",
+-            mPaddedFeature.getShape()[0], mPaddedFeature.getShape()[1], mPaddedFeature.getShape()[2],
+-            mPaddedMaskIndices.getShape()[0], mAudioAttentionMask.getShape()[0], mAudioAttentionMask.getShape()[1],
+-            mAudioEmbedding.getShape()[0], mAudioEmbedding.getShape()[1]);
++    LOG_DEBUG("Audio encoder inference completed");
+ 
+-        {
+-            TIME_STAGE(metrics::StageNames::kAUDIO_ENCODER, stream);
++    outTokens = totalAudioTokens;
++    return true;
++}
+ 
+-            if (!mAudioContext->enqueueV3(stream))
+-            {
+-                LOG_ERROR("Audio encoder inference failed");
+-                return false;
+-            }
+-        }
++bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
++    std::vector<int64_t>& audioTokenLengths, cudaStream_t stream)
++{
++    if (audioBuffers.empty())
++    {
++        return true;
++    }
+ 
+-        LOG_DEBUG("Audio encoder inference completed");
++    if (!mAudioEngine || !mAudioContext)
++    {
++        LOG_ERROR("Audio encoder not loaded");
++        return false;
++    }
+ 
++    // Process each audio clip via the shared per-audio encoder forward pass.
++    for (auto const& audio : audioBuffers)
++    {
++        int64_t totalAudioTokens = 0;
++        if (!encodeOneAudioImpl(audio, totalAudioTokens, stream))
++        {
++            return false;
++        }
+         audioTokenLengths.push_back(totalAudioTokens);
+         mMultimodalMetrics.recordRun(0, 0, 1, totalAudioTokens);
+     }
+@@ -492,6 +513,39 @@ bool Qwen3OmniAudioRunner::preprocessAudio(std::vector<rt::audioUtils::AudioData
+     return true;
+ }
+ 
++// Streaming entry point: encode a single mel chunk via the shared per-audio
++// forward pass, then copy the result into the caller-allocated `outEmbedding`.
++// Does NOT touch text or MRope state — those are handled by the runtime layer
++// (see spec §5 beginAsrSession / appendPrefillChunk).
++bool Qwen3OmniAudioRunner::encodeMelChunk(
++    rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream)
++{
++    int64_t totalAudioTokens = 0;
++    if (!encodeOneAudioImpl(mel, totalAudioTokens, stream))
++    {
++        return false;
++    }
++
++    if (outEmbedding.getDataType() != nvinfer1::DataType::kHALF)
++    {
++        LOG_ERROR("encodeMelChunk: outEmbedding must be FP16 (kHALF)");
++        return false;
++    }
++
++    if (!outEmbedding.reshape({totalAudioTokens, mConfig.audioFeatureDim}))
++    {
++        LOG_ERROR("encodeMelChunk: failed to reshape outEmbedding to [%ld, %d] (allocation too small?)",
++            totalAudioTokens, mConfig.audioFeatureDim);
++        return false;
++    }
++
++    size_t const bytes = static_cast<size_t>(totalAudioTokens) * mConfig.audioFeatureDim * sizeof(half);
++    CUDA_CHECK(cudaMemcpyAsync(
++        outEmbedding.rawPointer(), mAudioEmbedding.rawPointer(), bytes, cudaMemcpyDeviceToDevice, stream));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    return true;
++}
++
+ bool Qwen3OmniAudioRunner::infer([[maybe_unused]] cudaStream_t stream)
+ {
+     LOG_DEBUG("No-op (inference already done in preprocessAudio)");
+@@ -586,5 +640,89 @@ bool Qwen3OmniAudioRunner::initializeSequentialMRopeCache(
+     return true;
+ }
+ 
++bool Qwen3OmniAudioRunner::initializeSequentialMRopeLane(
++    int32_t lane, int32_t maxPositions, rt::Tensor& mropeCosSin, cudaStream_t stream)
++{
++    if (mConfig.mropeTheta <= 0.0F)
++    {
++        // Not an MRope model, nothing to do.
++        return true;
++    }
++
++    // The shared PipelineIO::mropeCosSin keeps its full [maxBatch, maxPositionEmbeddings,
++    // rotaryDim] shape — we MUST NOT reshape it here (other lanes share the buffer). Read
++    // the per-lane geometry directly from the live shape.
++    auto const ropeShape = mropeCosSin.getShape();
++    if (ropeShape.getNumDims() != 3)
++    {
++        LOG_ERROR("initializeSequentialMRopeLane: mropeCosSin has unexpected rank %d (want 3)",
++            ropeShape.getNumDims());
++        return false;
++    }
++    int64_t const maxBatch = ropeShape[0];
++    int64_t const maxPositionEmbeddings = ropeShape[1];
++    int64_t const rotaryDim = ropeShape[2];
++
++    if (lane < 0 || static_cast<int64_t>(lane) >= maxBatch)
++    {
++        LOG_ERROR("initializeSequentialMRopeLane: lane=%d out of range [0, %ld)", lane, maxBatch);
++        return false;
++    }
++
++    if (maxPositions > maxPositionEmbeddings)
++    {
++        LOG_ERROR(
++            "initializeSequentialMRopeLane: maxPositions=%d exceeds MRope cache capacity "
++            "(maxPositionEmbeddings=%ld); rebuild thinker engine with larger capacity.",
++            maxPositions, maxPositionEmbeddings);
++        return false;
++    }
++
++    // Build host position IDs for a SINGLE lane: [1, 3, maxPositionEmbeddings].
++    // For audio+text only, all 3 dimensions (T, H, W) use identical sequential
++    // positions [0, 1, 2, ...] — same layout as the one-shot path.
++    int64_t const numElements = 3 * maxPositionEmbeddings;
++    std::vector<int64_t> positionIdsHost(numElements);
++    for (int64_t dim = 0; dim < 3; ++dim)
++    {
++        for (int64_t pos = 0; pos < maxPositionEmbeddings; ++pos)
++        {
++            positionIdsHost[dim * maxPositionEmbeddings + pos] = pos;
++        }
++    }
++
++    rt::Tensor positionIdsDevice({1, 3, maxPositionEmbeddings}, rt::DeviceType::kGPU, nvinfer1::DataType::kINT64,
++        "sequentialMRopeLanePositionIds");
++    CUDA_CHECK(cudaMemcpyAsync(positionIdsDevice.rawPointer(), positionIdsHost.data(), numElements * sizeof(int64_t),
++        cudaMemcpyHostToDevice, stream));
++
++    // Target only this lane's contiguous slab of the shared cache: each batch row is
++    // maxPositionEmbeddings * rotaryDim floats, laid out contiguously (verified against the
++    // one-shot path's [activeBatchSize, maxPositionEmbeddings, rotaryDim] layout). Launch
++    // the kernel with batchSize=1 over the offset pointer — NO reshape of the shared buffer.
++    float* const laneCosSin = mropeCosSin.dataPointer<float>() + static_cast<int64_t>(lane) * maxPositionEmbeddings * rotaryDim;
++
++    // All audio+text MRope models (Qwen3-ASR, Qwen3-Omni) use interleaved layout.
++    bool constexpr interleaved = true;
++    try
++    {
++        kernel::initializeMRopeCosSin(laneCosSin, positionIdsDevice.dataPointer<int64_t>(), mConfig.mropeTheta,
++            rotaryDim, maxPositionEmbeddings, /*batchSize=*/1, interleaved, mConfig.mropeSectionH, mConfig.mropeSectionW,
++            stream);
++    }
++    catch (std::exception const& e)
++    {
++        LOG_ERROR("initializeSequentialMRopeLane: kernel launch failed: %s", e.what());
++        return false;
++    }
++
++    // Synchronize to ensure kernel completes before local positionIdsDevice is freed.
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    LOG_INFO("Initialized sequential MRope cos/sin cache for lane %d, %ld positions (maxPositions=%d)", lane,
++        maxPositionEmbeddings, maxPositions);
++
++    return true;
++}
++
+ } // namespace rt
+ } // namespace trt_edgellm
+diff --git a/cpp/multimodal/audioRunner.h b/cpp/multimodal/audioRunner.h
+index 1d87729..72f5181 100644
+--- a/cpp/multimodal/audioRunner.h
++++ b/cpp/multimodal/audioRunner.h
+@@ -102,6 +102,44 @@ public:
+     bool preprocessSystemPrompt(std::string const& systemPrompt, tokenizer::Tokenizer const* tokenizer,
+         rt::OptionalOutputTensor mropeCosSinOut, cudaStream_t stream) override;
+ 
++    //! \brief Encode a single mel-spectrogram chunk to audio embeddings (streaming entry point).
++    //! \details Thin public wrapper over the shared per-audio encoder forward path
++    //!          (`encodeOneAudioImpl`). Does NOT touch text tokens or MRope state — the
++    //!          streaming runtime drives token packing / MRope separately (see spec §5
++    //!          beginAsrSession / appendPrefillChunk). The one-shot `preprocess` /
++    //!          `preprocessAudio` paths are preserved bit-exact and unchanged.
++    //! \param[in]  mel          AudioData describing the mel chunk (must carry
++    //!                          `melSpectrogramPath`/`melSpectrogramFormat`; PCM is out of scope).
++    //! \param[out] outEmbedding Caller-allocated GPU half-precision tensor. Reshaped on
++    //!                          success to [audio_tokens_this_chunk, audioFeatureDim] and
++    //!                          populated by a device-to-device copy of the encoder output.
++    //!                          Caller must size the underlying allocation big enough — the
++    //!                          function only reshapes within the existing capacity.
++    //! \param[in]  stream       CUDA stream for execution.
++    //! \return True on success, false otherwise.
++    bool encodeMelChunk(rt::audioUtils::AudioData const& mel, rt::Tensor& outEmbedding, cudaStream_t stream);
++
++    //! \brief Initialize the MRope cos/sin cache for ONE batch lane of a streaming ASR session.
++    //! \details Session-scoped, single-row variant of `initializeSequentialMRopeCache`
++    //!          (spec §5 R3). Unlike the one-shot path, this does NOT reshape the shared
++    //!          `PipelineIO::mropeCosSin` buffer — the buffer keeps its full
++    //!          `[maxBatch, maxKVCacheCapacity, rotaryDim]` shape so concurrent lanes stay
++    //!          intact. Only the slab for `lane` is (re)written, using the same sequential
++    //!          T=H=W position-id layout the one-shot path uses, so a per-lane session init
++    //!          here is interchangeable with the one-shot init for that lane. Call once per
++    //!          session at begin-time; per-chunk `encodeMelChunk` calls never touch MRope.
++    //! \param[in]      lane          Batch lane (row) to initialize, in [0, mropeCosSin.shape[0]).
++    //! \param[in]      maxPositions  Upper bound on cumulative audio+text positions for this
++    //!                               session. Validated against the cache's maxPositionEmbeddings
++    //!                               so a session that would outgrow the cache fails fast at
++    //!                               begin-time instead of corrupting MRope mid-session.
++    //! \param[in,out]  mropeCosSin   The shared `PipelineIO::mropeCosSin` cache tensor, shape
++    //!                               `[maxBatch, maxPositionEmbeddings, rotaryDim]` FP32.
++    //! \param[in]      stream        CUDA stream.
++    //! \return True on success (or no-op for non-MRope models), false on failure.
++    bool initializeSequentialMRopeLane(
++        int32_t lane, int32_t maxPositions, rt::Tensor& mropeCosSin, cudaStream_t stream) override;
++
+ private:
+     //! \brief Preprocess audio buffers and run encoder inference
+     //! \param[in] audioBuffers Input audio data with mel-spectrogram paths or waveforms
+@@ -111,6 +149,18 @@ private:
+     bool preprocessAudio(std::vector<rt::audioUtils::AudioData> const& audioBuffers,
+         std::vector<int64_t>& audioTokenLengths, cudaStream_t stream);
+ 
++    //! \brief Encode a single audio clip to `mAudioEmbedding` via the encoder TRT context.
++    //! \details Shared body for both `preprocessAudio` (one-shot, looped per buffer) and
++    //!          `encodeMelChunk` (streaming, single buffer). Performs only the encoder
++    //!          forward pass — no text/MRope side effects. On success `mAudioEmbedding` is
++    //!          reshaped to [outTokens, audioFeatureDim] and `outTokens` carries that count.
++    //!          Bit-exact equivalent of the original inline `preprocessAudio` loop body.
++    //! \param[in]  audio      Single audio clip (mel-spectrogram path).
++    //! \param[out] outTokens  Number of audio tokens produced for this clip.
++    //! \param[in]  stream     CUDA stream.
++    //! \return True on success, false otherwise.
++    bool encodeOneAudioImpl(rt::audioUtils::AudioData const& audio, int64_t& outTokens, cudaStream_t stream);
++
+     //! \brief Tokenize text and insert audio tokens
+     //! \param[in] request LLM generation request
+     //! \param[out] batchInputIds Batched input IDs after tokenization and audio token insertion
+diff --git a/cpp/multimodal/multimodalRunner.h b/cpp/multimodal/multimodalRunner.h
+index aad887a..68afac9 100644
+--- a/cpp/multimodal/multimodalRunner.h
++++ b/cpp/multimodal/multimodalRunner.h
+@@ -127,6 +127,26 @@ public:
+         [[maybe_unused]] tokenizer::Tokenizer const* tokenizer,
+         [[maybe_unused]] rt::OptionalOutputTensor mropeCosSinOut, [[maybe_unused]] cudaStream_t stream);
+ 
++    /*!
++     * @brief Initialize the MRope cos/sin cache for ONE batch lane of a streaming ASR session.
++     * @details Default implementation is a no-op (returns true). MRope-based audio runners
++     *          (e.g. Qwen3OmniAudioRunner) override this to fill a single lane row of the
++     *          shared `PipelineIO::mropeCosSin` cache once at session start, WITHOUT reshaping
++     *          the shared buffer, so per-chunk encoder calls never touch MRope state and
++     *          concurrent lanes stay intact (spec §5 R3).
++     * @param lane          Batch lane (row) to initialize.
++     * @param maxPositions  Upper bound on cumulative positions for this session (validated
++     *                      against the cache's maxPositionEmbeddings).
++     * @param mropeCosSin   The shared `PipelineIO::mropeCosSin` cache tensor.
++     * @param stream        CUDA stream.
++     * @return True on success (or no-op), false on failure.
++     */
++    virtual bool initializeSequentialMRopeLane([[maybe_unused]] int32_t lane, [[maybe_unused]] int32_t maxPositions,
++        [[maybe_unused]] rt::Tensor& mropeCosSin, [[maybe_unused]] cudaStream_t stream)
++    {
++        return true;
++    }
++
+     /*!
+      * @brief Run multimodal inference
+      * @param stream CUDA stream

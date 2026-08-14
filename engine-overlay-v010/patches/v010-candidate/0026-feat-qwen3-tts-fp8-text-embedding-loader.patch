@@ -1,0 +1,213 @@
+From 87ae76ec75f9d24e11d308a147baa76a91144ffa Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 14 Aug 2026 22:05:58 +0800
+Subject: [PATCH] support standalone qwen3 tts fp8 text embeddings
+
+Signed-off-by: suharvest <suharvest@gmail.com>
+---
+ cpp/runtime/qwen3OmniTTSRuntime.cpp    | 60 ++++++++++++++++++++++----
+ cpp/runtime/qwen3OmniTTSRuntime.h      |  5 +++
+ scripts/quantize_text_embedding_fp8.py | 57 ++++++++++++++++++++++++
+ 3 files changed, 113 insertions(+), 9 deletions(-)
+ create mode 100644 scripts/quantize_text_embedding_fp8.py
+
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 4a6c14e..e82674a 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -211,11 +211,39 @@ Qwen3OmniTTSRuntime::Qwen3OmniTTSRuntime(std::string const& talkerEngineDir, std
+         bool const textEmbedLoaded = safetensors::loadSafetensors(textEmbedPath, textEmbedTensors, stream);
+         ELLM_CHECK(textEmbedLoaded, "Failed to load text embedding from: " + textEmbedPath.string());
+         check::check(!textEmbedTensors.empty(), "text embedding file is empty");
+-        check::check(textEmbedTensors[0].getShape().getNumDims() == 2,
++        // Standalone Qwen3-TTS may carry a FP8 E4M3 table plus FP32 per-group
++        // scales. loadSafetensors does not promise key ordering here, so
++        // classify by dtype. Plain FP16 files retain the upstream path.
++        int tableIdx = -1;
++        int scalesIdx = -1;
++        for (size_t i = 0; i < textEmbedTensors.size(); ++i)
++        {
++            auto const dtype = textEmbedTensors[i].getDataType();
++            if (dtype == nvinfer1::DataType::kHALF || dtype == nvinfer1::DataType::kFP8)
++            {
++                tableIdx = static_cast<int>(i);
++            }
++            else if (dtype == nvinfer1::DataType::kFLOAT)
++            {
++                scalesIdx = static_cast<int>(i);
++            }
++        }
++        check::check(tableIdx >= 0, "text embedding file has no FP16/FP8 table tensor");
++        check::check(textEmbedTensors[tableIdx].getShape().getNumDims() == 2,
+             "text embedding tensor should be 2D [vocabSize, hiddenSize]");
+-        mTextEmbeddingTable = std::move(textEmbedTensors[0]);
+-        LOG_INFO("Text embedding table loaded: [%lld, %lld]", mTextEmbeddingTable.getShape()[0],
+-            mTextEmbeddingTable.getShape()[1]);
++        mTextEmbeddingIsFp8 = textEmbedTensors[tableIdx].getDataType() == nvinfer1::DataType::kFP8;
++        if (mTextEmbeddingIsFp8)
++        {
++            check::check(scalesIdx >= 0, "FP8 text embedding requires an FP32 scales tensor in the same file");
++            check::check(textEmbedTensors[scalesIdx].getShape().getNumDims() == 2,
++                "text embedding scales should be 2D [vocabSize, hiddenSize/blockSize]");
++            check::check(textEmbedTensors[scalesIdx].getShape()[0] == textEmbedTensors[tableIdx].getShape()[0],
++                "text embedding scales vocab dimension must match table");
++            mTextEmbeddingScales = std::move(textEmbedTensors[scalesIdx]);
++        }
++        mTextEmbeddingTable = std::move(textEmbedTensors[tableIdx]);
++        LOG_INFO("Text embedding table loaded: [%lld, %lld] (%s)", mTextEmbeddingTable.getShape()[0],
++            mTextEmbeddingTable.getShape()[1], mTextEmbeddingIsFp8 ? "FP8+scales" : "FP16");
+     }
+ 
+     // Note: mTalkerEmbeddingTable is loaded by loadTalkerWeights() above.
+@@ -1103,7 +1131,7 @@ void Qwen3OmniTTSRuntime::initializeTTSEmbeddings(cudaStream_t stream)
+     CUDA_CHECK(cudaMemcpyAsync(
+         ttsIds.rawPointer(), hostTtsIds.data(), kNumTtsTokens * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+ 
+-    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, std::nullopt, ttsRaw, stream);
++    kernel::embeddingLookup(ttsIds, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), ttsRaw, stream);
+     // Reshape from [1, 3, hidden] to [3, hidden] for MLP (expects 2D input)
+     check::check(ttsRaw.reshape({kNumTtsTokens, thinkerHiddenSize}), "Tensor reshape failed");
+     if (isOmniNext())
+@@ -1544,7 +1572,8 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
+     CUDA_CHECK(cudaMemcpyAsync(mGpuTokenIdsBuffer.rawPointer(), combinedIds.data(), combinedLen * sizeof(int32_t),
+         cudaMemcpyHostToDevice, stream));
+     check::check(mThinkerEmbedBuffer.reshape({1, combinedLen, thinkerHiddenSize}), "Tensor reshape failed");
+-    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, std::nullopt, mThinkerEmbedBuffer, stream);
++    kernel::embeddingLookup(mGpuTokenIdsBuffer, mTextEmbeddingTable, scalesFor(mTextEmbeddingTable), mThinkerEmbedBuffer,
++        stream);
+     check::check(mThinkerEmbedBuffer.reshape({combinedLen, thinkerHiddenSize}), "Tensor reshape failed");
+ 
+     // Determine speaker ID (unused for VoiceDesign — its prefix has no speaker row).
+@@ -3074,7 +3103,8 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
+             __half* genDst = static_cast<__half*>(mThinkerEmbedBuffer.rawPointer()) + copyLen * thinkerHiddenSize;
+             rt::Tensor genEmbedView(genDst, rt::Coords{1, static_cast<int64_t>(genLen), thinkerHiddenSize},
+                 rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+-            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, genEmbedView, stream);
++            kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), genEmbedView,
++                stream);
+         }
+     }
+     else
+@@ -3084,7 +3114,7 @@ bool Qwen3OmniTTSRuntime::buildTalkerPrefillFromSegments(std::vector<int32_t> co
+             cudaMemcpyHostToDevice, stream));
+         rt::Tensor embedView(mThinkerEmbedBuffer.rawPointer(), rt::Coords{1, seqLen, thinkerHiddenSize},
+             rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+-        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, std::nullopt, embedView, stream);
++        kernel::embeddingLookup(mGpuTokenIdsBuffer, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
+     }
+ 
+     // Step 2: Project ALL tokens through text_projection (Qwen3-Omni: 2-layer MLP) or
+@@ -4125,6 +4155,18 @@ bool Qwen3OmniTTSRuntime::reprefillQwen3OmniNextChunk(int32_t batchIdx,
+ //        Incremental Trailing Hidden Helpers (for streaming)
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
++rt::OptionalInputTensor Qwen3OmniTTSRuntime::scalesFor(rt::Tensor const& table) const
++{
++    // Only the standalone text table is allowed to use the local FP8 sidecar.
++    // Keying on dtype also works for the short-lived views used by the streaming
++    // path, while all normal FP16/codec tables retain std::nullopt.
++    if (mTextEmbeddingIsFp8 && table.getDataType() == nvinfer1::DataType::kFP8)
++    {
++        return std::cref(mTextEmbeddingScales);
++    }
++    return std::nullopt;
++}
++
+ void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable,
+     rt::Tensor& trailingTextHidden, int32_t trailingIdx, cudaStream_t stream)
+ {
+@@ -4138,7 +4180,7 @@ void Qwen3OmniTTSRuntime::appendTrailingToken(int32_t tokenId, rt::Tensor const&
+     // embeddingLookup expects [1, 1, H] output; mStreamingTokenEmbed is [1, H] — same memory, just reshape for kernel
+     rt::Tensor embedView(mStreamingTokenEmbed.rawPointer(), rt::Coords{1, 1, mTalkerConfig.thinkerHiddenSize},
+         rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
+-    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, std::nullopt, embedView, stream);
++    kernel::embeddingLookup(mStreamingTokenId, thinkerEmbedTable, scalesFor(thinkerEmbedTable), embedView, stream);
+ 
+     // text_projection: mStreamingTokenEmbed [1, thinkerH] → mStreamingProjOut [1, talkerH].
+     // Qwen3-Next Omni Talker has its own embed_tokens at talker hidden dim, so just copy.
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index c8a5366..3d1bfdf 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -930,6 +930,8 @@ private:
+ 
+     // ========== Embedding Tables ==========
+     rt::Tensor mTextEmbeddingTable; //!< Text embedding table [thinkerVocabSize, thinkerHiddenSize] (for standalone TTS)
++    rt::Tensor mTextEmbeddingScales; //!< FP8 per-group scales [vocabSize, hiddenSize/blockSize] (empty for FP16)
++    bool mTextEmbeddingIsFp8{false}; //!< true when the standalone text table is FP8 E4M3
+     rt::Tensor mTalkerEmbeddingTable; //!< Talker LLM embedding table [vocabSize, hiddenSize]
+     std::vector<rt::Tensor>
+         mCodePredictorEmbeddingTables; //!< CodePredictor embedding tables (mNumRvqLayers) [codebookSize, hiddenSize]
+@@ -1074,6 +1076,9 @@ private:
+     void appendTrailingToken(int32_t tokenId, rt::Tensor const& thinkerEmbedTable, rt::Tensor& trailingTextHidden,
+         int32_t trailingIdx, cudaStream_t stream);
+ 
++    //! Return scales for the FP8 standalone text table; all FP16/codec tables use no scales.
++    rt::OptionalInputTensor scalesFor(rt::Tensor const& table) const;
++
+     /*!
+      * @brief Append tts_eos embedding at the end of trailingTextHidden
+      */
+diff --git a/scripts/quantize_text_embedding_fp8.py b/scripts/quantize_text_embedding_fp8.py
+new file mode 100644
+index 0000000..1c00def
+--- /dev/null
++++ b/scripts/quantize_text_embedding_fp8.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Quantize a standalone Qwen3-TTS text embedding table to FP8 E4M3.
++
++The v0.10 generic ``--fp8-embedding`` option targets LLM thinker
++``embedding.safetensors``. Qwen3-TTS keeps its table in
++``text_embedding.safetensors`` and is exported through a separate component
++path, so this small utility writes the same two-dtype sidecar consumed by the
++native TTS runtime: an FP8 table and FP32 per-row block scales.
++
++Usage::
++
++    python scripts/quantize_text_embedding_fp8.py input.safetensors output.safetensors
++"""
++
++from __future__ import annotations
++
++import argparse
++
++import torch
++from safetensors.torch import load_file, save_file
++
++
++FP8_MAX = 448.0
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("input")
++    parser.add_argument("output")
++    parser.add_argument("--key", default="text_embedding")
++    parser.add_argument("--block", type=int, default=128)
++    args = parser.parse_args()
++
++    tensors = load_file(args.input)
++    key = args.key if args.key in tensors else next(iter(tensors))
++    weight = tensors[key].to(torch.float32)
++    if weight.ndim != 2:
++        raise ValueError(f"expected 2D text embedding table, got {tuple(weight.shape)}")
++    vocab, hidden = weight.shape
++    if args.block <= 0 or hidden % args.block:
++        raise ValueError(f"hidden size {hidden} must be divisible by block {args.block}")
++    if args.block % 16:
++        raise ValueError("block must be a multiple of 16 for the FP8 vectorized loader")
++
++    groups = hidden // args.block
++    grouped = weight.reshape(vocab, groups, args.block)
++    scales = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / FP8_MAX
++    quantized = (grouped / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
++    table = quantized.reshape(vocab, hidden).contiguous()
++    scales = scales.reshape(vocab, groups).to(torch.float32).contiguous()
++
++    save_file({"text_embedding": table, "text_embedding_scales": scales}, args.output)
++    print(f"wrote {args.output}: table={tuple(table.shape)} scales={tuple(scales.shape)} block={args.block}")
++
++
++if __name__ == "__main__":
++    main()

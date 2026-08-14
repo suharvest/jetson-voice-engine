@@ -1,0 +1,277 @@
+From d74e35bc9f159320106ec1e038357c3ad63203e8 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Fri, 3 Jul 2026 18:59:56 +0800
+Subject: [PATCH 23/38] refactor(config): rename mixed_precision ->
+ bf16_residual (avoid upstream name clash)
+
+Upstream v0.9.0 uses 'mixed_precision' as a per-layer quantization concept
+(QUANT_MIXED, QuantConfig.is_mixed_precision, _parse_mixed_precision). Rename
+our BF16-residual / FP16-attention opt-in to bf16_residual so the two features
+cannot be confused:
+
+  ModelConfig.mixed_precision            -> bf16_residual
+  ModelConfig.mixed_precision_with_quant -> bf16_residual_with_quant
+  mixed_precision_active                 -> bf16_residual_active
+  config.json / llm_dict keys, docstrings, comments and our test file follow.
+
+Upstream quantization symbols are untouched.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+diff --git a/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h b/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
+index 381045f..21a8fdd 100644
+--- a/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
++++ b/cpp/kernels/int4GroupwiseGemmKernels/int4GroupwiseGemm.h
+@@ -60,7 +60,7 @@ void gemv_forward_cuda_new(half const* in_feats, int8_t const* kernel, half cons
+  * FP16 overflow when an output channel's pre-activation magnitude exceeds the FP16
+  * range (max 65504) — e.g. SparkTTS/Qwen down_proj output channel 62 (~2.3e5). The
+  * existing FP16 path is left untouched; callers opt into this variant only for
+- * overflow-prone linears under config.mixed_precision.
++ * overflow-prone linears under config.bf16_residual.
+  *
+  * @param out_feats Output features [M, N] in BF16
+  */
+diff --git a/tensorrt_edgellm/config.py b/tensorrt_edgellm/config.py
+index 013db47..1c785b7 100644
+--- a/tensorrt_edgellm/config.py
++++ b/tensorrt_edgellm/config.py
+@@ -494,15 +494,15 @@ class ModelConfig:
+     # Default False -> behaviour is byte-identical to the legacy FP16 path; no
+     # existing model is affected unless it opts in. Ignored when the backbone is
+     # quantized (FP8/NVFP4/AWQ/...): those paths keep their own dtype contract.
+-    mixed_precision: bool = False
++    bf16_residual: bool = False
+     # Opt-in: allow the mixed-precision hybrid graph to coexist with a quantized
+-    # backbone.  Default False keeps the legacy contract (mixed_precision is
++    # backbone.  Default False keeps the legacy contract (bf16_residual is
+     # ignored when quantized).  When True AND quant is INT4-AWQ, the residual
+     # stream / RMSNorm run BF16, attention q/k/v/o stay FP16 (unquantized), and
+     # the MLP runs INT4 weights with the down_proj emitting BF16 output (the
+     # overflow-safe path).  Only honoured for INT4-AWQ; FP8/NVFP4/MXFP8 linears
+     # require FP16 input and are left on the legacy path.
+-    mixed_precision_with_quant: bool = False
++    bf16_residual_with_quant: bool = False
+     # When True, embed_tokens and lm_head share the same weight tensor
+     tie_word_embeddings: bool = False
+     # Sliding window attention size; -1 means no sliding window.
+@@ -725,20 +725,20 @@ class ModelConfig:
+         return c
+ 
+     @property
+-    def mixed_precision_active(self) -> bool:
++    def bf16_residual_active(self) -> bool:
+         """True when the generic BF16-residual / FP16-attention hybrid path is on.
+ 
+-        Honoured for an unquantized backbone, or — when ``mixed_precision_with_quant``
++        Honoured for an unquantized backbone, or — when ``bf16_residual_with_quant``
+         is explicitly opted in — for an INT4-AWQ backbone (residual/MLP BF16,
+         attention FP16 unquantized, down_proj INT4+BF16-output).  FP8/NVFP4/MXFP8
+         linears require FP16 input and are always left on the legacy FP16 path even
+-        if ``mixed_precision`` is requested.
++        if ``bf16_residual`` is requested.
+         """
+-        if not self.mixed_precision:
++        if not self.bf16_residual:
+             return False
+         if not self.quant.is_quantized:
+             return True
+-        return (bool(self.mixed_precision_with_quant) and self.quant.quant_type
++        return (bool(self.bf16_residual_with_quant) and self.quant.quant_type
+                 in (QUANT_INT4_AWQ, QUANT_INT4_AWQ_MODELOPT))
+ 
+     @property
+@@ -748,7 +748,7 @@ class ModelConfig:
+         BF16 in mixed-precision mode, FP16 otherwise (legacy default).
+         """
+         import torch
+-        return torch.bfloat16 if self.mixed_precision_active else torch.float16
++        return torch.bfloat16 if self.bf16_residual_active else torch.float16
+ 
+     @property
+     def attention_dtype(self) -> "torch.dtype":  # noqa: F821
+@@ -902,9 +902,9 @@ class ModelConfig:
+                                                  None),
+             torch_dtype=llm_dict.get("torch_dtype",
+                                      llm_dict.get("dtype", "bfloat16")),
+-            mixed_precision=bool(llm_dict.get("mixed_precision", False)),
+-            mixed_precision_with_quant=bool(
+-                llm_dict.get("mixed_precision_with_quant", False)),
++            bf16_residual=bool(llm_dict.get("bf16_residual", False)),
++            bf16_residual_with_quant=bool(
++                llm_dict.get("bf16_residual_with_quant", False)),
+             tie_word_embeddings=llm_dict.get("tie_word_embeddings", False),
+             sliding_window_size=sliding_window_size,
+             layer_types=layer_types,
+diff --git a/tensorrt_edgellm/models/default/modeling_default.py b/tensorrt_edgellm/models/default/modeling_default.py
+index b54b41d..aa070be 100644
+--- a/tensorrt_edgellm/models/default/modeling_default.py
++++ b/tensorrt_edgellm/models/default/modeling_default.py
+@@ -383,7 +383,7 @@ class DecoderLayer(nn.Module):
+         # mixed-precision mode, FP16 otherwise).
+         residual_dtype = config.residual_dtype
+         self.attention_dtype = config.attention_dtype
+-        self.mixed_precision = config.mixed_precision_active
++        self.bf16_residual = config.bf16_residual_active
+         self.input_layernorm = RMSNorm(config.hidden_size,
+                                        config.rms_norm_eps,
+                                        dtype=residual_dtype)
+@@ -403,7 +403,7 @@ class DecoderLayer(nn.Module):
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         residual = hidden_states
+         normed = self.input_layernorm(hidden_states)
+-        if self.mixed_precision:
++        if self.bf16_residual:
+             # Cast the normed residual into the FP16 attention island. The
+             # attention block (q/k/v/o_proj, RoPE, SDPA, KV cache) runs FP16;
+             # its output is cast back to the BF16 residual stream below.
+@@ -417,7 +417,7 @@ class DecoderLayer(nn.Module):
+             attention_mask=attention_mask,
+             attention_pos_id=attention_pos_id,
+         )
+-        if self.mixed_precision:
++        if self.bf16_residual:
+             # Boundary Cast FP16 -> BF16 before the residual add.
+             attn_output = attn_output.to(residual.dtype)
+         hidden_states = residual + attn_output
+@@ -462,7 +462,7 @@ class Transformer(nn.Module):
+         self.norm = RMSNorm(config.hidden_size,
+                             config.rms_norm_eps,
+                             dtype=config.residual_dtype)
+-        self.mixed_precision = config.mixed_precision_active
++        self.bf16_residual = config.bf16_residual_active
+         self.residual_dtype = config.residual_dtype
+         # Populated at the end of each forward; see module docstring.
+         self.last_pre_norm_hidden_states: "torch.Tensor | None" = None
+@@ -481,7 +481,7 @@ class Transformer(nn.Module):
+         dflash_target_layer_ids: "List[int] | None" = None,
+     ) -> Tuple[torch.Tensor, Tuple, "Tuple | None", "torch.Tensor | None"]:
+         hidden_states = inputs_embeds
+-        if self.mixed_precision:
++        if self.bf16_residual:
+             # Engine input is FP16; upcast the residual stream to BF16 here so
+             # the whole decoder runs the mixed-precision graph. This single
+             # leading Cast keeps the inputs_embeds binding FP16 (no C++ change).
+diff --git a/tensorrt_edgellm/models/linear.py b/tensorrt_edgellm/models/linear.py
+index 1126823..f549610 100644
+--- a/tensorrt_edgellm/models/linear.py
++++ b/tensorrt_edgellm/models/linear.py
+@@ -187,7 +187,7 @@ class BF16Linear(nn.Module):
+     """Plain bfloat16 linear (mixed-precision residual / MLP / lm_head path).
+ 
+     Identical to :class:`FP16Linear` but in bfloat16.  Used only when
+-    ``config.mixed_precision_active`` selects the BF16 residual stream so the
++    ``config.bf16_residual_active`` selects the BF16 residual stream so the
+     MLP and lm_head matmuls accumulate in BF16, avoiding the FP16 overflow that
+     the legacy path hits on the residual stream.  Activations must be bfloat16.
+     """
+@@ -527,7 +527,7 @@ class AWQLinear(LinearBase):
+         self.out_features = out_features
+         self.group_size = group_size
+         # Opt-in: emit BF16 output (overflow-safe down_proj path under
+-        # mixed_precision_with_quant). Default False -> FP16, byte-identical.
++        # bf16_residual_with_quant). Default False -> FP16, byte-identical.
+         self.output_bf16 = output_bf16
+         # Initialized in AWQ layout [in, out//8] int32; loader repacks to
+         # [out//2, in] int8 (swizzled plugin layout) before inference/export.
+@@ -599,7 +599,7 @@ class ModelOptAWQPrepackedLinear(LinearBase):
+         self.out_features = out_features
+         self.group_size = group_size
+         # Opt-in BF16 output (overflow-safe down_proj path under
+-        # mixed_precision_with_quant). Default False -> FP16, byte-identical.
++        # bf16_residual_with_quant). Default False -> FP16, byte-identical.
+         self.output_bf16 = output_bf16
+         # Loaded from checkpoint as uint8; cast to int8 by the loader.
+         self.register_buffer(
+@@ -838,9 +838,9 @@ def make_linear(
+     if quant_type == QUANT_FP16:
+         # Mixed-precision: the residual-stream linears (MLP, lm_head) run in
+         # BF16 while the attention projections (q/k/v/o_proj) stay FP16.  This
+-        # is purely additive — without ``mixed_precision_active`` every
++        # is purely additive — without ``bf16_residual_active`` every
+         # unquantized linear is FP16, exactly as before.
+-        if config.mixed_precision_active and not _is_attention_projection(
++        if config.bf16_residual_active and not _is_attention_projection(
+                 module_name):
+             layer = BF16Linear(in_features, out_features, bias)
+         else:
+@@ -855,7 +855,7 @@ def make_linear(
+         # MLP down_proj is the overflow-prone linear, so emit BF16 output for it
+         # (gate/up stay FP16 for the SwiGLU mul). Attention projections are
+         # excluded by construction (they are FP16 unquantized here).
+-        output_bf16 = (config.mixed_precision_active
++        output_bf16 = (config.bf16_residual_active
+                        and module_name.endswith(".down_proj")
+                        and not _is_attention_projection(module_name))
+         layer = AWQLinear(in_features,
+@@ -864,7 +864,7 @@ def make_linear(
+                           bias,
+                           output_bf16=output_bf16)
+     elif quant_type == QUANT_INT4_AWQ_MODELOPT:
+-        output_bf16 = (config.mixed_precision_active
++        output_bf16 = (config.bf16_residual_active
+                        and module_name.endswith(".down_proj")
+                        and not _is_attention_projection(module_name))
+         layer = ModelOptAWQPrepackedLinear(in_features,
+diff --git a/tensorrt_edgellm/onnx/export.py b/tensorrt_edgellm/onnx/export.py
+index 975b9e5..9db1a63 100644
+--- a/tensorrt_edgellm/onnx/export.py
++++ b/tensorrt_edgellm/onnx/export.py
+@@ -785,7 +785,7 @@ def _export_model(
+                                         "match_fp32_elementwise_initializers",
+                                         False)),
+                             match_consumer_float_dtype=bool(
+-                                getattr(model.config, "mixed_precision_active",
++                                getattr(model.config, "bf16_residual_active",
+                                         False)))
+     _strip_attention_plugin_optional_inputs(output_path)
+     external_weight_files = externalize_model_weights(
+diff --git a/tests/test_mixed_precision_int4.py b/tests/test_bf16_residual_int4.py
+similarity index 92%
+rename from tests/test_mixed_precision_int4.py
+rename to tests/test_bf16_residual_int4.py
+index 8a92df8..55213e5 100644
+--- a/tests/test_mixed_precision_int4.py
++++ b/tests/test_bf16_residual_int4.py
+@@ -6,7 +6,7 @@ Covers the opt-in dtype routing that lets an INT4-AWQ backbone coexist with the
+ BF16-residual / FP16-attention mixed-precision graph, with the MLP down_proj
+ emitting BF16 output (so its overflow-prone activation never lands in FP16):
+ 
+-  * ``config.mixed_precision_active`` truth table
++  * ``config.bf16_residual_active`` truth table
+   * ``make_linear`` routes down_proj -> AWQLinear(output_bf16=True); gate/up stay
+     FP16; behaviour is byte-identical without the opt-in flag
+   * ``int4_groupwise_gemm`` op returns BF16 only when output_dtype='bfloat16'
+@@ -24,7 +24,7 @@ from tensorrt_edgellm.models import linear as L
+ from tensorrt_edgellm.models.ops import int4_groupwise_gemm
+ 
+ 
+-def _cfg(mixed_precision, quant_type, with_quant):
++def _cfg(bf16_residual, quant_type, with_quant):
+     return ModelConfig(
+         model_type="qwen2",
+         hidden_size=896,
+@@ -38,8 +38,8 @@ def _cfg(mixed_precision, quant_type, with_quant):
+         rope_theta=1000000.0,
+         max_position_embeddings=32768,
+         quant=QuantConfig(quant_type=quant_type, group_size=128),
+-        mixed_precision=mixed_precision,
+-        mixed_precision_with_quant=with_quant,
++        bf16_residual=bf16_residual,
++        bf16_residual_with_quant=with_quant,
+     )
+ 
+ 
+@@ -53,8 +53,8 @@ def _cfg(mixed_precision, quant_type, with_quant):
+         (False, QUANT_INT4_AWQ, True, False),  # no mp
+     ],
+ )
+-def test_mixed_precision_active(mp, qtype, flag, expected):
+-    assert _cfg(mp, qtype, flag).mixed_precision_active is expected
++def test_bf16_residual_active(mp, qtype, flag, expected):
++    assert _cfg(mp, qtype, flag).bf16_residual_active is expected
+ 
+ 
+ def test_make_linear_down_proj_bf16_output():
+-- 
+2.50.1 (Apple Git-155)
+

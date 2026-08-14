@@ -1,0 +1,239 @@
+--- a/qwen3_asr_worker.cpp(#12-state)
++++ b/qwen3_asr_worker.cpp(+prefix-cap-BROKEN)
+@@ -329,6 +329,12 @@
+     std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
+     Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
+     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
++    //! Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1): the transcript decoded so
++    //! far, fed back as an assistant-role prefix each hop so the runtime only
++    //! generates the CONTINUATION (newly-arrived words) instead of re-decoding the
++    //! whole transcript-so-far. Includes the head's leading "language <X>" tag,
++    //! exactly as the model emits it, so continuation resumes seamlessly.
++    std::string rawDecoded;                   //!< Accumulated prefix transcript (lang tag included).
+ };
+ 
+ std::mutex gEngineExecMutex;                                   //!< Serializes the whole prefill+decode engine step.
+@@ -383,6 +389,24 @@
+     return std::string();
+ }
+ 
++// Forward declarations for the streaming-prefix path (definitions live after the
++// asrStreamDelta namespace, alongside runOneShotCore which they reuse). handleChunk
++// / handleEnd (defined just below) reference these, so declare them up here.
++namespace asrStreamPrefix
++{
++struct HopOut
++{
++    bool ok{false};
++    std::string generated;
++    double totalMs{0.0};
++    std::string error;
++};
++bool enabled();
++int32_t hopCap();
++HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
++    rt::LLMInferenceRuntime& runtime, cudaStream_t stream, std::unordered_map<std::string, std::string>& loraWeightsMap);
++} // namespace asrStreamPrefix
++
+ //! begin: reserve a lane (pool_saturated -> 4429), register session, ack.
+ void handleBegin(Json const& input)
+ {
+@@ -516,6 +540,34 @@
+         return;
+     }
+ 
++    // Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1): per-hop assistant-prefix
++    // continuation with a decode cap. Feeds the prior transcript back so the
++    // runtime decodes ONLY the newly-arrived words (flat per-hop decode) instead
++    // of re-decoding the whole transcript-so-far. Audio stays cumulative.
++    if (asrStreamPrefix::enabled())
++    {
++        std::string const prefix = st.rawDecoded;
++        asrStreamPrefix::HopOut hop;
++        {
++            std::lock_guard<std::mutex> lk(gEngineExecMutex);
++            hop = asrStreamPrefix::runPrefixHop(
++                sid, st, prefix, asrStreamPrefix::hopCap(), runtime, stream, loraWeightsMap);
++        }
++        if (hop.ok)
++        {
++            st.rawDecoded = prefix + hop.generated;
++            std::cout << Json{{"event", "partial"}, {"id", sid}, {"text", stripLangTag(st.rawDecoded)}}.dump()
++                      << std::endl;
++        }
++        else
++        {
++            Json ev = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "partial_decode_failed"}};
++            if (!hop.error.empty()) ev["detail"] = hop.error;
++            std::cout << ev.dump() << std::endl;
++        }
++        return;
++    }
++
+     // Cumulative re-decode on the session's reserved lane (serialized by the engine
+     // exec mutex, identical step to the one-shot/finalize path).
+     Json const req = buildFinalizeRequest(sid, st);
+@@ -622,6 +674,29 @@
+     {
+         finalEv = Json{{"event", "error"}, {"id", sid}, {"ok", false}, {"error", "no_audio_accumulated"}};
+     }
++    else if (asrStreamPrefix::enabled())
++    {
++        // Streaming-prefix finalize: one more continuation hop from the accumulated
++        // prefix, UNCAPPED (override=-1) so the utterance is guaranteed to complete
++        // to EOS. The accumulated rawDecoded is the final transcript.
++        std::string const prefix = st.rawDecoded;
++        asrStreamPrefix::HopOut hop;
++        {
++            std::lock_guard<std::mutex> lk(gEngineExecMutex);
++            hop = asrStreamPrefix::runPrefixHop(
++                sid, st, prefix, /*uncapped*/ -1, runtime, stream, loraWeightsMap);
++        }
++        std::string const finalRaw = prefix + hop.generated;
++        finalEv = Json{{"event", "final"}, {"id", sid}, {"ok", hop.ok}};
++        if (hop.ok)
++        {
++            finalEv["responses"] = Json::array(
++                {Json{{"request_idx", 0}, {"batch_idx", 0}, {"output_text", finalRaw}}});
++            finalEv["text"] = stripLangTag(finalRaw);
++        }
++        finalEv["total_ms"] = hop.totalMs;
++        if (!hop.error.empty()) finalEv["error"] = hop.error;
++    }
+     else
+     {
+         Json const req = buildFinalizeRequest(sid, st);
+@@ -1095,6 +1170,133 @@
+ }
+ } // namespace asrStreamDelta
+ 
++// ===========================================================================
++// Streaming-prefix + per-hop decode cap (v0.7.x "assistant-prefix continuation"
++// trick ported to the v0.8.0 vanilla rt::LLMInferenceRuntime).
++//
++// Gated by env OVS_ASR_STREAM_PREFIX=1 (default OFF -> runOneShotCore cumulative
++// path UNCHANGED). The dominant per-hop cost on the deployed path is DECODE,
++// which grows O(transcript-so-far) because each cumulative hop re-decodes the
++// WHOLE transcript to EOS. This path flattens DECODE: each hop feeds the prior
++// transcript back as an ASSISTANT-role prefix (apply_chat_template=true,
++// add_generation_prompt=false), so the runtime PREFILLS the prefix and generates
++// ONLY the continuation (newly-arrived words), capped at maxDecodeTokensPerHop.
++//
++// FEASIBILITY VERIFIED (offline probe, zh_long_03): full audio + half-transcript
++// assistant prefix -> the runtime emits the genuine continuation (second half),
++// byte-identical to the one-shot tail. The v0.8.0 runtime correctly resumes
++// generation from an assistant prefix across the audio-pad prompt (Method-B
++// equivalent), so no runtime change is needed.
++//
++// Audio stays CUMULATIVE (full mel each hop) — this trick fixes DECODE, not
++// PREFILL/encode, which is the minor floor. Per hop:
++//   prefix = session.rawDecoded (prior transcript, lang tag included)
++//   request = user(audio=full cumulative mel) + assistant(prefix)
++//   cap = OVS_ASR_STREAM_PREFIX_CAP (default 64); the FINAL hop may run uncapped
++//         to guarantee completion.
++//   after decode: session.rawDecoded = prefix + generatedText
++// ===========================================================================
++namespace asrStreamPrefix
++{
++//! True iff OVS_ASR_STREAM_PREFIX=1 (cached once; default OFF). When OFF the
++//! streaming begin/chunk/end path is byte-identical to the cumulative re-decode.
++bool enabled()
++{
++    static bool const on = []() {
++        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX");
++        return p != nullptr && std::string(p) == "1";
++    }();
++    return on;
++}
++
++//! Per-hop decode cap (mirrors v0.7.x maxDecodeTokensPerHop=64). Env-tunable via
++//! OVS_ASR_STREAM_PREFIX_CAP; clamped to >=1. The final hop overrides this with
++//! an uncapped decode (override=-1) to guarantee the utterance completes.
++int32_t hopCap()
++{
++    static int32_t const cap = []() {
++        char const* p = std::getenv("OVS_ASR_STREAM_PREFIX_CAP");
++        int32_t v = (p != nullptr) ? std::atoi(p) : 64;
++        return (v >= 1) ? v : 64;
++    }();
++    return cap;
++}
++
++//! Build the one-shot-style request envelope for an assistant-prefix continuation
++//! hop. user message carries the FULL cumulative audio; the assistant message
++//! carries `prefix` (the prior transcript). apply_chat_template=true +
++//! add_generation_prompt=false leave the assistant turn OPEN so the runtime
++//! generates only the continuation. `capOverride` is plumbed as
++//! max_generate_length_override (>0 to cap a hop; -1 for the uncapped final hop).
++Json buildPrefixRequest(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride)
++{
++    Json req = st.beginMeta.is_object() ? st.beginMeta : Json::object();
++    if (!req.contains("batch_size")) req["batch_size"] = 1;
++    if (!req.contains("temperature")) req["temperature"] = 1.0;
++    if (!req.contains("top_p")) req["top_p"] = 1.0;
++    if (!req.contains("top_k")) req["top_k"] = 1;
++    if (!req.contains("max_generate_length")) req["max_generate_length"] = 256;
++    req["id"] = sid;
++    req["apply_chat_template"] = true;
++    req["max_generate_length_override"] = capOverride;
++
++    Json userContent = Json::array();
++    if (!st.melPath.empty())
++    {
++        userContent.push_back(Json{{"type", "audio"}, {"audio", st.melPath}});
++    }
++    Json messages = Json::array();
++    messages.push_back(Json{{"role", "user"}, {"content", userContent}});
++    if (prefix.empty())
++    {
++        // FIRST hop (no prior transcript): there is nothing to continue from, so we
++        // open the assistant turn the normal way — add_generation_prompt=true and NO
++        // assistant message. This is byte-identical to a plain capped one-shot start
++        // (verified: a user-only message with add_generation_prompt=FALSE does NOT
++        // open the assistant turn and yields garbage). The capped output seeds
++        // rawDecoded for the next hop's continuation.
++        req["add_generation_prompt"] = true;
++    }
++    else
++    {
++        // CONTINUATION hop: an explicit trailing assistant message carrying the prior
++        // transcript opens the assistant turn itself, so add_generation_prompt=false
++        // leaves that turn OPEN and the runtime generates only the continuation.
++        req["add_generation_prompt"] = false;
++        messages.push_back(Json{{"role", "assistant"}, {"content", prefix}});
++    }
++    req["requests"] = Json::array({Json{{"messages", messages}, {"reference", "ref"}}});
++    return req;
++}
++
++//! Run a single continuation hop and return {ok, generatedText, total_ms}. The
++//! generated text is the CONTINUATION only; the caller appends it to `prefix`.
++//! (HopOut is declared in the forward block above handleBegin.)
++HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string const& prefix, int32_t capOverride,
++    rt::LLMInferenceRuntime& runtime, cudaStream_t stream, std::unordered_map<std::string, std::string>& loraWeightsMap)
++{
++    HopOut out;
++    Json const req = buildPrefixRequest(sid, st, prefix, capOverride);
++    // Reuse the PROVEN parse->handleRequest core. runOneShotCore honors
++    // apply_chat_template / add_generation_prompt / max_generate_length_override
++    // straight from the request JSON, so the assistant prefix is prefilled and
++    // only the continuation is generated. (We are inside OVS_ASR_STREAM_PREFIX,
++    // so asrStreamDelta/asrSessionPath are not the active branch.)
++    Json core = runOneShotCore(req, runtime, stream, loraWeightsMap);
++    out.ok = core.value("ok", false);
++    if (core.contains("total_ms")) out.totalMs = core["total_ms"].get<double>();
++    if (out.ok && core.contains("responses") && core["responses"].is_array() && !core["responses"].empty())
++    {
++        Json const& r0 = core["responses"][0];
++        if (r0.contains("output_text") && r0["output_text"].is_string())
++            out.generated = r0["output_text"].get<std::string>();
++    }
++    if (!out.ok && core.contains("error") && core["error"].is_string())
++        out.error = core["error"].get<std::string>();
++    return out;
++}
++} // namespace asrStreamPrefix
++
+ //! Core one-shot engine step: parse the `requests` payload, run handleRequest on
+ //! each, and return the assembled response Json. This is the PROVEN golden path
+ //! (CER 0.0000 + byte-identity). Both the legacy event-less one-shot path AND the

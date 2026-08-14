@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: suharvest <suharvest@gmail.com>
+Date: Thu, 25 Jun 2026 08:12:22 +0800
+Subject: [PATCH] feat(loader): allow tied BF16Linear lm_head
+
+The generic checkpoint destination-dtype fix now comes from upstream PR
+#149. Keep only the product mixed-precision extension that permits a
+BF16Linear lm_head to share the embedding weight.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ tensorrt_edgellm/checkpoint/loader.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/tensorrt_edgellm/checkpoint/loader.py b/tensorrt_edgellm/checkpoint/loader.py
+--- a/tensorrt_edgellm/checkpoint/loader.py
++++ b/tensorrt_edgellm/checkpoint/loader.py
+@@ -184,11 +184,12 @@ def load_weights(
+     config = getattr(model, "config", None)
+     if (hasattr(model, "tie_weights") and config is not None
+             and getattr(config, "tie_word_embeddings", False)):
+-        from ..models.linear import FP16Linear
+-        if isinstance(getattr(model, "lm_head", None), FP16Linear):
++        from ..models.linear import BF16Linear, FP16Linear
++        if isinstance(getattr(model, "lm_head", None),
++                      (FP16Linear, BF16Linear)):
+             model.tie_weights()
+             logger.info("Tied lm_head.weight to embed_tokens.weight")
+         else:
+             logger.debug(
+-                "Skipping tied lm_head.weight for non-FP16 lm_head type %s",
++                "Skipping tied lm_head.weight for non-FP16/BF16 lm_head type %s",
+                 type(getattr(model, "lm_head", None)).__name__)
