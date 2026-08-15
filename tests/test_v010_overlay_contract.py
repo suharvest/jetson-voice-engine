@@ -138,7 +138,12 @@ def test_v010_manifests_have_release_provenance_and_fresh_hashes():
             "aarch64_build": True,
         }
         assert data["build"]["type"] == "Release"
-        assert data["build"]["enable_cute_dsl"] == "fmha"
+        expected_cute = (
+            "ALL"
+            if manifest_path.name == "qwen35-gdn-mtp-sm87-v010.toml"
+            else "fmha"
+        )
+        assert data["build"]["enable_cute_dsl"] == expected_cute
 
         proposed = data["proposed_upstream_patches"]
         assert proposed["series_sha256"] == _sha256(upstream_dir / "series")
@@ -232,6 +237,20 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
     assert "--dflash-draft" in text
     assert "base_config.json" in text
     assert "draft_config.json" in text
+    for model_id in (
+        "qwen3.5-4b",
+        "qwen3.5-4b-base",
+        "qwen3.5-4b-mtp",
+        "qwen3.5-4b-mtp-4k",
+        "qwen3.5-4b-mtp-8k",
+        "qwen3.5-4b-dflash",
+    ):
+        assert f"PREC[{model_id}]=int4_awq" in text
+    assert 'QWEN35_FP8_KV_CACHE:-0' in text
+    assert '*-mtp-4k) max_input=4096; max_kv=4096' in text
+    assert '*-mtp-8k) max_input=8192; max_kv=8192' in text
+    assert "run_gdn_builder" in text
+    assert 'LD_PRELOAD="${gdn_plugin}' in text
 
     customvoice = tomllib.loads(
         (OVERLAY / "manifests/customvoice-v010.toml").read_text(encoding="utf-8")
@@ -250,7 +269,19 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
         assert len(int4_artifacts) == 5
     assert customvoice["model"]["int4_gemm_plugin_version"] == 1
     assert highperf["model"]["customvoice"]["int4_gemm_plugin_version"] == 1
+    assert highperf["model"]["base"]["precision"] == "int4"
+    assert highperf["model"]["base"]["int4_gemm_plugin_version"] == 1
+    assert highperf["model"]["base"]["stage2_revision"] == (
+        "ff2318e66525365b2ed9f55811bf5d2381280ed8"
+    )
     assert 'TTS_INT4_GEMM_PLUGIN_VERSION="1"' in text
+    int4_driver = OVERLAY / "drivers/export-qwen3-tts-int4-v010.sh"
+    assert int4_driver.stat().st_mode & 0o111
+    int4_driver_text = int4_driver.read_text(encoding="utf-8")
+    assert f'PIN="{PIN}"' in int4_driver_text
+    assert "TTS_INT4_STAGE2_CHECKPOINT" in int4_driver_text
+    assert "TTS_INT4_STAGE2_REVISION" in int4_driver_text
+    assert "--int4-gemm-plugin-version 1" in int4_driver_text
 
     result = subprocess.run([str(driver)], text=True, capture_output=True)
     assert result.returncode != 0
@@ -295,3 +326,23 @@ def test_v010_asr_quantization_contract_is_explicit_and_frozen():
     assert 'ops["Int4GroupwiseGemmPlugin"]' in validator
     assert 'ops["Int4GroupwiseGemmPluginV2"]' in validator
     assert "v1_count != 196 or v2_count != 0" in validator
+
+
+def test_v010_qwen35_orin_contract_preserves_awq_and_context_profiles():
+    manifest = tomllib.loads(
+        (OVERLAY / "manifests/qwen35-gdn-mtp-sm87-v010.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["build"]["enable_cute_dsl"] == "ALL"
+    assert manifest["build"]["plugin_preload_required"] is True
+    model = manifest["model"]
+    assert model["precision"] == "int4_awq"
+    assert model["quantization_algorithm"] == "W4A16_AWQ"
+    assert model["quantization_group_size"] == 128
+    assert model["int4_gemm_plugin_version"] == 1
+    assert model["kv_cache_quantization"] == "none"
+    assert manifest["profiles"]["4k"]["max_input_len"] == 4096
+    assert manifest["profiles"]["4k"]["max_kv_cache_capacity"] == 4096
+    assert manifest["profiles"]["8k"]["max_input_len"] == 8192
+    assert manifest["profiles"]["8k"]["max_kv_cache_capacity"] == 8192

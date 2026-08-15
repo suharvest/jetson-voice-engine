@@ -1,0 +1,86 @@
+[upstream]
+version = "v0.10.0"
+pin = "71dd1bae032e70771265917ec74d3ff4cad07a10"
+remote = "https://github.com/NVIDIA/TensorRT-Edge-LLM.git"
+
+[proposed_upstream_patches]
+directory = "patches/upstream-v010-prs"
+series = "patches/upstream-v010-prs/series"
+lock = "patches/upstream-v010-prs/LOCK"
+checksums = "patches/upstream-v010-prs/SHA256SUMS"
+count = 4
+series_sha256 = "9c366ab2e23e79e100d0d209edad0f5137feed1f88fbaab29b8959b913ede5ee"
+lock_sha256 = "1d34836757eeac6e423ff7b97261f127a93ba6edc4634cbfa5387f7fda49d9f3"
+checksums_sha256 = "7d78dbdd53065b3601dc9cb7fc0c868d0641167e620ba4c219087e2497608144"
+
+[patches]
+directory = "patches/v010-candidate"
+series = "patches/v010-candidate/series"
+checksums = "patches/v010-candidate/SHA256SUMS"
+count = 32
+sparse_numbering = true
+series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
+checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
+
+[target]
+device = "jetson-orin-nx"
+sm = "87"
+cuda = "12.6"
+tensorrt = "10.3"
+l4t = "36.4.3"
+jetpack = "6.2"
+embedded_target = "jetson-orin"
+aarch64_build = true
+
+[build]
+type = "Release"
+enable_cute_dsl = "ALL"
+builder = "build-gdn/examples/llm/llm_build"
+plugin = "build-gdn/libNvInfer_edgellm_plugin.so"
+plugin_preload_required = true
+
+[model]
+id = "Qwen/Qwen3.5-4B"
+revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+precision = "int4_awq"
+quantization_algorithm = "W4A16_AWQ"
+quantization_group_size = 128
+int4_gemm_plugin_version = 1
+calibration_dataset = "cnn_dailymail"
+lm_head_quantized = false
+kv_cache_quantization = "none"
+fp8_kv_opt_in_env = "QWEN35_FP8_KV_CACHE=1"
+components = ["gdn_base", "mtp_draft"]
+
+[profiles."4k"]
+model_id = "qwen3.5-4b-mtp-4k"
+max_batch_size = 1
+max_input_len = 4096
+max_kv_cache_capacity = 4096
+max_verify_tree_size = 4
+max_draft_tree_size = 4
+
+[profiles."8k"]
+model_id = "qwen3.5-4b-mtp-8k"
+max_batch_size = 1
+max_input_len = 8192
+max_kv_cache_capacity = 8192
+max_verify_tree_size = 4
+max_draft_tree_size = 4
+
+[artifacts]
+root = "/opt/edgellm-v010"
+required = [
+  "build-gdn/libNvInfer_edgellm_plugin.so",
+  "python/_edgellm_runtime.cpython-310-aarch64-linux-gnu.so",
+  "engines/qwen3.5-4b-mtp-4k/engines/spec_base.engine",
+  "engines/qwen3.5-4b-mtp-4k/engines/spec_draft.engine",
+  "engines/qwen3.5-4b-mtp-4k/engines/base_config.json",
+  "engines/qwen3.5-4b-mtp-4k/engines/draft_config.json",
+  "engines/qwen3.5-4b-mtp-8k/engines/spec_base.engine",
+  "engines/qwen3.5-4b-mtp-8k/engines/spec_draft.engine",
+  "engines/qwen3.5-4b-mtp-8k/engines/base_config.json",
+  "engines/qwen3.5-4b-mtp-8k/engines/draft_config.json",
+]
+provenance_required = true
+sha256_required = true

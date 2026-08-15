@@ -83,8 +83,15 @@ uses the native Base/VoiceDesign/CustomVoice exporter, builds both native Base
 clone encoders, and uses the upstream MTP `--specBase` / `--specDraft` path.
 Qwen3-TTS INT4 remains an explicit product driver because upstream v0.10
 supports the Talker in FP16 only: `qwen3-tts` is the native FP16 route and
-`qwen3-tts-int4` is the separately qualified product extension. Native
-VoiceDesign and Qwen3.5 DFlash routes are revision-locked for gray testing.
+`qwen3-tts-int4` is the separately qualified CustomVoice extension. The
+production-equivalent Base lane is `qwen3-tts-base-int4`; it reuses the
+immutable, previously qualified stage-2 checkpoint but always re-exports the
+Talker with the v0.10 exporter and plugin v1. `qwen3-tts-base` remains the
+native FP16 correctness/gray baseline. The reviewed driver is
+`drivers/export-qwen3-tts-int4-v010.sh` and refuses floating stage-2 inputs.
+Native VoiceDesign and Qwen3.5 DFlash routes are revision-locked for gray
+testing. Qwen3.5 Orin release routes preserve W4A16-AWQ and plugin v1 rather
+than using the upstream NVFP4 default.
 The aggregate driver always writes to a new v0.10 artifact root; no v0.9.1
 ONNX or engine is accepted as an input.
 

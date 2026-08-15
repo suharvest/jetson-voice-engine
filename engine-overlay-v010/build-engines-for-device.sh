@@ -11,10 +11,12 @@
 # SCOPE — the edge-llm TensorRT family (ONE quantize -> export -> llm_build /
 # audio_build pipeline). Add a model = add a MODELS[] manifest line:
 #   qwen3-asr       | Qwen/Qwen3-ASR-0.6B                    | asr | int4_awq (b1+b2)
-#   qwen3-tts       | Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice   | tts | int4
+#   qwen3-tts       | Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice   | tts | fp16
+#   qwen3-tts-int4  | same source; reviewed product extension | tts | int4 (plugin v1)
 #   qwen3-tts-base  | Qwen/Qwen3-TTS-12Hz-0.6B-Base          | tts | fp16 (+ native clone encoders)
+#   qwen3-tts-base-int4 | same Base source + qualified stage-2 | tts | int4 (+ native clone encoders)
 #   qwen3.5-4b      | compatibility alias for qwen3.5-4b-base
-#   qwen3.5-4b-base | Qwen/Qwen3.5-4B                        | llm | nvfp4
+#   qwen3.5-4b-base | Qwen/Qwen3.5-4B                        | llm | int4_awq
 #   qwen3.5-4b-mtp  | same source; base plus explicit MTP integration hook
 #   sparktts-bf16  | <SparkTTS-0.5B repo>                | tts | bf16
 #   sparktts-w4a16 | <SparkTTS-0.5B repo>                | tts | w4a16
@@ -83,6 +85,15 @@ run_builder() {
   LD_PRELOAD="${PLUGIN}${LD_PRELOAD:+:${LD_PRELOAD}}" "$@"
 }
 
+run_gdn_builder() {
+  local gdn_plugin="${BUILD_GDN}/libNvInfer_edgellm_plugin.so"
+  # GDN/MTP/DFlash use the ENABLE_CUTE_DSL=ALL build. Loading the voice
+  # plugin here is not equivalent: custom-op creators are process-global and
+  # must be registered from the exact plugin paired with this builder.
+  EDGELLM_PLUGIN_PATH="${gdn_plugin}" \
+  LD_PRELOAD="${gdn_plugin}${LD_PRELOAD:+:${LD_PRELOAD}}" "$@"
+}
+
 # --- single source of truth for arch/platform ---
 eval "$(bash "${HERE}/detect-target.sh")"
 echo "==> target: SM=${TARGET_SM} platform=${TARGET_PLATFORM} arch=${CMAKE_CUDA_ARCH}"
@@ -140,6 +151,23 @@ _provenance() { # artifact-root repo revision precision
     printf 'target_platform: %s\n' "${TARGET_PLATFORM}"
   } > "${root}/PROVENANCE.md"
   sha256sum "${root}/PROVENANCE.md" > "${root}/SHA256SUMS.provenance"
+}
+
+_quantize_qwen35() { # model_dir output_dir precision
+  local -a args=(
+    llm
+    --model_dir "$1"
+    --output_dir "$2"
+    --quantization "$3"
+    --text_dataset cnn_dailymail
+  )
+  # The published v0.9.1 Orin baseline is AWQ with ordinary KV storage.
+  # FP8 KV is a separate opt-in experiment and must never silently change the
+  # 4K/8K no-regression comparison.
+  if [ "${QWEN35_FP8_KV_CACHE:-0}" = "1" ]; then
+    args+=(--kv_cache_quantization fp8)
+  fi
+  tensorrt-edgellm-quantize "${args[@]}"
 }
 
 build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
@@ -216,7 +244,7 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
 
 build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable revision
   local m="$1" repo="$2" prec="${3:-int4}" src out
-  local tts_batch tts_max_input tts_max_kv tts_engine_suffix
+  local tts_batch tts_max_input tts_max_kv tts_engine_suffix is_base
   src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   # Product defaults are the v0.8 Base limits already validated on Jetson.
   # Concurrency is a separate artifact choice: the default build is the
@@ -225,6 +253,10 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
   tts_batch="${TTS_MAX_BATCH_SIZE:-1}"
   tts_max_input="${TTS_MAX_INPUT_LEN:-1024}"
   tts_max_kv="${TTS_MAX_KV_CACHE_CAPACITY:-1536}"
+  case "${m}" in
+    qwen3-tts-base|qwen3-tts-base-int4) is_base=1 ;;
+    *) is_base=0 ;;
+  esac
   case "${tts_batch}" in
     1) tts_engine_suffix="" ;;
     2) tts_engine_suffix="-b2" ;;
@@ -243,17 +275,32 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
       # v0.10 still supports Qwen3-TTS Talker in FP16 only. Keep the reviewed
       # product INT4 Talker route isolated and provenance-bearing; all other
       # components, including Base clone encoders, come from native v0.10.
-      if [ -z "${EDGELLM_TTS_INT4_DRIVER:-}" ] \
-          || [ ! -x "${EDGELLM_TTS_INT4_DRIVER:-}" ]; then
-        echo "ERROR: Qwen3-TTS INT4 requires executable EDGELLM_TTS_INT4_DRIVER" >&2
+      local int4_driver stage2_checkpoint stage2_revision
+      int4_driver="${EDGELLM_TTS_INT4_DRIVER:-${HERE}/drivers/export-qwen3-tts-int4-v010.sh}"
+      if [ ! -x "${int4_driver}" ]; then
+        echo "ERROR: Qwen3-TTS INT4 driver is not executable: ${int4_driver}" >&2
         exit 9
       fi
+      if [ "${is_base}" = "1" ]; then
+        stage2_checkpoint="${TTS_BASE_INT4_STAGE2_CHECKPOINT:-}"
+        stage2_revision="${TTS_BASE_INT4_STAGE2_REVISION:-}"
+      else
+        stage2_checkpoint="${TTS_CUSTOMVOICE_INT4_STAGE2_CHECKPOINT:-}"
+        stage2_revision="${TTS_CUSTOMVOICE_INT4_STAGE2_REVISION:-}"
+      fi
+      [ -n "${stage2_checkpoint}" ] && [ -n "${stage2_revision}" ] || {
+        echo "ERROR: ${m} INT4 requires its immutable stage-2 checkpoint and revision" >&2
+        exit 9
+      }
       TTS_INT4_UPSTREAM="${UPSTREAM}" \
       TTS_INT4_MODEL="${src}" \
+      TTS_INT4_MODEL_REVISION="$4" \
+      TTS_INT4_STAGE2_CHECKPOINT="${stage2_checkpoint}" \
+      TTS_INT4_STAGE2_REVISION="${stage2_revision}" \
       TTS_INT4_OUTPUT="${out}/onnx/llm" \
       TTS_INT4_PRECISION="int4" \
       TTS_INT4_GEMM_PLUGIN_VERSION="1" \
-        "${EDGELLM_TTS_INT4_DRIVER}"
+        "${int4_driver}"
       for required in model.onnx config.json DRIVER_REVISION PROVENANCE.md; do
         [ -s "${out}/onnx/llm/${required}" ] || {
           echo "ERROR: INT4 driver did not produce ${out}/onnx/llm/${required}" >&2
@@ -302,7 +349,7 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
       --minCodeLen "${QWEN3_TTS_CODE2WAV_MIN_CODE_LEN:-1}" \
       --optCodeLen "${QWEN3_TTS_CODE2WAV_OPT_CODE_LEN:-128}" \
       --maxCodeLen "${QWEN3_TTS_CODE2WAV_MAX_CODE_LEN:-512}"
-  if [ "${m}" = "qwen3-tts-base" ]; then
+  if [ "${is_base}" = "1" ]; then
     local trtexec clone_engine_dir
     for required in speaker_encoder.onnx speech_tokenizer_encoder.onnx; do
       [ -s "${out}/onnx/clone_encoders/${required}" ] || {
@@ -337,18 +384,22 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
 }
 
 build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
-  local m="$1" repo="$2" prec="${3:-nvfp4}" src out
+  local m="$1" repo="$2" prec="${3:-int4_awq}" src out
+  local -a export_backend_args=()
   src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   [ -x "${BUILD_GDN}/examples/llm/llm_build" ] \
       && [ -s "${BUILD_GDN}/libNvInfer_edgellm_plugin.so" ] || {
     echo "ERROR: ${m} requires a v0.10 BUILD_GDN with ENABLE_CUTE_DSL=ALL" >&2
     exit 6
   }
-  echo "==> [llm:${m}] quantize ${prec}+fp8-kv -> export(--skip-visual) -> GDN engine"
+  echo "==> [llm:${m}] quantize ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) -> GDN engine"
   ( cd "${UPSTREAM}"
-    tensorrt-edgellm-quantize llm --model_dir "${src}" --output_dir "${out}/_q" \
-      --quantization "${prec}" --kv_cache_quantization fp8 --text_dataset cnn_dailymail
-    tensorrt-edgellm-export "${out}/_q" "${out}/onnx" --skip-visual --skip-audio )
+    _quantize_qwen35 "${src}" "${out}/_q" "${prec}"
+    if [ "${prec}" = "int4_awq" ]; then
+      export_backend_args+=(--int4-gemm-plugin-version 1)
+    fi
+    tensorrt-edgellm-export "${out}/_q" "${out}/onnx" \
+      "${export_backend_args[@]}" --skip-visual --skip-audio )
   for required in \
     llm/model.onnx llm/config.json llm/embedding.safetensors \
     llm/tokenizer.json llm/processed_chat_template.json; do
@@ -358,8 +409,8 @@ build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revisio
     }
   done
   # GDN needs the CuTe-enabled llm_build (build-gdn); tag auto-inferred from arch
-  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-  "${BUILD_GDN}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
+  run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
+      --onnxDir "${out}/onnx/llm" \
       --engineDir "${out}" --maxBatchSize 1 --maxInputLen 4096 --maxKVCacheCapacity 8192
   _meta "${out}/llm.engine"
   _provenance "${out}" "${repo}" "$4" "${prec}"
@@ -367,24 +418,33 @@ build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revisio
 
 build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
   local m="$1" repo="$2" prec="$3" src export_dir spec_dir export_src
+  local max_input max_kv
+  local -a export_backend_args=()
   src="$(_dl "${repo}" "$4")"
   export_dir="${EXPORT_ROOT}/${m}/onnx"
-  spec_dir="${MTP_SPEC_DIR:-${EXPORT_ROOT}/gdn-mtp}"
+  spec_dir="${MTP_SPEC_DIR:-${EXPORT_ROOT}/${m}/engines}"
+  case "${m}" in
+    *-mtp-4k) max_input=4096; max_kv=4096 ;;
+    *-mtp-8k) max_input=8192; max_kv=8192 ;;
+    *)
+      max_input="${MTP_MAX_INPUT_LEN:-8192}"
+      max_kv="${MTP_MAX_KV_CACHE_CAPACITY:-8192}"
+      ;;
+  esac
   export_src="${src}"
   if [ "${prec}" != "fp16" ] && [ "${prec}" != "bf16" ]; then
     export_src="${EXPORT_ROOT}/${m}/_q"
-    echo "==> [llm:${m}] quantize ${prec}+fp8-kv for native v0.10 MTP"
+    echo "==> [llm:${m}] quantize ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) for native v0.10 MTP"
     ( cd "${UPSTREAM}"
-      tensorrt-edgellm-quantize llm \
-        --model_dir "${src}" \
-        --output_dir "${export_src}" \
-        --quantization "${prec}" \
-        --kv_cache_quantization fp8 \
-        --text_dataset cnn_dailymail )
+      _quantize_qwen35 "${src}" "${export_src}" "${prec}" )
+  fi
+  if [ "${prec}" = "int4_awq" ]; then
+    export_backend_args+=(--int4-gemm-plugin-version 1)
   fi
   echo "==> [llm:${m}] native v0.10 export --mtp"
   ( cd "${UPSTREAM}"
-    tensorrt-edgellm-export "${export_src}" "${export_dir}" --mtp )
+    tensorrt-edgellm-export "${export_src}" "${export_dir}" \
+      "${export_backend_args[@]}" --mtp )
   for required in llm/model.onnx llm/config.json mtp_draft/model.onnx mtp_draft/config.json; do
     [ -s "${export_dir}/${required}" ] || {
       echo "ERROR: v0.10 MTP export did not produce ${export_dir}/${required}" >&2
@@ -397,22 +457,20 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
     exit 6
   }
   mkdir -p "${spec_dir}"
-  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-    "${BUILD_GDN}/examples/llm/llm_build" \
+  run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
       --onnxDir "${export_dir}/llm" \
       --engineDir "${spec_dir}" \
       --maxBatchSize 1 \
-      --maxInputLen "${MTP_MAX_INPUT_LEN:-2048}" \
-      --maxKVCacheCapacity "${MTP_MAX_KV_CACHE_CAPACITY:-4096}" \
+      --maxInputLen "${max_input}" \
+      --maxKVCacheCapacity "${max_kv}" \
       --maxVerifyTreeSize 4 \
       --specBase
-  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-    "${BUILD_GDN}/examples/llm/llm_build" \
+  run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
       --onnxDir "${export_dir}/mtp_draft" \
       --engineDir "${spec_dir}" \
       --maxBatchSize 1 \
-      --maxInputLen "${MTP_MAX_INPUT_LEN:-2048}" \
-      --maxKVCacheCapacity "${MTP_MAX_KV_CACHE_CAPACITY:-4096}" \
+      --maxInputLen "${max_input}" \
+      --maxKVCacheCapacity "${max_kv}" \
       --maxDraftTreeSize 4 \
       --specDraft
   # v0.9.1 used EDGELLM_MTP_BUILD_SCRIPT here. v0.10 owns --mtp export and
@@ -433,6 +491,7 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
 build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
   local m="$1" base_repo="$2" draft_repo="$3" prec="$4"
   local base_rev="$5" draft_rev="$6" base_src draft_src root base_q draft_q spec_dir
+  local -a export_backend_args=()
   base_src="$(_dl "${base_repo}" "${base_rev}")"
   draft_src="$(_dl "${draft_repo}" "${draft_rev}")"
   root="${EXPORT_ROOT}/${m}"
@@ -452,12 +511,7 @@ build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
     *)
       echo "==> [llm:${m}] quantize DFlash base + draft (${prec})"
       ( cd "${UPSTREAM}"
-        tensorrt-edgellm-quantize llm \
-          --model_dir "${base_src}" \
-          --output_dir "${base_q}" \
-          --quantization "${prec}" \
-          --kv_cache_quantization fp8 \
-          --text_dataset cnn_dailymail
+        _quantize_qwen35 "${base_src}" "${base_q}" "${prec}"
         tensorrt-edgellm-quantize draft \
           --base_model_dir "${base_src}" \
           --draft_model_dir "${draft_src}" \
@@ -467,13 +521,18 @@ build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
           --text_dataset cnn_dailymail )
       ;;
   esac
+  if [ "${prec}" = "int4_awq" ]; then
+    export_backend_args+=(--int4-gemm-plugin-version 1)
+  fi
   echo "==> [llm:${m}] v0.10 DFlash base + draft export"
   ( cd "${UPSTREAM}"
     tensorrt-edgellm-export \
       "${base_q}" "${root}/base-export" \
+      "${export_backend_args[@]}" \
       --dflash-base --dflash-draft-dir "${draft_q}"
     tensorrt-edgellm-export \
       "${base_q}" "${root}/draft-export" \
+      "${export_backend_args[@]}" \
       --dflash-draft --dflash-draft-dir "${draft_q}" )
   for required in \
     base-export/llm/model.onnx base-export/llm/config.json \
@@ -486,8 +545,7 @@ build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
     }
   done
   mkdir -p "${spec_dir}"
-  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-    "${BUILD_GDN}/examples/llm/llm_build" \
+  run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
       --onnxDir "${root}/base-export/llm" \
       --engineDir "${spec_dir}" \
       --maxBatchSize 1 \
@@ -495,8 +553,7 @@ build_llm_dflash() { # id base_repo draft_repo precision base_rev draft_rev
       --maxKVCacheCapacity "${DFLASH_MAX_KV_CACHE_CAPACITY:-2048}" \
       --maxVerifyTreeSize 16 \
       --specBase
-  EDGELLM_PLUGIN_PATH="${BUILD_GDN}/libNvInfer_edgellm_plugin.so" \
-    "${BUILD_GDN}/examples/llm/llm_build" \
+  run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
       --onnxDir "${root}/draft-export/dflash_draft" \
       --engineDir "${spec_dir}" \
       --maxBatchSize 1 \
@@ -602,11 +659,14 @@ REPO[qwen3-asr]="Qwen/Qwen3-ASR-0.6B";                  REV[qwen3-asr]="5eb14417
 REPO[qwen3-tts]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; REV[qwen3-tts]="85e237c12c027371202489a0ec509ded67b5e4b5"; KIND[qwen3-tts]=tts; PREC[qwen3-tts]=fp16
 REPO[qwen3-tts-int4]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; REV[qwen3-tts-int4]="85e237c12c027371202489a0ec509ded67b5e4b5"; KIND[qwen3-tts-int4]=tts; PREC[qwen3-tts-int4]=int4
 REPO[qwen3-tts-base]="Qwen/Qwen3-TTS-12Hz-0.6B-Base";   REV[qwen3-tts-base]="5d83992436eae1d760afd27aff78a71d676296fc"; KIND[qwen3-tts-base]=tts; PREC[qwen3-tts-base]=fp16
+REPO[qwen3-tts-base-int4]="Qwen/Qwen3-TTS-12Hz-0.6B-Base"; REV[qwen3-tts-base-int4]="5d83992436eae1d760afd27aff78a71d676296fc"; KIND[qwen3-tts-base-int4]=tts; PREC[qwen3-tts-base-int4]=int4
 REPO[qwen3-tts-voicedesign]="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"; REV[qwen3-tts-voicedesign]="5ecdb67327fd37bb2e042aab12ff7391903235d3"; KIND[qwen3-tts-voicedesign]=tts; PREC[qwen3-tts-voicedesign]=fp16
-REPO[qwen3.5-4b]="Qwen/Qwen3.5-4B";                     REV[qwen3.5-4b]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=nvfp4
-REPO[qwen3.5-4b-base]="Qwen/Qwen3.5-4B";                REV[qwen3.5-4b-base]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=nvfp4
-REPO[qwen3.5-4b-mtp]="Qwen/Qwen3.5-4B";                 REV[qwen3.5-4b-mtp]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=nvfp4
-REPO[qwen3.5-4b-dflash]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-dflash]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; DRAFT_REPO[qwen3.5-4b-dflash]="z-lab/Qwen3.5-4B-DFlash"; DRAFT_REV[qwen3.5-4b-dflash]="9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf"; KIND[qwen3.5-4b-dflash]=llm_dflash; PREC[qwen3.5-4b-dflash]=nvfp4
+REPO[qwen3.5-4b]="Qwen/Qwen3.5-4B";                     REV[qwen3.5-4b]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=int4_awq
+REPO[qwen3.5-4b-base]="Qwen/Qwen3.5-4B";                REV[qwen3.5-4b-base]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=int4_awq
+REPO[qwen3.5-4b-mtp]="Qwen/Qwen3.5-4B";                 REV[qwen3.5-4b-mtp]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=int4_awq
+REPO[qwen3.5-4b-mtp-4k]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-mtp-4k]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp-4k]=llm_mtp; PREC[qwen3.5-4b-mtp-4k]=int4_awq
+REPO[qwen3.5-4b-mtp-8k]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-mtp-8k]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp-8k]=llm_mtp; PREC[qwen3.5-4b-mtp-8k]=int4_awq
+REPO[qwen3.5-4b-dflash]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-dflash]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; DRAFT_REPO[qwen3.5-4b-dflash]="z-lab/Qwen3.5-4B-DFlash"; DRAFT_REV[qwen3.5-4b-dflash]="9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf"; KIND[qwen3.5-4b-dflash]=llm_dflash; PREC[qwen3.5-4b-dflash]=int4_awq
 # moss/sparktts are not plain HF-repo pipelines — sources come from env
 # (MOSS_ONNX_BUNDLE / SPARKTTS_MODEL_DIR+SPARKTTS_REPO); REPO holds a hint only.
 REPO[moss]="env:MOSS_ONNX_BUNDLE";                      KIND[moss]=moss;     PREC[moss]=mix1

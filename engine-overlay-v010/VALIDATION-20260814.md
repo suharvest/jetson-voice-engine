@@ -258,9 +258,19 @@ inputs at the exact immutable revisions frozen by the v0.10 driver:
 
 It also retains a 227 MB MOSS-TTS-Nano source directory and a 3.7 GB Spark-TTS
 source directory for their model-specific v0.10 re-export lanes. The 8.7 GB
-Qwen3.5 directory is an older AWQ workspace, not the official
-`Qwen/Qwen3.5-4B` revision required by the v0.10 NVFP4 driver, so it is not
-accepted as that lane's source checkpoint.
+Qwen3.5 directory is an older AWQ workspace, not a fresh export from the exact
+`Qwen/Qwen3.5-4B` revision required by the v0.10 driver, so its old
+ONNX/engines are not accepted as v0.10 artifacts. The Orin route nevertheless
+preserves the validated W4A16-AWQ quantization and explicitly exports plugin
+v1; NVFP4 is not a JetPack 6.2 release precision.
+
+The subsequent artifact audit found a reusable Base stage-2 workspace at
+`/home/harve/project/qwen3-tts-base-w4a16-onnx` with separate Talker and
+CodePredictor INT4 checkpoints. It is an input candidate only: its config,
+checkpoint content, and stage-2 revision must pass the new v0.10 INT4 driver
+before it can be credited. No CustomVoice INT4 stage-2 checkpoint was found;
+only the exact raw CustomVoice snapshot is cached, so that quantization must be
+regenerated from the previously qualified recipe.
 
 The WSL cache may replace network download only. Quantization keeps the
 previously qualified per-model recipe, while every v0.10 ONNX and TensorRT

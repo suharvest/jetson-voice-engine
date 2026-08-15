@@ -55,9 +55,16 @@ required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md"]
 [model.base]
 id = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 revision = "5d83992436eae1d760afd27aff78a71d676296fc"
-precision = "fp16"
+precision = "int4"
+upstream_supported_precision = false
+product_extension = true
+int4_gemm_plugin_version = 1
+stage2_source = "wip/native-int4-talker"
+stage2_revision = "ff2318e66525365b2ed9f55811bf5d2381280ed8"
 components = ["talker", "code_predictor", "code2wav", "speaker_encoder", "speech_tokenizer_encoder"]
-native_v010_export = true
+native_v010_components = ["code_predictor", "code2wav", "speaker_encoder", "speech_tokenizer_encoder"]
+required_driver = "drivers/export-qwen3-tts-int4-v010.sh"
+required_stage2_env = "TTS_BASE_INT4_STAGE2_CHECKPOINT"
 
 [artifacts]
 root = "/opt/edgellm-v010"
@@ -69,11 +76,13 @@ required = [
   "engines/qwen3-tts-int4/talker/PROVENANCE.md",
   "engines/qwen3-tts-int4/code_predictor/llm.engine",
   "engines/qwen3-tts-int4/code2wav/code2wav.engine",
-  "engines/qwen3-tts-base/talker/llm.engine",
-  "engines/qwen3-tts-base/code_predictor/llm.engine",
-  "engines/qwen3-tts-base/code2wav/code2wav.engine",
-  "engines/qwen3-tts-base/clone_encoders/speaker_encoder.engine",
-  "engines/qwen3-tts-base/clone_encoders/speech_tokenizer_encoder.engine",
+  "engines/qwen3-tts-base-int4/talker/llm.engine",
+  "engines/qwen3-tts-base-int4/talker/DRIVER_REVISION",
+  "engines/qwen3-tts-base-int4/talker/PROVENANCE.md",
+  "engines/qwen3-tts-base-int4/code_predictor/llm.engine",
+  "engines/qwen3-tts-base-int4/code2wav/code2wav.engine",
+  "engines/qwen3-tts-base-int4/clone_encoders/speaker_encoder.engine",
+  "engines/qwen3-tts-base-int4/clone_encoders/speech_tokenizer_encoder.engine",
 ]
 provenance_required = true
 sha256_required = true
