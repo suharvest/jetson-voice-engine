@@ -28,7 +28,16 @@ fail() {
   || fail "expected TensorRT-Edge-LLM v0.10.0 ${PIN}"
 [ -s "${model}/config.json" ] || fail "model config missing: ${model}/config.json"
 [ -s "${stage2}/config.json" ] || fail "stage-2 config missing: ${stage2}/config.json"
+[ -s "${model}/model.safetensors" ] || fail "model weights missing: ${model}/model.safetensors"
+[ -s "${stage2}/model.safetensors" ] || fail "stage-2 weights missing: ${stage2}/model.safetensors"
+[ -s "${stage2}/hf_quant_config.json" ] || fail "stage-2 quant config missing: ${stage2}/hf_quant_config.json"
 [ ! -e "${output}" ] || fail "output must be fresh: ${output}"
+
+model_config_sha="$(sha256sum "${model}/config.json" | awk '{print $1}')"
+model_weights_sha="$(sha256sum "${model}/model.safetensors" | awk '{print $1}')"
+stage2_config_sha="$(sha256sum "${stage2}/config.json" | awk '{print $1}')"
+stage2_quant_config_sha="$(sha256sum "${stage2}/hf_quant_config.json" | awk '{print $1}')"
+stage2_weights_sha="$(sha256sum "${stage2}/model.safetensors" | awk '{print $1}')"
 
 python3 - "${model}/config.json" "${stage2}/config.json" <<'PY'
 import json
@@ -97,7 +106,12 @@ printf 'sha256:%s\n' "${driver_sha}" > "${output}/DRIVER_REVISION"
   printf 'driver_sha256: `%s`\n\n' "${driver_sha}"
   printf 'upstream_sha: `%s`\n\n' "${PIN}"
   printf 'model_revision: `%s`\n\n' "${model_revision}"
+  printf 'model_config_sha256: `%s`\n\n' "${model_config_sha}"
+  printf 'model_weights_sha256: `%s`\n\n' "${model_weights_sha}"
   printf 'stage2_revision: `%s`\n\n' "${stage2_revision}"
+  printf 'stage2_config_sha256: `%s`\n\n' "${stage2_config_sha}"
+  printf 'stage2_quant_config_sha256: `%s`\n\n' "${stage2_quant_config_sha}"
+  printf 'stage2_weights_sha256: `%s`\n\n' "${stage2_weights_sha}"
   printf 'int4_gemm_plugin_version: `1`\n'
 } > "${output}/PROVENANCE.md"
 (

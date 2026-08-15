@@ -282,6 +282,14 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
     assert "TTS_INT4_STAGE2_CHECKPOINT" in int4_driver_text
     assert "TTS_INT4_STAGE2_REVISION" in int4_driver_text
     assert "--int4-gemm-plugin-version 1" in int4_driver_text
+    for checksum_field in (
+        "model_config_sha256",
+        "model_weights_sha256",
+        "stage2_config_sha256",
+        "stage2_quant_config_sha256",
+        "stage2_weights_sha256",
+    ):
+        assert checksum_field in int4_driver_text
 
     result = subprocess.run([str(driver)], text=True, capture_output=True)
     assert result.returncode != 0
