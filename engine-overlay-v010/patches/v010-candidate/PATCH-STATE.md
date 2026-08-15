@@ -14,10 +14,19 @@ upstream fixes and additive files from `addon/`.
   CustomVoice, VoiceDesign, and clone encoders;
 - old `0036` `codec_language_id` export: v0.10.0 carries the language metadata.
 
-The former external-speaker-embedding path is replaced by the native
-`cloneEncoderDir` plus `ref_audio` / `ref_text` contract. The product worker
-temporarily accepts `speaker_embedding_b64` for protocol compatibility, warns,
-and ignores it; callers must migrate to the native reference-audio contract.
+Base voice cloning uses v0.10's native `cloneEncoderDir` plus
+`ref_audio` / `ref_text` contract when reference audio is available.  The old
+OVS/VoxEdge persistent-voice ABI is retained by 0025 as a thin adapter:
+`speaker_embedding_b64` must be strict standard base64 encoding of exactly
+1024 little-endian float32 values (4096 decoded bytes), all finite.  The
+worker decodes and validates it, then the runtime converts it to FP16 in the
+same `mVoiceCloneXVector` conditioning slot populated by
+`CloneEncoderRunner`; no old external speaker encoder or mel engine is
+reintroduced.  `speaker`/`speaker_id` is mutually exclusive with either
+`speaker_embedding_b64` or `ref_audio`; the two clone inputs are mutually
+exclusive, and malformed input fails closed.  `ref_text` remains native ICL
+metadata and requires `ref_audio`.  CustomVoice's `language`/speaker path is
+unchanged.
 
 ## Retained product capability
 

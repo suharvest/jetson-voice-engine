@@ -1,35 +1,199 @@
-From 0509a2e1aa8beb17f9cd09be2a162fafc10a6a5b Mon Sep 17 00:00:00 2001
-From: suharvest <suharvest@gmail.com>
-Date: Fri, 14 Aug 2026 22:04:28 +0800
-Subject: [PATCH] use v010 native qwen3 tts voice clone
+From 8c68858d67dc2471d34abe0f16d736711d76a2c7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Sat, 15 Aug 2026 12:29:47 +0800
+Subject: [PATCH] feat(qwen3-tts): preserve legacy speaker embedding ABI
 
-Use the v0.10 Base voice-clone path (`cloneEncoderDir`) and forward
-`ref_audio`/`ref_text` to the native runtime, which owns reference encoding and
-ICL construction.
+Keep Base voice cloning on v0.10's native `ref_audio`/`ref_text` path.  The
+legacy OVS/VoxEdge persistent voice format remains accepted as strict standard
+base64 of little-endian float32[1024]; the worker validates length, padding,
+finite values, and exclusivity, then injects the vector into the native
+CloneEncoderRunner-equivalent FP16 conditioning slot.  No external speaker
+encoder or mel engine is restored, and CustomVoice requests are unchanged.
 
-Keep the native export path portable as well: Code2Wav selects CUDA only when
-available, and the Mimi clone encoder uses eager attention so current
-Transformers can export its static speech-tokenizer bucket without a symbolic
-SDPA guard failure.
 
-Normalize streaming CLI PCM chunks according to the engine's actual waveform
-dtype. Qwen3-TTS Code2Wav exports FP32, so interpreting its buffer as FP16
-produces saturated noise even though the RVQ codes are correct.
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.cpp b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+index 4a6c14e..64d2b85 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.cpp
++++ b/cpp/runtime/qwen3OmniTTSRuntime.cpp
+@@ -40,6 +40,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <chrono>
++#include <cmath>
+ #include <cuda_runtime.h>
+ #include <nlohmann/json.hpp>
+ #include <unordered_set>
+@@ -101,6 +102,36 @@ bool extractMLPWeightsFromTensors(std::vector<rt::Tensor>& tensors, rt::Tensor&
+ // Shared chunk accumulator + emitter for streaming RVQ codes.
+ // Used by both runTalkerGenerationLoop (per-batch in TTS) and handleStreamingGeneration (bs=1 Omni)
+ // so chunk semantics (threshold-triggered non-final emit + single final flush) live in one place.
++bool validateVoiceCloneRequest(Qwen3OmniTTSRuntime::TalkerGenerationRequest const& request, char const* context)
++{
++    bool const hasEmbedding = !request.speakerEmbedding.empty();
++    bool const hasRefAudio = !request.refAudioPath.empty();
++    bool const hasRefText = !request.refText.empty();
++    bool const hasSpeaker = request.speakerId >= 0 || !request.speakerName.empty();
++
++    if ((hasEmbedding || hasRefAudio) && hasSpeaker)
++    {
++        LOG_ERROR("%s: speaker/speaker_id is mutually exclusive with speaker_embedding_b64/ref_audio", context);
++        return false;
++    }
++    if (hasEmbedding && hasRefAudio)
++    {
++        LOG_ERROR("%s: speaker_embedding_b64 and ref_audio are mutually exclusive", context);
++        return false;
++    }
++    if (hasEmbedding && hasRefText)
++    {
++        LOG_ERROR("%s: precomputed speaker embedding cannot be combined with ref_text", context);
++        return false;
++    }
++    if (hasRefText && !hasRefAudio)
++    {
++        LOG_ERROR("%s: ref_text requires ref_audio", context);
++        return false;
++    }
++    return true;
++}
++
+ struct ChunkEmitter
+ {
+     int32_t chunkFrames{0};
+@@ -1497,12 +1528,27 @@ bool Qwen3OmniTTSRuntime::prepareTalkerInput(std::vector<int32_t> const& textTok
+         return false;
+     }
 
-The legacy `speaker_embedding_b64` request field remains accepted for protocol
-compatibility, but is deliberately not decoded: v0.10 has no host-side
-arbitrary speaker-embedding ABI. Requests containing it receive a warning and
-the field is ignored; callers must migrate to `ref_audio` with optional
-`ref_text`.
++    if (!validateVoiceCloneRequest(request, "prepareTalkerInput"))
++    {
++        return false;
++    }
++
+     bool const isVoiceDesign = (mTalkerConfig.ttsModelType == "voice_design");
 
-Signed-off-by: suharvest <suharvest@gmail.com>
----
- examples/omni/qwen3_tts_inference.cpp                           | 28 +++++++--
- examples/omni/qwen3_tts_streaming_worker.cpp                    | 65 ++++++++++++--------
- .../qwen3_tts/modeling_qwen3_tts_clone_encoders.py             |  4 +++-
- .../qwen3_tts/modeling_qwen3_tts_code2wav.py                   |  4 +++-
- 4 files changed, 72 insertions(+), 29 deletions(-)
+-    // Voice clone prompt (Base checkpoints): load per request; iclFrames > 0 selects ICL mode.
+-    bool const hasClonePrompt = !request.refAudioPath.empty();
++    // Voice clone prompt (Base checkpoints): either run v0.10's native reference
++    // encoders or copy the persisted 1024-f32 ABI into the exact x-vector slot
++    // populated by CloneEncoderRunner. iclFrames > 0 selects ICL mode.
++    bool const hasPrecomputedEmbedding = !request.speakerEmbedding.empty();
++    bool const hasClonePrompt = hasPrecomputedEmbedding || !request.refAudioPath.empty();
+     int32_t iclFrames = 0;
+-    if (hasClonePrompt)
++    if (hasPrecomputedEmbedding)
++    {
++        if (!setVoiceCloneEmbedding(request.speakerEmbedding, stream))
++        {
++            return false;
++        }
++    }
++    else if (hasClonePrompt)
+     {
+         if (!encodeVoiceCloneReference(request.refAudioPath, request.refText, iclFrames, stream))
+         {
+@@ -1706,6 +1752,22 @@ bool Qwen3OmniTTSRuntime::handleAudioGeneration(
+     check::check(activeBatchSize > 0 && activeBatchSize <= mMaxBatchSize,
+         "Batch size " + std::to_string(activeBatchSize) + " exceeds max " + std::to_string(mMaxBatchSize));
 
++    // Validate clone requests before selecting the legacy Qwen3-TTS or OmniNext
++    // prefill path. In particular, never silently ignore a persisted embedding
++    // on an architecture that has no compatible conditioning slot.
++    for (auto const& request : requests)
++    {
++        if (!validateVoiceCloneRequest(request, "handleAudioGeneration"))
++        {
++            return false;
++        }
++        if (isOmniNext() && (!request.speakerEmbedding.empty() || !request.refAudioPath.empty()))
++        {
++            LOG_ERROR("handleAudioGeneration: voice clone is only supported by the Qwen3-TTS Base path");
++            return false;
++        }
++    }
++
+     response.batchRvqCodes.clear();
+     response.numFramesPerSample.clear();
+     response.success = false;
+@@ -2924,6 +2986,43 @@ int64_t Qwen3OmniTTSRuntime::flushPrefillRows(rt::Tensor& output, cudaStream_t s
+     return numRows;
+ }
+
++bool Qwen3OmniTTSRuntime::setVoiceCloneEmbedding(std::vector<float> const& embedding, cudaStream_t stream)
++{
++    constexpr int32_t kEmbeddingDim = talker_constants::kLegacyVoiceCloneEmbeddingDim;
++    if (static_cast<int32_t>(embedding.size()) != kEmbeddingDim)
++    {
++        LOG_ERROR("speaker embedding must contain exactly %d float32 values, got %zu", kEmbeddingDim,
++            embedding.size());
++        return false;
++    }
++    if (mVoiceCloneXVector.getShape().getNumDims() != 1 || mVoiceCloneXVector.getShape()[0] != kEmbeddingDim)
++    {
++        LOG_ERROR("speaker embedding conditioning slot has unexpected shape; expected [%d]", kEmbeddingDim);
++        return false;
++    }
++
++    std::vector<__half> halfEmbedding(static_cast<size_t>(kEmbeddingDim));
++    for (int32_t i = 0; i < kEmbeddingDim; ++i)
++    {
++        float const value = embedding[static_cast<size_t>(i)];
++        if (!std::isfinite(value))
++        {
++            LOG_ERROR("speaker embedding contains non-finite float32 at index %d", i);
++            return false;
++        }
++        halfEmbedding[static_cast<size_t>(i)] = __float2half_rn(value);
++        if (!std::isfinite(__half2float(halfEmbedding[static_cast<size_t>(i)])))
++        {
++            LOG_ERROR("speaker embedding value at index %d overflows FP16 conditioning", i);
++            return false;
++        }
++    }
++
++    CUDA_CHECK(cudaMemcpyAsync(mVoiceCloneXVector.rawPointer(), halfEmbedding.data(),
++        halfEmbedding.size() * sizeof(__half), cudaMemcpyHostToDevice, stream));
++    return true;
++}
++
+ bool Qwen3OmniTTSRuntime::encodeVoiceCloneReference(
+     std::string const& refAudioPath, std::string const& refText, int32_t& iclFrames, cudaStream_t stream)
+ {
+diff --git a/cpp/runtime/qwen3OmniTTSRuntime.h b/cpp/runtime/qwen3OmniTTSRuntime.h
+index c8a5366..4152f24 100644
+--- a/cpp/runtime/qwen3OmniTTSRuntime.h
++++ b/cpp/runtime/qwen3OmniTTSRuntime.h
+@@ -59,6 +59,7 @@ constexpr int32_t kNonStreamingPrefixRows = 8;     //!< Fixed prefix rows in non
+ constexpr int32_t kPrefixRowsWithLanguage = 9;     //!< Prefix rows with CustomVoice language conditioning
+ constexpr int32_t kCodePredictorPrefillSeqLen = 2; //!< CodePredictor prefill sequence length
+ constexpr int32_t kCodecEmbeddingCount = 6;        //!< Number of codec embeddings to add
++constexpr int32_t kLegacyVoiceCloneEmbeddingDim = 1024; //!< Persisted OVS/VoxEdge Base clone ABI dimension
+
+ // CodePredictor sampling defaults. Qwen3-Omni dense/MoE hardcode
+ // ``code_predictor.generate(top_k=50, top_p=0.8)`` with the HF
+@@ -204,6 +205,13 @@ public:
+         std::string refAudioPath{""};
+         std::string refText{""}; //!< Reference transcript (enables ICL mode)
+
++        //! [Qwen3-TTS Base] Optional persisted clone x-vector decoded from the legacy
++        //! ``speaker_embedding_b64`` ABI. The worker validates this as exactly
++        //! little-endian float32[1024] and the runtime converts it to the same FP16
++        //! GPU conditioning slot populated by CloneEncoderRunner. Mutually exclusive
++        //! with refAudioPath/refText and speaker selection.
++        std::vector<float> speakerEmbedding;
++
+         //! [Qwen3-Omni Next] Custom voice: reference-voice codec codes, [frames][num_code_groups].
+         //! When non-empty, replaces the built-in speaker codec rows and skips the
+         //! per-speaker system prompt (HF ``prompt_speaker_codes`` semantics).
+@@ -830,6 +838,9 @@ private:
+     //! on error; iclFrames receives the reference frame count (0 = x-vector-only mode).
+     bool encodeVoiceCloneReference(
+         std::string const& refAudioPath, std::string const& refText, int32_t& iclFrames, cudaStream_t stream);
++    //! Copy a validated persisted Base x-vector into the same GPU slot populated by
++    //! CloneEncoderRunner::extractSpeakerEmbedding; no external encoder is used.
++    bool setVoiceCloneEmbedding(std::vector<float> const& embedding, cudaStream_t stream);
+     int32_t mMaxBatchSize{1}; //!< Maximum batch size from Talker engine config (min of Talker and CodePredictor)
+
+     int32_t mNumRvqLayers{talker_constants::kDefaultNumRvqLayers};
 diff --git a/examples/omni/qwen3_tts_inference.cpp b/examples/omni/qwen3_tts_inference.cpp
 index f535b08..752e552 100644
 --- a/examples/omni/qwen3_tts_inference.cpp
@@ -88,9 +252,8 @@ index f535b08..752e552 100644
                      audioOutput.waveform = waveformTensor;
                      audioOutput.sampleRate = code2wavRunner->getConfig().sampleRate;
                      audioOutput.hasWaveform = true;
-
 diff --git a/examples/omni/qwen3_tts_streaming_worker.cpp b/examples/omni/qwen3_tts_streaming_worker.cpp
-index a2e6604..5bb52ff 100644
+index a2e6604..a912643 100644
 --- a/examples/omni/qwen3_tts_streaming_worker.cpp
 +++ b/examples/omni/qwen3_tts_streaming_worker.cpp
 @@ -2,7 +2,7 @@
@@ -127,14 +290,121 @@ index a2e6604..5bb52ff 100644
 + *   * Qwen3-TTS Base voice clone uses v0.10's native reference-encoder path:
 + *     `cloneEncoderDir` points at the exported speaker/tokenizer encoders and
 + *     requests carry `ref_audio` plus optional `ref_text`.
-+ *   * The historical `speaker_embedding_b64` field is intentionally not
-+ *     decoded: v0.10 owns extraction and ICL construction on device. It is
-+ *     accepted for protocol compatibility but logs a warning and is ignored;
-+ *     callers must migrate to `ref_audio`/`ref_text`.
++ *   * The historical `speaker_embedding_b64` field is strictly decoded as
++ *     little-endian float32[1024] and copied into v0.10's native x-vector
++ *     conditioning slot. It is mutually exclusive with `speaker`, `speaker_id`,
++ *     `ref_audio`, and `ref_text`; malformed/non-finite values fail closed.
   *
   * Concurrency model (unchanged): N worker threads, each bound to ONE slot
   * (runtime + stateless Code2Wav + CUDA stream). A runtime instance is never
-@@ -84,6 +87,7 @@ struct Args
+@@ -78,12 +81,114 @@ using Json = nlohmann::json;
+ namespace
+ {
+
++constexpr size_t kLegacySpeakerEmbeddingDim = 1024;
++constexpr size_t kLegacySpeakerEmbeddingBytes = kLegacySpeakerEmbeddingDim * sizeof(float);
++
++int decodeBase64Value(char value)
++{
++    if (value >= 'A' && value <= 'Z')
++        return value - 'A';
++    if (value >= 'a' && value <= 'z')
++        return value - 'a' + 26;
++    if (value >= '0' && value <= '9')
++        return value - '0' + 52;
++    if (value == '+')
++        return 62;
++    if (value == '/')
++        return 63;
++    return -1;
++}
++
++std::vector<float> decodeSpeakerEmbeddingB64(std::string const& encoded)
++{
++    if (encoded.empty())
++    {
++        throw std::invalid_argument("speaker_embedding_b64 must not be empty");
++    }
++    if (encoded.size() % 4 != 0)
++    {
++        throw std::invalid_argument("speaker_embedding_b64 length must be a multiple of 4");
++    }
++
++    size_t padding = 0;
++    if (!encoded.empty() && encoded.back() == '=')
++        ++padding;
++    if (encoded.size() > 1 && encoded[encoded.size() - 2] == '=')
++        ++padding;
++    if (padding > 2)
++    {
++        throw std::invalid_argument("speaker_embedding_b64 has invalid padding");
++    }
++
++    std::vector<uint8_t> bytes;
++    bytes.reserve(encoded.size() / 4 * 3 - padding);
++    for (size_t offset = 0; offset < encoded.size(); offset += 4)
++    {
++        bool const isFinal = offset + 4 == encoded.size();
++        char const c0 = encoded[offset];
++        char const c1 = encoded[offset + 1];
++        char const c2 = encoded[offset + 2];
++        char const c3 = encoded[offset + 3];
++        int const v0 = decodeBase64Value(c0);
++        int const v1 = decodeBase64Value(c1);
++        bool const pad2 = c2 == '=';
++        bool const pad3 = c3 == '=';
++        int const v2 = pad2 ? 0 : decodeBase64Value(c2);
++        int const v3 = pad3 ? 0 : decodeBase64Value(c3);
++
++        if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0 || (pad2 && !pad3) || (!isFinal && (pad2 || pad3)))
++        {
++            throw std::invalid_argument("speaker_embedding_b64 contains invalid characters or padding");
++        }
++        // Reject non-canonical encodings instead of silently accepting bytes
++        // hidden in the unused bits of a padded quartet.
++        if ((pad2 && (v1 & 0x0f) != 0) || (pad3 && !pad2 && (v2 & 0x03) != 0))
++        {
++            throw std::invalid_argument("speaker_embedding_b64 has non-zero trailing bits");
++        }
++
++        bytes.push_back(static_cast<uint8_t>((v0 << 2) | (v1 >> 4)));
++        if (!pad2)
++        {
++            bytes.push_back(static_cast<uint8_t>((v1 << 4) | (v2 >> 2)));
++        }
++        if (!pad3)
++        {
++            bytes.push_back(static_cast<uint8_t>((v2 << 6) | v3));
++        }
++    }
++
++    if (bytes.size() != kLegacySpeakerEmbeddingBytes)
++    {
++        throw std::invalid_argument(
++            "speaker_embedding_b64 must decode to exactly 4096 bytes (little-endian float32[1024])");
++    }
++
++    static_assert(sizeof(float) == sizeof(uint32_t));
++    std::vector<float> embedding(kLegacySpeakerEmbeddingDim);
++    for (size_t i = 0; i < kLegacySpeakerEmbeddingDim; ++i)
++    {
++        size_t const base = i * sizeof(float);
++        uint32_t const bits = static_cast<uint32_t>(bytes[base])
++            | (static_cast<uint32_t>(bytes[base + 1]) << 8)
++            | (static_cast<uint32_t>(bytes[base + 2]) << 16)
++            | (static_cast<uint32_t>(bytes[base + 3]) << 24);
++        std::memcpy(&embedding[i], &bits, sizeof(float));
++        if (!std::isfinite(embedding[i]))
++        {
++            throw std::invalid_argument("speaker_embedding_b64 contains NaN or infinity");
++        }
++    }
++    return embedding;
++}
++
+ struct Args
+ {
+     std::string talkerEngineDir;
      std::string codePredictorEngineDir;
      std::string code2wavEngineDir;
      std::string tokenizerDir;
@@ -142,7 +412,7 @@ index a2e6604..5bb52ff 100644
      int32_t maxSlots{1}; //!< TTS slot-pool size. Default 1 == single-instance behavior (M1 validated config).
      bool debug{false};
  };
-@@ -95,6 +99,7 @@ enum OptionId : int
+@@ -95,6 +200,7 @@ enum OptionId : int
      CODE_PREDICTOR_ENGINE_DIR,
      CODE2WAV_ENGINE_DIR,
      TOKENIZER_DIR,
@@ -150,7 +420,7 @@ index a2e6604..5bb52ff 100644
      MAX_SLOTS,
      DEBUG,
  };
-@@ -102,16 +107,18 @@ enum OptionId : int
+@@ -102,16 +208,19 @@ enum OptionId : int
  void printUsage(char const* programName)
  {
      std::cerr << "Usage: " << programName << " --talkerEngineDir=<path> --code2wavEngineDir=<path>"
@@ -165,14 +435,15 @@ index a2e6604..5bb52ff 100644
                << "Request schema:\n"
                << "  {\"id\":\"...\",\"text\":\"...\",\"speaker\":\"Vivian\",\n"
 +              << "   \"ref_audio\":\"/path/ref.wav\",\"ref_text\":\"optional transcript\",\n"
++              << "   \"speaker_embedding_b64\":\"<base64 little-endian float32[1024]>\",\n"
                << "   \"stream\":true,\"first_chunk_frames\":8,\"chunk_frames\":10,\n"
                << "   \"chunk_format\":\"pcm_s16le\",\"chunk_transport\":\"base64\"}\n"
 -              << "Cancel (M1: acknowledged but not supported yet):\n"
 +              << "Cancel (handled by the cooperative-cancel patch):\n"
                << "  {\"type\":\"cancel\",\"id\":\"...\"}\n";
  }
- 
-@@ -123,6 +130,7 @@ bool parseArgs(Args& args, int argc, char** argv)
+
+@@ -123,6 +232,7 @@ bool parseArgs(Args& args, int argc, char** argv)
          {"codePredictorEngineDir", required_argument, 0, CODE_PREDICTOR_ENGINE_DIR},
          {"code2wavEngineDir", required_argument, 0, CODE2WAV_ENGINE_DIR},
          {"tokenizerDir", required_argument, 0, TOKENIZER_DIR},
@@ -180,7 +451,7 @@ index a2e6604..5bb52ff 100644
          {"max_slots", required_argument, 0, MAX_SLOTS},
          {"debug", no_argument, 0, DEBUG},
          {0, 0, 0, 0}};
-@@ -137,6 +145,7 @@ bool parseArgs(Args& args, int argc, char** argv)
+@@ -137,6 +247,7 @@ bool parseArgs(Args& args, int argc, char** argv)
          case CODE_PREDICTOR_ENGINE_DIR: args.codePredictorEngineDir = optarg; break;
          case CODE2WAV_ENGINE_DIR: args.code2wavEngineDir = optarg; break;
          case TOKENIZER_DIR: args.tokenizerDir = optarg; break;
@@ -188,7 +459,7 @@ index a2e6604..5bb52ff 100644
          case MAX_SLOTS:
          {
              int const v = std::atoi(optarg);
-@@ -157,6 +166,17 @@ bool parseArgs(Args& args, int argc, char** argv)
+@@ -157,6 +268,17 @@ bool parseArgs(Args& args, int argc, char** argv)
      {
          args.tokenizerDir = args.talkerEngineDir;
      }
@@ -206,41 +477,68 @@ index a2e6604..5bb52ff 100644
      // Slot-pool size env fallback (matches the OVS EDGE_LLM_TTS_MAX_CONCURRENT
      // convention). CLI --max_slots takes precedence when given (!= default 1).
      if (args.maxSlots == 1)
-@@ -277,19 +297,15 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
+@@ -277,20 +399,42 @@ Qwen3OmniTTSRuntime::TalkerGenerationRequest buildRequest(Json const& item)
      req.speakerName = item.value("speaker", "");
      req.speakerId = item.value("speaker_id", -1);
- 
+
 -    // M1: `language` (CustomVoice 9-row conditioning) and `speaker_embedding_b64`
 -    // (external voice-clone embedding) need the M2 runtime patches — the v0.9.0
 -    // TalkerGenerationRequest has no fields for them yet. Accept-and-warn so the
 -    // protocol surface stays stable for the consumer.
 -    if (!item.value("language", "").empty())
--    {
--        std::cerr << "[worker] warning: request field 'language' is not supported yet on v0.9.0 (M2); ignored"
--                  << std::endl;
--    }
 +    // v0.10 native Base voice clone: the runtime loads reference audio through
 +    // the on-device clone encoders and optionally builds an ICL prompt from its
-+    // transcript. Do not turn this into a host-side embedding ABI.
++    // transcript. A persisted 0.0.9a embedding remains available through the
++    // strict legacy ABI, but is injected into the runtime x-vector slot without
++    // restoring the old external speaker encoder/mel engine.
 +    req.refAudioPath = item.value("ref_audio", "");
 +    req.refText = item.value("ref_text", "");
-     if (!item.value("speaker_embedding_b64", "").empty())
++    bool const hasEmbeddingField = item.contains("speaker_embedding_b64");
++    if (hasEmbeddingField)
++    {
++        if (!item["speaker_embedding_b64"].is_string())
++        {
++            throw std::invalid_argument("speaker_embedding_b64 must be a base64 string");
++        }
++        req.speakerEmbedding = decodeSpeakerEmbeddingB64(item["speaker_embedding_b64"].get<std::string>());
++    }
++
++    bool const hasEmbedding = !req.speakerEmbedding.empty();
++    bool const hasRefAudio = !req.refAudioPath.empty();
++    bool const hasRefText = !req.refText.empty();
++    bool const hasSpeaker = req.speakerId >= 0 || !req.speakerName.empty();
++    if ((hasEmbedding || hasRefAudio) && hasSpeaker)
++    {
++        throw std::invalid_argument("speaker/speaker_id is mutually exclusive with speaker_embedding_b64/ref_audio");
++    }
++    if (hasEmbedding && hasRefAudio)
++    {
++        throw std::invalid_argument("speaker_embedding_b64 and ref_audio are mutually exclusive");
++    }
++    if (hasEmbedding && hasRefText)
+     {
+-        std::cerr << "[worker] warning: request field 'language' is not supported yet on v0.9.0 (M2); ignored"
+-                  << std::endl;
++        throw std::invalid_argument("speaker_embedding_b64 cannot be combined with ref_text");
+     }
+-    if (!item.value("speaker_embedding_b64", "").empty())
++    if (hasRefText && !hasRefAudio)
      {
 -        std::cerr << "[worker] warning: request field 'speaker_embedding_b64' is not supported yet on v0.9.0 (M2); "
 -                     "ignored"
-+        std::cerr << "[worker] warning: 'speaker_embedding_b64' is not supported by the v0.10 native voice-clone "
-+                     "path; use 'ref_audio' and optional 'ref_text' (field ignored)"
-                   << std::endl;
+-                  << std::endl;
++        throw std::invalid_argument("ref_text requires ref_audio");
      }
- 
-@@ -664,7 +680,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
+
+     Message msg;
+@@ -664,7 +808,8 @@ bool initSlotPool(Args const& args, bool useStateful, bool useAsyncVocode, int64
              CUDA_CHECK(cudaStreamCreate(&slot->stream));
- 
+
              slot->runtime = std::make_unique<Qwen3OmniTTSRuntime>(
 -                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, slot->stream);
 +                args.talkerEngineDir, args.codePredictorEngineDir, args.tokenizerDir, args.cloneEncoderDir,
 +                slot->stream);
- 
+
              // Per-slot STATELESS Code2Wav. Each owns its own engine+context+buffers,
              // so concurrent slots never contend. useStateful only affects `ready` meta.
 diff --git a/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py b/tensorrt_edgellm/models/qwen3_tts/modeling_qwen3_tts_clone_encoders.py
@@ -274,3 +572,5 @@ index 0e0487c..f68e568 100644
      os.makedirs(output_dir, exist_ok=True)
      output_path = os.path.join(output_dir, "model.onnx")
      for external_data_name in ("onnx_model.data", "model.onnx.data"):
+--
+2.50.1 (Apple Git-155)

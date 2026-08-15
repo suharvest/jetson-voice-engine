@@ -111,6 +111,37 @@ def test_native_voice_clone_export_is_host_portable():
     assert "dtype == nvinfer1::DataType::kFLOAT" in patch
     assert "dtype == nvinfer1::DataType::kHALF" in patch
     assert 'nvinfer1::DataType::kFLOAT, "streaming_pcm"' in patch
+    assert "decodeSpeakerEmbeddingB64" in patch
+    assert "kLegacySpeakerEmbeddingDim = 1024" in patch
+    assert "must decode to exactly 4096 bytes" in patch
+    assert "contains NaN or infinity" in patch
+    assert "setVoiceCloneEmbedding" in patch
+    assert "mVoiceCloneXVector.rawPointer()" in patch
+    assert "speaker/speaker_id is mutually exclusive" in patch
+    assert "field ignored" not in patch
+
+
+def test_base_voice_clone_compatibility_contract_is_manifest_locked():
+    manifest = tomllib.loads(
+        (OVERLAY / "manifests/qwen3-tts-highperf-sm87-v010.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["compatibility"]["voice_clone"] == {
+        "native_fields": ["ref_audio", "ref_text"],
+        "legacy_field": "speaker_embedding_b64",
+        "legacy_encoding": "base64(le-f32[1024])",
+        "legacy_decoded_bytes": 4096,
+        "legacy_requires_external_encoder": False,
+        "legacy_mutually_exclusive_with": [
+            "speaker",
+            "speaker_id",
+            "ref_audio",
+            "ref_text",
+        ],
+        "finite_values_required": True,
+        "customvoice_unchanged": True,
+    }
 
 
 def test_v010_manifests_have_release_provenance_and_fresh_hashes():

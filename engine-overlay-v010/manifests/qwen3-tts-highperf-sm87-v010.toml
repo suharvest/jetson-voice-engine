@@ -20,7 +20,7 @@ checksums = "patches/v010-candidate/SHA256SUMS"
 count = 32
 sparse_numbering = true
 series_sha256 = "8f6d316faf54efbbb59c3b40089bc093f7c138c0d33e2ec79357467348632019"
-checksums_sha256 = "4c8f9ef64861e499b4252b87f74d53c79407aa1b70f148cfba5259e23f4c05b1"
+checksums_sha256 = "5243e6c52b250f13080e43bbaac49021383147e20a880a290dbc1384c7638c03"
 
 [target]
 device = "jetson-orin-nx"
@@ -65,6 +65,16 @@ components = ["talker", "code_predictor", "code2wav", "speaker_encoder", "speech
 native_v010_components = ["code_predictor", "code2wav", "speaker_encoder", "speech_tokenizer_encoder"]
 required_driver = "drivers/export-qwen3-tts-int4-v010.sh"
 required_stage2_env = "TTS_BASE_INT4_STAGE2_CHECKPOINT"
+
+[compatibility.voice_clone]
+native_fields = ["ref_audio", "ref_text"]
+legacy_field = "speaker_embedding_b64"
+legacy_encoding = "base64(le-f32[1024])"
+legacy_decoded_bytes = 4096
+legacy_requires_external_encoder = false
+legacy_mutually_exclusive_with = ["speaker", "speaker_id", "ref_audio", "ref_text"]
+finite_values_required = true
+customvoice_unchanged = true
 
 [artifacts]
 root = "/opt/edgellm-v010"

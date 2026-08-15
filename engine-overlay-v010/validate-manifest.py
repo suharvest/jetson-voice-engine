@@ -101,6 +101,30 @@ def verify_release_target(data: dict[str, Any]) -> None:
         fail(f"[build].type must be 'Release', got {build.get('type')!r}")
 
 
+def verify_voice_clone_contract(data: dict[str, Any]) -> None:
+    """Lock the Base persistent-voice ABI without changing CustomVoice."""
+    model = data.get("model")
+    if not isinstance(model, dict) or not isinstance(model.get("base"), dict):
+        return
+    compatibility = table(data, "compatibility")
+    voice = compatibility.get("voice_clone")
+    if not isinstance(voice, dict):
+        fail("[compatibility.voice_clone] must be a table")
+    expected: dict[str, Any] = {
+        "native_fields": ["ref_audio", "ref_text"],
+        "legacy_field": "speaker_embedding_b64",
+        "legacy_encoding": "base64(le-f32[1024])",
+        "legacy_decoded_bytes": 4096,
+        "legacy_requires_external_encoder": False,
+        "legacy_mutually_exclusive_with": ["speaker", "speaker_id", "ref_audio", "ref_text"],
+        "finite_values_required": True,
+        "customvoice_unchanged": True,
+    }
+    for key, wanted in expected.items():
+        if voice.get(key) != wanted:
+            fail(f"[compatibility.voice_clone].{key} must be {wanted!r}, got {voice.get(key)!r}")
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         fail("usage: validate-manifest.py OVERLAY_ROOT MANIFEST UPSTREAM_PIN")
@@ -125,6 +149,7 @@ def main() -> None:
         fail("[upstream].remote must be the NVIDIA repository")
 
     verify_release_target(data)
+    verify_voice_clone_contract(data)
 
     proposed = table(data, "proposed_upstream_patches")
     if value(proposed, "proposed_upstream_patches", "directory",
