@@ -244,6 +244,111 @@ enables `fmha`, so CPU mel fallback is used), and the generic Omni runner probes
 an optional `action.engine` that ASR does not use. Neither prevented the checked
 ASR outputs above.
 
+## WSL model-input reuse audit (2026-08-15)
+
+`wsl2-local` has complete Hugging Face caches for all three immediate voice
+inputs at the exact immutable revisions frozen by the v0.10 driver:
+
+- Qwen3-ASR 0.6B: `5eb144179a02acc5e5ba31e748d22b0cf3e303b0`
+  (1.8 GB cache; `model.safetensors` SHA-256 matches the Nano gray input above);
+- Qwen3-TTS 0.6B Base: `5d83992436eae1d760afd27aff78a71d676296fc`
+  (2.4 GB cache);
+- Qwen3-TTS 0.6B CustomVoice:
+  `85e237c12c027371202489a0ec509ded67b5e4b5` (2.4 GB cache).
+
+It also retains a 227 MB MOSS-TTS-Nano source directory and a 3.7 GB Spark-TTS
+source directory for their model-specific v0.10 re-export lanes. The 8.7 GB
+Qwen3.5 directory is an older AWQ workspace, not the official
+`Qwen/Qwen3.5-4B` revision required by the v0.10 NVFP4 driver, so it is not
+accepted as that lane's source checkpoint.
+
+The WSL cache may replace network download only. Quantization keeps the
+previously qualified per-model recipe, while every v0.10 ONNX and TensorRT
+engine is regenerated. Old ONNX/engines remain mechanism-only evidence and
+cannot be promoted into the v0.10 artifact set.
+
+## Qwen3-ASR formal INT4 checkpoint and ONNX gate (2026-08-15)
+
+The exact ASR revision above was quantized on `wsl2-local` with the complete
+patched v0.10 Python tree and its pinned toolchain (Torch 2.13.0, Transformers
+5.14.1, ModelOpt 0.45.0). The calibration contract is the previously qualified
+W4A16-AWQ recipe: LibriSpeech multimodal audio+transcript calibration, 128
+samples, group size 128, no zero point, pre-quant scale enabled, audio tower
+FP16, and tied embedding/LM head excluded. Quantization completed in 370.7 s;
+the checkpoint `model.safetensors` SHA-256 is
+`8bb301e19569ba8c41224e9513190c5fa76073de2c1d5d2caf109fe9fdc69e30`.
+
+v0.10 changes the INT4 exporter default to CuTe-DSL
+`Int4GroupwiseGemmPluginV2`. That is a different weight layout/kernel path
+from the AWQ-swizzled v1 plugin qualified on Orin. The formal export therefore
+sets `--int4-gemm-plugin-version 1`; the aggregate driver and manifests now
+freeze that choice for both ASR and the product CustomVoice INT4 driver.
+
+The fail-closed `validate-asr-onnx.py` gate passes with 1,136 thinker nodes,
+515 audio nodes, exactly 196 `Int4GroupwiseGemmPlugin` v1 nodes, zero v2 nodes,
+all required sidecars present, and both ONNX models accepted by
+`onnx.checker`. Core SHA-256 values are:
+
+- thinker `model.onnx`:
+  `2fc79431026a8d84002a48a27825e6153e5618634cb4d1976d1285b7b33d5ee6`;
+- thinker external weights:
+  `d1f0b7f602c96e5fd7293f28b2ab2b40622a77d5850d1afaa536e2ed0cc78a35`;
+- full-vocab embedding:
+  `70fb4840066b259c8a90aea869a9ed204dd7f13240665ab8bbb7980046dc8964`;
+- audio encoder `model.onnx`:
+  `50d4de338fcd867308867600af37ed193a8161bac62f338328f66045df96fcef`.
+
+This closes the checkpoint/export gate. The engine and small-corpus PCM gray
+gate below also passes, but the full production greedy/force-language ZH CER
+and EN WER corpus remains required before replacing the FP16 gray set.
+
+## Qwen3-ASR formal INT4 engine and PCM gray gate (2026-08-15)
+
+All three engines were built natively on `orin-nx` (JetPack 6.2, CUDA 12.6,
+TensorRT 10.3, SM87) from the checked ONNX above. The builder and plugin are
+the already-qualified v0.10 binaries recorded in the device compile gate. The
+release profiles are unchanged from v0.9.1: thinker b1/b2 use maximum input
+1,024 and KV capacity 1,536; the audio encoder uses 100--3,000 time steps.
+
+The resulting SHA-256 values are:
+
+- thinker b1 engine:
+  `b1dd878acc5ee7f045cf274d525f1ede997f32f92b823b48d7892c85409ebf1b`;
+- thinker b1 config:
+  `6d6c1a6c307e394349aabb234c241c44a78e3b5885d2190cdbf9714f6f2fb545`;
+- thinker b2 engine:
+  `62085451b8d416db2d11838583a9ce3d62d47c03e25581f8a56011b91659b0d2`;
+- thinker b2 config:
+  `0a4c0caf39905f0deaf0b726caedab97c93975dd338040b8d4368c79a507289e`;
+- audio encoder engine:
+  `a359ac5d35a0ad9d1f4666da0e4b10d13ee676bd8e6c09a6b571951392ab506a`;
+- audio encoder config:
+  `30e489e9c3982f42fe3976ad6e5391adffda3aae5b23ff0998d53d7159e78193`.
+
+Each engine directory was copied to `wsl2-local`, checked file by file, then
+restored to NX and checked again before runtime. No x86-built TensorRT engine
+is used. The worker is the same guarded v0.10 binary used by the FP16 Nano gray
+lane, SHA-256
+`3381a9ce35d32c199ac37a65cecfe772b056678a48796d296d4f2520e752eab2`.
+
+The production `pcm_b64` path passed all eight existing requantization samples
+(five Chinese and three English) on both b1 and b2. After punctuation
+normalization every result has LCS 1.0 against the previous validated text.
+Final-chunk latency ranges were 78.9--206.8 ms on b1 and 79.3--208.1 ms on b2.
+
+The b2 session gate also passes: lanes 0 and 1 can co-reside, a third begin
+fails closed with `pool_saturated` / status 4429, the two distinct Chinese and
+English samples finalize serially with isolated LCS 1.0 text, and lane 0 is
+reusable afterward. The checked finalizations took 589.8 ms and 149.3 ms from
+the client side. This confirms the current two-resident-session contract; it
+does not provide continuous batching or mid-decode admission.
+
+The old test driver's precomputed `mel_path` scenarios fail with the v0.10
+formal export (`TensorRT Edge LLM cannot handle this request`) while the actual
+product `pcm_b64` path passes. That legacy compatibility path is not credited
+to the gray gate and must not be used as the release health check. The failure
+is retained as a compatibility difference rather than hidden by the PCM pass.
+
 ## Gates still required before an overall OVS upgrade
 
 - Regenerate every ONNX and TensorRT engine with v0.10 identity.

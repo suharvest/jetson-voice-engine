@@ -47,6 +47,7 @@ revision = "85e237c12c027371202489a0ec509ded67b5e4b5"
 precision = "int4"
 upstream_supported_precision = false
 product_extension = true
+int4_gemm_plugin_version = 1
 components = ["talker", "code_predictor", "code2wav"]
 required_driver_env = "EDGELLM_TTS_INT4_DRIVER"
 required_driver_outputs = ["DRIVER_REVISION", "PROVENANCE.md"]

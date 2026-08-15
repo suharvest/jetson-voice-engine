@@ -144,6 +144,7 @@ _provenance() { # artifact-root repo revision precision
 
 build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
   local m="$1" repo="$2" prec="${3:-int4_awq}" src out max_input max_kv suffix export_src
+  local -a export_backend_args=()
   src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   max_input="${ASR_MAX_INPUT_LEN:-1024}"
   max_kv="${ASR_MAX_KV_CACHE_CAPACITY:-1536}"
@@ -166,14 +167,23 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
         --model_dir "${src}" \
         --output_dir "${export_src}" \
         --quantization "${prec}" \
-        --text_dataset cnn_dailymail )
+        --text_dataset cnn_dailymail \
+        --audio_dataset librispeech \
+        --num_samples 128 )
+    # The previously qualified Orin W4A16 runtime uses the legacy
+    # AWQ-swizzled Int4GroupwiseGemmPlugin. v0.10 defaults to CuTe-DSL V2,
+    # which is a distinct weight layout/kernel path and is not covered by that
+    # quality or JP6.2 compatibility evidence.
+    export_backend_args+=(--int4-gemm-plugin-version 1)
   fi
   echo "==> [asr:${m}] v0.10 export -> thinker + audio encoder"
   ( cd "${UPSTREAM}"
     if [ "${ASR_FP8_EMBEDDING:-0}" = "1" ]; then
-      tensorrt-edgellm-export "${export_src}" "${out}/onnx" --fp8-embedding
+      tensorrt-edgellm-export "${export_src}" "${out}/onnx" \
+        "${export_backend_args[@]}" --fp8-embedding
     else
-      tensorrt-edgellm-export "${export_src}" "${out}/onnx"
+      tensorrt-edgellm-export "${export_src}" "${out}/onnx" \
+        "${export_backend_args[@]}"
     fi )
   for required in \
     llm/model.onnx llm/config.json llm/embedding.safetensors \
@@ -242,6 +252,7 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
       TTS_INT4_MODEL="${src}" \
       TTS_INT4_OUTPUT="${out}/onnx/llm" \
       TTS_INT4_PRECISION="int4" \
+      TTS_INT4_GEMM_PLUGIN_VERSION="1" \
         "${EDGELLM_TTS_INT4_DRIVER}"
       for required in model.onnx config.json DRIVER_REVISION PROVENANCE.md; do
         [ -s "${out}/onnx/llm/${required}" ] || {

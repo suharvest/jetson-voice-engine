@@ -248,6 +248,9 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
             if "qwen3-tts-int4" in path
         ]
         assert len(int4_artifacts) == 5
+    assert customvoice["model"]["int4_gemm_plugin_version"] == 1
+    assert highperf["model"]["customvoice"]["int4_gemm_plugin_version"] == 1
+    assert 'TTS_INT4_GEMM_PLUGIN_VERSION="1"' in text
 
     result = subprocess.run([str(driver)], text=True, capture_output=True)
     assert result.returncode != 0
@@ -261,3 +264,34 @@ def test_v010_asr_worker_fails_closed_on_unsafe_native_audio_batch():
     assert "native_audio_batch_unsafe_v010" in worker
     assert "batch.requests.size() > 1" in worker
     assert "worker finalizations are serialized for audio isolation" in worker
+
+
+def test_v010_asr_quantization_contract_is_explicit_and_frozen():
+    manifest = tomllib.loads(
+        (OVERLAY / "manifests/qwen3-asr-sm87.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    model = manifest["model"]
+    assert model["precision"] == "int4_awq"
+    assert model["quantization_algorithm"] == "W4A16_AWQ"
+    assert model["quantization_group_size"] == 128
+    assert model["int4_gemm_plugin_version"] == 1
+    assert model["calibration_dataset"] == "librispeech"
+    assert model["calibration_samples"] == 128
+    assert model["audio_tower_precision"] == "fp16"
+    assert model["lm_head_quantized"] is False
+
+    driver = (OVERLAY / "build-engines-for-device.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "--audio_dataset librispeech" in driver
+    assert "--num_samples 128" in driver
+    assert "--int4-gemm-plugin-version 1" in driver
+
+    validator = (OVERLAY / "validate-asr-onnx.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'ops["Int4GroupwiseGemmPlugin"]' in validator
+    assert 'ops["Int4GroupwiseGemmPluginV2"]' in validator
+    assert "v1_count != 196 or v2_count != 0" in validator
