@@ -465,14 +465,18 @@ adapter described below and is not evidence about the final candidate ABI.
 
 ## Gates still required before an overall OVS upgrade
 
-- Regenerate every ONNX and TensorRT engine with v0.10 identity.
+- Finish the final Spark W4A16 engine from its exact v0.10 export; do not
+  substitute the retained v0.9.1 graph.
 - Publish model-owned immutable artifacts and a new outer v0.10 release lock.
 - Keep native ASR audio batching disabled until its two-WAV isolation defect
   is fixed; the formal INT4 b1/b2 path remains the release lane.
 - Publish the now-built MOSS, Spark, Qwen3.5 and voice payloads under immutable
   revisions after their final manifests are frozen.
-- Finish the Nano-native Base performance gate and the remaining Nano v0.9.1
-  ASR control replay.
+- Finish the remaining Nano ASR control policy. The v0.9.1 Base lane was never
+  deployed on that host, so the documented Nano-native Base gate uses the last
+  deployed v0.8 control plus the strict same-device v0.9.1 comparison on NX.
+- Keep MOSS and Spark excluded from Nano unless their plans are rebuilt on the
+  Nano and receive independent performance qualification.
 - Build new v0.10 runtime images/profiles/compose identities while preserving
   v0.9.1 as rollback.
 
@@ -709,6 +713,50 @@ The build-only 6 GB `/swapfile_c2w` was swapped off and removed after the
 manifests were frozen, restoring 7.8 GB free disk without touching named
 images, model volumes, or rollback artifacts.
 
+The Nano-native payload was then copied file-by-file to the 16 GB NX and its
+same `56ce2a...` manifest was rechecked before loading. An interleaved
+v0.9.1/v0.10 A/B run used two blocks and six measured requests per release.
+The cross-device v0.10 functional probe had a TTFA ratio of 1.03922 and an
+elapsed-time per generated-frame ratio of 1.04032 versus v0.9.1, passing both
+1.05 gates. Its
+longer total wall ratio (1.05891) reflects 57 generated frames versus 56 for
+the control and is therefore report-only; all six v0.10 outputs were
+byte-identical. The evidence JSON SHA-256 is
+`ab08940575c1cb687114dbad3b23e6078890637d8cdb38be12d2fdb6cc12f33e`.
+
+That performance report did not retain worker stderr, so it could not establish
+plan portability. A subsequent warning-aware direct worker replay passed N=2
+and cancel/recovery functionally but captured TensorRT's cross-device-model
+warning for all seven Base plans. Its report SHA-256 is
+`a187de9d92e3b2d2a0c4afe7fa0ad444656efaa9adbd29a1ea229cc78e5249b2`.
+The unpublished package that labeled the Nano payload portable is therefore
+retired. Base must use independent NX and Nano artifact revisions.
+
+The same warning-aware audit was applied to CustomVoice. Its Nano-native
+Talker, CodePredictor, and Code2Wav passed real overlapping N=2 plus three of
+three cancel/keep/recovery rounds on NX, but each plan emitted the same
+cross-device-model warning. Evidence SHA-256 is
+`e990ef57474a630a4b202fc6bee55f79e70b8a15f2eb95e2f8f817e0d3f9dc72`.
+CustomVoice also requires per-target artifact revisions; matching SM87 and
+TensorRT versions are not treated as sufficient plan portability evidence.
+
+## Orin Nano cross-device MOSS gray probe (2026-08-15)
+
+The exact v0.10 MOSS runtime and NX-built mixed-precision bundle were copied
+directly to the Nano with full tree verification. Functionally the probe
+loaded both slots, produced a genuinely overlapping N=2 pair with distinct
+non-empty outputs, and passed three of three cancel/keep/immediate-recovery
+rounds with cancellation terminal after one chunk. The result JSON SHA-256 is
+`cbd40bb2b9bafce0658e1d8f23c2d921b8d644aa0b85517366654650557b37bc`.
+
+This is deliberately not a qualification result. TensorRT warned for all six
+plans that they were built for a different device model and that cross-device
+use may affect performance or correctness. The Nano release scope therefore
+excludes MOSS rather than treating matching SM87/TRT versions as plan
+portability. Spark is excluded for the same reason until a Nano-native build
+and baseline exist. The copied cross-device payload was removed after the
+evidence hash was frozen; the complete MOSS source bundle remains on NX.
+
 ## Consolidated v0.10 speech candidate image gate (2026-08-15)
 
 The additive image now contains all four workers (ASR, Qwen3 TTS,
@@ -723,11 +771,36 @@ workers. The image also explicitly locks `LANGUAGE_MODE=multilanguage`; an
 initial service smoke proved that relying on the inherited `zh_en` default is
 correctly rejected by the profile loader.
 
-The corrected local image ID is
-`sha256:97aa610c9a61693f6691127afbf06e40c410295eb73d0392dbdbab7495a43604`
-and its unpacked size is 624,921,007 bytes. On NX, the fail-closed ASR profile
+The final consolidated local image ID is
+`sha256:430a38b77673d7b3217691cd27ca01b62123f7ca6714363d9da3599cdb390af0`
+and its Docker inspect size is 579,256,279 bytes. It is labeled with root
+revision `d76bf4fd7518670b7e26e230a3a366d71a481958` and submodule revision
+`d46ae67f7a4d1aa0f2d26693fc8741ac09fa5c32`. On NX, the fail-closed ASR profile
 verified the complete model SHA manifest, adopted device-native v0.10 engine
 sidecars for host signature `sm87-trt10.3-jp6.2-cuda12.6`, loaded the latest
 unified plugin, and reached `/readyz`. An actual 7.04-second WAV returned the
 expected Chinese transcript with 358 ms worker time and no error. The
 container was stopped after the gate and the image remains unpublished.
+
+## Qwen3.5 4K GDN+MTP final rebuild gate (2026-08-15)
+
+The final 4K base and draft engines were rebuilt on the 16 GB Orin NX from the
+same immutable `harvestsu/Qwen3.5-4B-AWQ` revision, AWQ group-128 W4A16 recipe,
+INT4 plugin version 1, batch size 1, 4096 input/KV capacities, and verify/draft
+tree size 7 used by the qualified candidate. The engine directory is 3.7 GB;
+its `SHA256SUMS.relative` SHA-256 is
+`862f7cd2f1c56308b7c2322d8f61bd78ec5ecf5f9bedf7c0b0b9f4360042256d`.
+Every payload passed that manifest before runtime loading.
+
+The rebuilt pair loaded both TensorRT engines and the tokenizer, captured the
+MTP CUDA graphs, and returned the deterministic answer `2 plus 2 equals 4.`
+with acceptance rate 3.0. The v0.10 formatter reports 45.3487 token/s because
+it now includes `spec_decode_draft_accept`, a stage absent from the v0.9.1
+counter. The version-compatible gate deliberately compares only draft
+prefill, draft proposal, and base verification: v0.9.1 measured 48.2558
+token/s and the rebuilt v0.10 engine measured 48.0617 token/s, a ratio of
+0.995978. This passes the 0.95 no-regression threshold; the raw formatter
+field remains report-only rather than being compared across incompatible
+accounting contracts.
+The frozen runtime-evidence manifest SHA-256 is
+`70e6f9d7aa0ebe73e465f03446cce2e497101aaa177e5f0a89f4f862959dcbaf`.
