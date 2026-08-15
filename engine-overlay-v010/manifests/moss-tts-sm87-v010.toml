@@ -35,40 +35,41 @@ aarch64_build = true
 [build]
 type = "Release"
 enable_cute_dsl = "fmha"
-worker = "spark_tts_worker"
+worker = "moss_tts_nano_worker"
+precision_recipe = "mix1"
+global_precision = "fp32"
+local_precision = "bf16"
+codec_precision = "fp32"
 
-[driver]
-required_env = "EDGELLM_SPARK_LLM_DRIVER"
-required_outputs = ["llm.engine", "token-gate.json", "DRIVER_REVISION", "PROVENANCE.md"]
-token_gate_global_count = 32
+[model.tts]
+repo = "OpenMOSS-Team/MOSS-TTS-Nano-100M"
+revision = "44502f80dbf9743528fa921cc544d662c685ebec"
+weights_sha256 = "24003f2f11ac8a2cbf70514db2d8f1c02fb451aa6b3c0bffc9da09f31cd7caa5"
 
-[source]
-repo = "SparkAudio/Spark-TTS-0.5B"
-revision = "642071559bfc6346c2359d19dcb6be3f9dd8a05d"
-model_dir_env = "SPARKTTS_MODEL_DIR"
-repo_dir_env = "SPARKTTS_REPO"
-llm_weights_sha256 = "54825baf0a2f6076eb3c78fa1d22a95aee225f59070a8b295f8169db860eb109"
-bicodec_weights_sha256 = "e9940cd48d4446e4340ced82d234bf5618350dd9f5db900ebe47a4fdb03867ec"
+[model.codec]
+repo = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano"
+revision = "6aa02b01e445cc585582cf0ba480bc3ea6c8dd68"
+weights_sha256 = "34d9880d805eecb21bde975202b1c256dbd0eb98c8680b9d3aeffd2bc6ac2f67"
 
-[model.bf16]
-mode = "bf16"
-artifact_root = "engines/sparktts-bf16"
+[onnx.tts]
+repo = "OpenMOSS-Team/MOSS-TTS-Nano-100M-ONNX"
+revision = "f52645cb467506d8e18e746ddd59482685b74e58c"
 
-[model.w4a16]
-mode = "w4a16"
-artifact_root = "engines/sparktts-w4a16"
+[onnx.codec]
+repo = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX"
+revision = "eff0d0749bfb3fa2d61149794ec6feef0d1e1ae"
 
 [artifacts]
 root = "/opt/edgellm-v010"
 required = [
-  "engines/sparktts-bf16/llm.engine",
-  "engines/sparktts-bf16/token-gate.json",
-  "engines/sparktts-bf16/DRIVER_REVISION",
-  "engines/sparktts-bf16/PROVENANCE.md",
-  "engines/sparktts-w4a16/llm.engine",
-  "engines/sparktts-w4a16/token-gate.json",
-  "engines/sparktts-w4a16/DRIVER_REVISION",
-  "engines/sparktts-w4a16/PROVENANCE.md",
+  "bin/moss_tts_nano_worker",
+  "engines/moss-tts-nano/engines/moss_tts_prefill.plan",
+  "engines/moss-tts-nano/engines/moss_tts_decode_step.plan",
+  "engines/moss-tts-nano/engines/moss_tts_local_decoder.plan",
+  "engines/moss-tts-nano/engines/moss_tts_local_cached_step.plan",
+  "engines/moss-tts-nano/engines/moss_tts_local_fixed_sampled_frame.plan",
+  "engines/moss-tts-nano/codec_onnx/codec_decode_step.plan",
+  "engines/moss-tts-nano/PROVENANCE.md",
 ]
 provenance_required = true
 sha256_required = true

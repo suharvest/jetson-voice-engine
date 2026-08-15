@@ -605,7 +605,24 @@ build_moss() { # $1 model_id  $2 (unused) $3 precision(mix1)
   ONNX_DIR="${bundle}/tts" CODEC_ONNX_DIR="${bundle}/codec" \
     OUT_DIR="${out}" TRTEXEC="${trtexec}" \
     bash "${HERE}/../models/moss-tts-nano/build_moss_tts_engines.sh"
-  _meta "${out}/engines/moss_tts_prefill.plan"
+  local artifact
+  for artifact in \
+    "${out}/engines/moss_tts_prefill.plan" \
+    "${out}/engines/moss_tts_decode_step.plan" \
+    "${out}/engines/moss_tts_local_decoder.plan" \
+    "${out}/engines/moss_tts_local_cached_step.plan" \
+    "${out}/engines/moss_tts_local_fixed_sampled_frame.plan" \
+    "${out}/codec_onnx/codec_decode_step.plan"; do
+    [ -s "${artifact}" ] || {
+      echo "ERROR: MOSS mix1 build did not produce ${artifact}" >&2
+      exit 14
+    }
+    _meta "${artifact}"
+  done
+  _provenance "${out}" \
+    "OpenMOSS-Team/MOSS-TTS-Nano-100M+OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano" \
+    "44502f80dbf9743528fa921cc544d662c685ebec+6aa02b01e445cc585582cf0ba480bc3ea6c8dd68" \
+    "mix1-fp32-global-bf16-local-fp32-codec"
 }
 
 build_sparktts() { # $1 model_id  $2 (unused)  $3 mode(bf16|w4a16)

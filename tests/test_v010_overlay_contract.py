@@ -171,6 +171,54 @@ def test_v010_manifests_have_release_provenance_and_fresh_hashes():
         assert result.returncode == 0, result.stderr
 
 
+def test_moss_and_spark_sources_are_immutable_and_weight_hash_locked():
+    moss = tomllib.loads(
+        (OVERLAY / "manifests/moss-tts-sm87-v010.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert moss["model"]["tts"] == {
+        "repo": "OpenMOSS-Team/MOSS-TTS-Nano-100M",
+        "revision": "44502f80dbf9743528fa921cc544d662c685ebec",
+        "weights_sha256": "24003f2f11ac8a2cbf70514db2d8f1c02fb451aa6b3c0bffc9da09f31cd7caa5",
+    }
+    assert moss["model"]["codec"] == {
+        "repo": "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano",
+        "revision": "6aa02b01e445cc585582cf0ba480bc3ea6c8dd68",
+        "weights_sha256": "34d9880d805eecb21bde975202b1c256dbd0eb98c8680b9d3aeffd2bc6ac2f67",
+    }
+    assert moss["build"]["precision_recipe"] == "mix1"
+
+    spark = tomllib.loads(
+        (OVERLAY / "manifests/sparktts-sm87-v010.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert spark["source"]["revision"] == (
+        "642071559bfc6346c2359d19dcb6be3f9dd8a05d"
+    )
+    assert spark["source"]["llm_weights_sha256"] == (
+        "54825baf0a2f6076eb3c78fa1d22a95aee225f59070a8b295f8169db860eb109"
+    )
+    assert spark["source"]["bicodec_weights_sha256"] == (
+        "e9940cd48d4446e4340ced82d234bf5618350dd9f5db900ebe47a4fdb03867ec"
+    )
+
+    driver = (OVERLAY / "build-engines-for-device.sh").read_text(
+        encoding="utf-8"
+    )
+    for artifact in (
+        "moss_tts_prefill.plan",
+        "moss_tts_decode_step.plan",
+        "moss_tts_local_decoder.plan",
+        "moss_tts_local_cached_step.plan",
+        "moss_tts_local_fixed_sampled_frame.plan",
+        "codec_decode_step.plan",
+    ):
+        assert artifact in driver
+    assert "mix1-fp32-global-bf16-local-fp32-codec" in driver
+
+
 def test_build_wrapper_replays_exact_counts_and_fails_closed():
     build = OVERLAY / "build.sh"
     text = build.read_text(encoding="utf-8")
