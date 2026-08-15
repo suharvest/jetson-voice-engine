@@ -398,6 +398,30 @@ def test_v010_qwen35_orin_contract_preserves_awq_and_context_profiles():
     )
     assert manifest["build"]["enable_cute_dsl"] == "ALL"
     assert manifest["build"]["plugin_preload_required"] is True
+    assert manifest["build"]["artifact_groups"] == [
+        "fmha",
+        "gdn",
+        "gemm",
+        "int4_fp16_gemm",
+        "ssd",
+    ]
+    assert manifest["build"]["excluded_groups"] == ["f16_moe"]
+    assert "cudaLibrary_t" in manifest["build"]["excluded_group_reason"]
+    assert manifest["build"]["cutedsl_library_sha256"] == (
+        "eba7a3526898df54b57060d85a1249785cfd00796ec84e885de45ce432275bb5"
+    )
+    assert manifest["build"]["cutedsl_manifest_sha256"] == (
+        "e394a69517e3016c5040fcb73533d29db029bee35a3163b595b358cc5e9d0575"
+    )
+    assert manifest["build"]["plugin_sha256"] == (
+        "6ea06491171799e8b111f15e1f54b39f422fb2841b80c4f8dcfb165bb7706844"
+    )
+    assert manifest["build"]["builder_sha256"] == (
+        "71f691eaff604b4e970faa981459dea2dec926597eb263ee4c71b854cec21c6f"
+    )
+    assert manifest["build"]["runner_sha256"] == (
+        "20a546b5971fc2e9189b07a35f87f28ab98b78fa7df482428ff7ace8d90d0003"
+    )
     model = manifest["model"]
     assert model["id"] == "harvestsu/Qwen3.5-4B-AWQ"
     assert model["revision"] == "7551dd662b7f7b140aaa99558ac62ac9317be1b5b"

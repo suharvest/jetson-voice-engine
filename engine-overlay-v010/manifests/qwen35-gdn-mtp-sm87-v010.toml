@@ -38,6 +38,16 @@ enable_cute_dsl = "ALL"
 builder = "build-gdn/examples/llm/llm_build"
 plugin = "build-gdn/libNvInfer_edgellm_plugin.so"
 plugin_preload_required = true
+artifact_groups = ["fmha", "gdn", "gemm", "int4_fp16_gemm", "ssd"]
+excluded_groups = ["f16_moe"]
+excluded_group_reason = "cutlass-dsl-4.6.1 emits cudaLibrary_t from its CUDA12.9 runtime, unavailable in Jetson CUDA12.6; dense Qwen3.5 does not consume f16_moe"
+cutedsl_library_sha256 = "eba7a3526898df54b57060d85a1249785cfd00796ec84e885de45ce432275bb5"
+cutedsl_metadata_sha256 = "b9211e796d4b308d4e1f828a620aa4c065b41bf4266dad1ac5463c4bf194f56e"
+cutedsl_manifest_sha256 = "e394a69517e3016c5040fcb73533d29db029bee35a3163b595b358cc5e9d0575"
+plugin_sha256 = "6ea06491171799e8b111f15e1f54b39f422fb2841b80c4f8dcfb165bb7706844"
+builder_sha256 = "71f691eaff604b4e970faa981459dea2dec926597eb263ee4c71b854cec21c6f"
+runner_sha256 = "20a546b5971fc2e9189b07a35f87f28ab98b78fa7df482428ff7ace8d90d0003"
+tool_manifest_sha256 = "35cbd1274a97dc63ab416b0dc0ed15e3a9f4b968872622068521376c50ac909a"
 
 [model]
 id = "harvestsu/Qwen3.5-4B-AWQ"

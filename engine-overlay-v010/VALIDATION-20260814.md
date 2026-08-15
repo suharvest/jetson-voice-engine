@@ -408,6 +408,63 @@ deterministic payload manifest SHA-256 is
 The 4K/8K build contract restores the v0.9.1 MTP verify/draft tree size of 7;
 the prior v0.10 candidate value 4 was not a qualified product parameter.
 
+## Qwen3.5 SM87 CuTe artifact gate (2026-08-15)
+
+The official v0.10 generator was run natively on `orin-nx` for SM87 with host
+CUDA 12.6.68, `nvidia-cutlass-dsl==4.6.1`, and `cupy-cuda12x==12.3.0`.
+The initial `ALL` artifact generated 65 variants, but its Ampere `f16_moe`
+header uses `cudaLibrary_t` from the CuTe package's CUDA 12.9 runtime API.
+That type is absent from Jetson CUDA 12.6, so a normal C++ build fails closed
+before linking. The failed artifact and log are retained as compatibility
+evidence; it is not credited to the release.
+
+Qwen3.5-4B is dense and does not consume the MoE runner. The qualified dense
+artifact therefore contains every group it does consume: `fmha`, `gdn`,
+`gemm`, `int4_fp16_gemm`, and `ssd`; `f16_moe` is explicitly excluded rather
+than silently disabled. CMake still uses `ENABLE_CUTE_DSL=ALL`, meaning all
+groups present in the checked artifact are compiled. The static library
+SHA-256 is
+`eba7a3526898df54b57060d85a1249785cfd00796ec84e885de45ce432275bb5`;
+metadata SHA-256 is
+`b9211e796d4b308d4e1f828a620aa4c065b41bf4266dad1ac5463c4bf194f56e`.
+The complete artifact manifest SHA-256 is
+`e394a69517e3016c5040fcb73533d29db029bee35a3163b595b358cc5e9d0575`.
+The same native build completed `ldd -r` for the release plugin, builder, and
+runner without unresolved symbols. Their SHA-256 values are respectively
+`6ea06491171799e8b111f15e1f54b39f422fb2841b80c4f8dcfb165bb7706844`,
+`71f691eaff604b4e970faa981459dea2dec926597eb263ee4c71b854cec21c6f`,
+and `20a546b5971fc2e9189b07a35f87f28ab98b78fa7df482428ff7ace8d90d0003`;
+the tool manifest SHA-256 is
+`35cbd1274a97dc63ab416b0dc0ed15e3a9f4b968872622068521376c50ac909a`.
+MoE remains an unsupported v0.10/JP6.2 feature until NVIDIA supplies a
+CUDA12.6-compatible generator/runtime path.
+
+## Orin Nano TTS gray gates (2026-08-15)
+
+CustomVoice was rebuilt on `orin-nano` with an N1 Talker/CodePredictor profile
+and a Code2Wav `1/64/128` profile. Engine SHA-256 values are Talker
+`17d14eaa4c439fdd79bcc44336f7091c8a31dc59d023d6986c4f34fb573eb264`,
+CodePredictor
+`6b00e2d8c69c6cbff84f912a98a1a88e95e3b21597dc10e5cedc3a228fac4084`,
+and Code2Wav
+`0c58b0e473cd7943aef2ebc2287f0b4861b3bc407537c3fab8f80af984a50d50`.
+Two sequential Vivian generations, one in-flight cancel, and the recovery
+generation passed. The report SHA-256 is
+`9f17c3c20db1b96f957da7b044fc2f60b543ebe178a13a04bde11cc3a8258c62`;
+the relative engine-manifest SHA-256 is
+`0ae222a8bd8fff92b32d90d2e36a7d1ca4623395e5f70ad06607613d133ecbe4`.
+
+The NX-built Base N2 engines were also loaded on Nano as a compatibility gray
+gate. Native v0.10 `ref_audio` plus the exported clone encoders passed two
+sequential generations, cancel, and recovery; report SHA-256 is
+`a8ef684f2a15a7295dd3f9d66846808cf48cb9bcb12bfea97b5d4d651cb8c2f5`.
+TensorRT correctly warns that plans built on a different Orin model are not a
+formal performance artifact, so a Nano-native Base build remains required for
+the final no-regression gate. A preceding protocol probe also confirmed that
+`speaker_embedding_b64` is accepted only as a warned-and-ignored compatibility
+field on v0.10. Production callers must migrate to `ref_audio`/`ref_text`, or
+the OVS adapter must translate the old contract before the release is promoted.
+
 ## Gates still required before an overall OVS upgrade
 
 - Regenerate every ONNX and TensorRT engine with v0.10 identity.
