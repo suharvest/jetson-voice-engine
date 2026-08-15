@@ -220,6 +220,12 @@ def test_moss_and_spark_sources_are_immutable_and_weight_hash_locked():
         "weights_sha256": "34d9880d805eecb21bde975202b1c256dbd0eb98c8680b9d3aeffd2bc6ac2f67",
     }
     assert moss["build"]["precision_recipe"] == "mix1"
+    assert moss["build"]["global_precision"] == "fp32"
+    assert moss["build"]["local_precision"] == "fp16"
+    assert moss["build"]["codec_precision"] == "fp32"
+    assert moss["onnx"]["codec"]["revision"] == (
+        "ceff0d0749bfb3fa2d61149794ec6feef0d1e1ae"
+    )
 
     spark = tomllib.loads(
         (OVERLAY / "manifests/sparktts-sm87-v010.toml").read_text(
@@ -248,7 +254,8 @@ def test_moss_and_spark_sources_are_immutable_and_weight_hash_locked():
         "codec_decode_step.plan",
     ):
         assert artifact in driver
-    assert "mix1-fp32-global-bf16-local-fp32-codec" in driver
+    assert "GLOBAL_PREC= LOCAL_PREC=--fp16 CODEC_PREC=" in driver
+    assert "mix1-fp32-global-fp16-local-fp32-codec" in driver
 
 
 def test_build_wrapper_replays_exact_counts_and_fails_closed():

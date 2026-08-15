@@ -460,10 +460,8 @@ sequential generations, cancel, and recovery; report SHA-256 is
 `a8ef684f2a15a7295dd3f9d66846808cf48cb9bcb12bfea97b5d4d651cb8c2f5`.
 TensorRT correctly warns that plans built on a different Orin model are not a
 formal performance artifact, so a Nano-native Base build remains required for
-the final no-regression gate. A preceding protocol probe also confirmed that
-`speaker_embedding_b64` is accepted only as a warned-and-ignored compatibility
-field on v0.10. Production callers must migrate to `ref_audio`/`ref_text`, or
-the OVS adapter must translate the old contract before the release is promoted.
+the final no-regression gate. That initial probe preceded the compatibility
+adapter described below and is not evidence about the final candidate ABI.
 
 ## Gates still required before an overall OVS upgrade
 
@@ -471,10 +469,265 @@ the OVS adapter must translate the old contract before the release is promoted.
 - Publish model-owned immutable artifacts and a new outer v0.10 release lock.
 - Keep native ASR audio batching disabled until its two-WAV isolation defect
   is fixed; the formal INT4 b1/b2 path remains the release lane.
-- Finish MOSS, Spark and Qwen3.5 TensorRT builds, then run performance,
-  byte/parity, cross-model co-residency and release-profile RSS gates.
+- Publish the now-built MOSS, Spark, Qwen3.5 and voice payloads under immutable
+  revisions after their final manifests are frozen.
+- Finish the Nano-native Base performance gate and the remaining Nano v0.9.1
+  ASR control replay.
 - Build new v0.10 runtime images/profiles/compose identities while preserving
   v0.9.1 as rollback.
 
 Until those gates pass, the driver may produce only isolated v0.10 candidate
 artifacts and outer OVS v0.9.1 release identities must not be changed.
+
+## Orin Nano ASR INT4-AWQ v0.10 gates (2026-08-15)
+
+The formal v0.10 export reused the qualified production checkpoint and profile,
+but explicitly locked all 196 `Int4GroupwiseGemmPlugin` nodes to plugin v1;
+there are zero v2 nodes. The WSL ONNX manifest SHA-256 is
+`b60385946027fad4cbb83ae8c799fa99e18ed23a8cb413b56185cf0b726949a4`.
+Nano then built native B1/B2 engines with input/KV limits 1024/1536 plus an
+audio encoder with time-step range 100..3000. The complete engine manifest
+SHA-256 is
+`23736b8c41cb1cf9da596dc2beca90629ee3091d08741ac2270229af810a92e9`.
+
+The worker produced exact short-command transcripts `别说了。` and
+`Stop, please.` in 406.8 and 374.4 ms. B1 admitted one lane, rejected the
+second with status 4429, and reused lane zero after release. B2 exposed two
+physical lanes, rejected a third with 4429, reused a released lane, kept the
+Chinese and English requests isolated, and rejected unsafe native audio batch
+execution with `native_audio_batch_unsafe_v010`. Evidence SHA-256 values are:
+
+- B1 Chinese: `67d400b651d9bb92fd63a30b630353e5228f4e7b0e8ac790fb6ec5c05a1663a3`;
+- B1 English: `5273e769c52983aaba1ab81e6480bfc0e3cfed439d71a48e9999d419e30acefb`;
+- B2 isolation: `4df0df7a2de09980209d55d216db959f54f9593eddb495f2c43829c490526a18`.
+
+The fixed 20-row, SHA-locked FLEURS corpus also completed without an empty
+result or worker error. Using the repository's common normalization and
+CER/WER implementation, mean error rates were 7.41% short Chinese, 5.75% long
+Chinese, 4.29% short English, and 5.47% long English. Median per-row worker
+latencies were respectively 222.8, 396.8, 205.0, and 424.2 ms. These numbers
+are backed by raw report SHA-256
+`1a88c889ed9772f238cfea11b072937c25c80ef64994bd683f599e09a1983b2b`.
+They remain candidate evidence until the same corpus is replayed on a native Nano
+v0.9.1 baseline; the prior Nano inventory has only v0.8.0 INT4 and v0.10 FP16,
+so neither may be mislabeled as that control.
+
+## Legacy Base voice-clone embedding compatibility (2026-08-15)
+
+The v0.10 adapter now retains the production `speaker_embedding_b64` ABI as a
+thin compatibility layer over the upstream Base runtime. It accepts only
+canonical base64 encoding of exactly 1024 finite little-endian float32 values,
+copies them into the same x-vector slot populated by the native clone encoder,
+and fails closed on malformed data or conflicting speaker/ref-audio fields. It
+does not restore the retired external speaker/mel engines. The 4+32 patch stack
+passes checksum validation, exact forward/reverse replay and tracked-tree
+equality, and the 13 overlay contract tests pass. The rebuilt Orin worker
+SHA-256 is
+`3b718c128069c9c242e3287ac887a2ad6c198009ea8f6d4a3eb0edb18b1f7f78`.
+On Orin NX, the same embedding produced byte-identical PCM twice
+(`f93a9b300293db44a7bceac653ffec9adc631752715e771246ab72904dbc9705`),
+while a different checked embedding produced
+`5285b0ee9eac31643e462a00bb1a90122b48e0ef8db0f9639eb1507cc58637c9`.
+The A/B evidence SHA-256 is
+`bf4c05f5cda57fa85fdb8f350b0305bc407036eb841d18e7024bd83fe7a3f80c`.
+
+An interleaved v0.9.1/v0.10 Base performance comparison normalized for the
+different generated frame counts. v0.10/v0.9.1 was 1.01682 per frame and
+1.01685 for TTFA, both within the 1.05 no-regression gate; total wall time was
+0.90550 because v0.10 generated 57 rather than 64 frames. The performance
+report SHA-256 is
+`13c7d955003bc137ae5694b5f0adce2a53990b189e0bcc474b9ddbf9a1b1802a`.
+
+## Candidate image ASR service gate on orin-nano (2026-08-15)
+
+The isolated candidate image
+`seeed-local-voice:edgellm-v010-candidate-unpublished` has local image ID
+`sha256:f64c940dc7e59447f3509f91c9e022175e30703eb378e5380e5b5d59067af4ac`.
+It was started with both candidate opt-ins, an independent
+`speech-models-v010-candidate` volume, and the formal INT4 B1/B2/audio engine
+payload. The HTTP service became ready, returned the exact Chinese and English
+transcripts `别说了。` and `Stop, please.`, completed those requests in 155.8
+and 111.5 ms, and completed a genuinely overlapping N=2 pair in 393.5 ms wall
+time. A subsequent recovery request returned the exact Chinese transcript in
+94.9 ms. The evidence manifest SHA-256 is
+`4f113bde158c591b7bed7169ce78025264380d309d01f553e4771bb9030aa736`.
+The image remains deliberately unpublished and cannot be promoted by this gray
+gate alone.
+
+## Qwen3.5 8K GDN+MTP performance comparison (2026-08-15)
+
+The 8K v0.10 engines use the same immutable W4A16 AWQ checkpoint, group size
+128, plugin v1, 4096 input profile, 8192 KV capacity, and MTP tree-size contract
+as the qualified v0.9.1 control. Their relative payload-manifest SHA-256 is
+`b673fd188ccca32bcf9f715462c3233558a86ba6045554233baac2ebfb74e936`.
+Both versions returned the correct deterministic answer and had median MTP
+acceptance 3.0. v0.10 prefill improved from 393.68 to 403.95 token/s, but median
+decode throughput fell from 47.6602 to 44.6096 token/s, a ratio of 0.935993.
+That fails the original 0.95 gate when the two releases' reported fields are
+treated as the same metric. It is retained as evidence of the initial gate,
+but the reported values were subsequently found not to have the same timing
+contract.
+
+The follow-up test ran v0.10 first and interleaved six runs of each release on
+the same `MAXN_SUPER` system with CPU, GPU, and EMC clocks pinned. It confirmed
+the reported-field difference: v0.9.1 median decode throughput was 47.6171
+token/s and v0.10 was 44.7251 token/s, a ratio of 0.939265. All twelve answers
+were identical and all acceptance values remained 3.0. v0.10 prefill was again
+faster, 404.319 versus 393.315 token/s. The temperature-tagged evidence
+manifest SHA-256 is
+`bfe4a15832412a857c70e31ca53cbdaa15208c2823f82456b6730f1288d4d808`.
+
+Stage-level source and profile analysis then identified the contract change.
+v0.10 adds `spec_decode_draft_accept` to the reported throughput denominator;
+v0.9.1 executes the same accept-token catch-up but its formatter omits that
+stage. Recomputing both releases with the v0.9.1 stage set gives a v0.10/v0.9.1
+ratio of 0.99785. A larger three-run test with 50 requests per process gave a
+compatible-stage ratio of 0.99441 and median process wall times of 22.217 s for
+v0.10 versus 23.750 s for v0.9.1, so steady-state v0.10 was 6.5% faster. Its
+evidence manifest SHA-256 is
+`257044ef5cc77b1eb7d4b390fde53d2540bb3ed3a9d1d9674a34f6a968bcfbb6`.
+The steady-state performance gate therefore passes under an explicitly
+versioned metric contract. A controlled comparison then dropped the Linux page
+cache before each of three runs per release. Median cold process time was
+10.751 s for v0.10 versus 11.531 s for v0.9.1, a ratio of 0.93238, so the cold
+start gate also passes. Its evidence manifest SHA-256 is
+`09abf101bbe299c5194c748ef7dad49ce3db6d44a4c5d9377cf6b4232e518b60`.
+
+The candidate HTTP image pairs the v0.10 server wrapper, pybind SHA-256
+`0b5c4efb949bb611b7f7d9c152f48a937889918298b343d022a7415fc140a87f`
+and plugin SHA-256
+`6ea06491171799e8b111f15e1f54b39f422fb2841b80c4f8dcfb165bb7706844`.
+Its local image ID is
+`sha256:f80d34d7f36be39146a49eb9acf48bae9020f59144660c078a7aabb4cab871e1`.
+The fail-closed entrypoint verified the exact 8K profile, TensorRT 10.3.0.30,
+MTP engine co-location and the qualified top-k/step/tree contract 1/3/4, then
+passed warmup and fixed-answer HTTP inference. Twenty of twenty streaming
+abort/immediate-recovery rounds passed; abort-to-next-request delay was
+0.01--0.02 ms and recovery TTFT was 264--269 ms, with no CUDA/TensorRT error.
+The report SHA-256 is
+`78beccf7f1bbbaf68a98eada266bdf50f60e89b0b5cd4a620d59464d9530dc78`.
+
+Qwen3.5 and Qwen3-TTS Base then ran concurrently on the 16 GB NX. All 12 LLM
+requests returned their exact expected strings while Base emitted 72 frames /
+276480 PCM bytes. Peak system RAM was 12409 MiB and neither runtime reported
+an error. The co-residency report SHA-256 is
+`d7525d9277425b1144720be84e3514c3bee9059d6eb0921a2624892b6f5e3a37`.
+
+## MOSS-TTS-Nano v0.10 engine and runtime gates (2026-08-15)
+
+All six TensorRT components were rebuilt on `orin-nx` with the frozen mixed
+precision recipe: FP32 global prefill/decode, FP16 local decoder/cached/fixed,
+and FP32 codec decode. The release-shaped bundle also contains the v0.10
+worker, plugin, immutable model revisions, exporter/build-script hashes, and
+relocatable codec links. The 1.9 GB bundle manifest SHA-256 is
+`dd5dfdc028687e75f3f7681aad03c05c33defaa3db7e49a8219f1ecf68d0cdbb`;
+it was pulled to local archival storage and every payload hash was rechecked.
+
+The runtime gate loaded the correct ONNX Runtime 1.20 ABI, exposed two physical
+slots with concurrent dispatch and cooperative cancel, and produced non-empty,
+distinct 48 kHz outputs. Its initial pair overlapped. Three of three
+cancel/keep/recovery rounds passed, cancellation was terminal after one chunk,
+the worker exited zero, and stderr contained no CUDA or TensorRT error. The
+runtime evidence manifest SHA-256 is
+`3fce9023ffccb4db03bdee373153d0024ca7d3a8175cfd42725f0cbdd4572568`.
+
+An interleaved four-block v0.9.1/v0.10 comparison normalized generated audio
+seconds by wall seconds. v0.9.1 median was 4.37845x real time and v0.10 was
+4.38997x, a ratio of 1.00263; all isolated and overlapping N=2 requests
+completed without an error. The no-regression threshold was 0.95 and the
+summary SHA-256 is
+`150ae3e62dd63a45d6672cfd5f59a056452d07b5af05999f29aca37f774ebd57`.
+
+## SparkTTS v0.10 engine and runtime gates (2026-08-15)
+
+The arch-independent export retained the qualified
+`SparkAudio/Spark-TTS-0.5B` revision
+`642071559bfc6346c2359d19dcb6be3f9dd8a05d`. Its BF16 and reviewed W4A16
+graphs were rebuilt with the v0.10 SM87 builder; the W4A16 graph contains 72
+INT4 plugin-v1 nodes and no plugin-v2 node. The W4A16 and BF16 engine bundle
+manifest SHA-256 values are respectively
+`4d0f4e0bf4cd59d70bd6799a73cc75f9debefa35a58c09f272fd9a7c20772741`
+and `250bc6d32f915a02077a2fe8b5edfb71fcdfc63601a93092f8b9b744a6ffe235`.
+BiCodec FP16 and speaker-decoder FP32 were also rebuilt natively from their
+previously qualified ONNX graphs; their shared-bundle manifest SHA-256 is
+`0723d99d1f255c365009d19f57c37cbe39b2cc9cba8b2ece360793792521a1d1`.
+The CUDA 12.6/SM87 worker SHA-256 is
+`3928cd0e6cd0d2ee14abd8795cb68e0d365307bc6a6722c88d1544c75ccf8402`
+and its dynamic-symbol check has no missing dependency.
+
+The production W4A16 lane met or slightly improved the same-device v0.9.1
+baseline. Chinese TTFA/RTF were 0.449 s/0.502 versus 0.455 s/0.507; English
+were 0.409 s/0.494 versus 0.412 s/0.494. N=2 chunks were genuinely
+interleaved and both workers exited without a CUDA error. Clone and
+controllable modes produced distinct, non-empty audio. Ten of ten
+cancel/keep/recovery rounds passed with byte-identical keep and recovery
+outputs and cancellation after one chunk. A subsequent 50-round soak matching
+the v0.9.1 qualification count also passed 50/50: every cancellation was
+terminal after one chunk, every keep and recovery output remained byte-identical
+to its baseline, the worker exited zero, and no CUDA error was reported. Its
+evidence manifest SHA-256 is
+`80dac24a5ef5baf64b808230febf2b05942cabe4f39290b88d89472d649ffa33`.
+The BF16 correctness lane also
+passed basic and genuinely interleaved N=2 execution, though it remains slower
+than W4A16 and is not the production performance route. The evidence manifest
+SHA-256 is
+`a21ba53dcc066f05de8a4ea0caa0ba9da91f9077873e833f3856afdee15c1213`.
+
+## Orin Nano native Base INT4 rebuild and runtime gates (2026-08-15)
+
+The complete Base ONNX export was recovered from WSL and transferred directly
+over Tailscale to the Nano at 53.6 MB/s. Its 1,324,244,520-byte transfer
+archive SHA-256 was
+`4fe73e1229f5959e36a23a56956991f2c772638e0f9c1123e569a6abbf01776b`.
+Talker and CodePredictor retained the previously qualified INT4 group-128,
+plugin-v1 recipe; Code2Wav was rebuilt on the target with the 1/128/512
+profile. Both upstream clone encoders were also built natively. The frozen
+engine-manifest SHA-256 is
+`56ce2a04d54782e26e1e9a9a9a22fd6d0b4ff721012634a2c788f199197c0e31`
+and the provenance SHA-256 is
+`e85a81ec54efdad6b6415569045acfa8cef324ea877d440320276e0a2923b18d`.
+
+One warmup followed by three measured deterministic Base requests emitted 45
+frames / 172800 PCM bytes each. All three outputs were byte-identical with
+SHA-256
+`94b6dc44a7181201ef43400ca41168c3beffc8afcc167d397031855e78fc62d0`.
+Median warm TTFA was 425.7 ms and median wall time was 2.356 s for 3.6 s audio,
+an RTF of 0.6544. The last qualified Nano Base lane was v0.8 (the v0.9.1 Base
+artifact was not deployed on this host); its 540 ms TTFA and 0.69 RTF give
+candidate/control ratios of 0.7883 and 0.9484. Both pass the 1.05
+no-regression threshold. The strict v0.10/v0.9.1 Base comparison remains the
+same-device NX gate documented above.
+
+The two-slot gate produced distinct deterministic baselines, then a genuinely
+overlapping N=2 pair whose outputs matched both baselines byte-for-byte. All
+20 cancel/keep/immediate-recovery rounds passed. Cancellation became terminal
+in 7.93--8.33 ms, every unaffected request and recovery output matched its
+baseline, and stderr contained no CUDA or TensorRT error. The report SHA-256
+is
+`5797988f8a32bf08716664e9ba763689c9bc424ad9de2fa48762896d0430db70`.
+The build-only 6 GB `/swapfile_c2w` was swapped off and removed after the
+manifests were frozen, restoring 7.8 GB free disk without touching named
+images, model volumes, or rollback artifacts.
+
+## Consolidated v0.10 speech candidate image gate (2026-08-15)
+
+The additive image now contains all four workers (ASR, Qwen3 TTS,
+MOSS-TTS-Nano, and Spark-TTS), the unified plugin, all six isolated candidate
+profiles, and a MOSS-scoped frozen ONNX Runtime 1.20.0 sidecar. The sidecar is
+selected only by the MOSS wrapper, so the server and other backends retain the
+base image's newer Python ORT. Its SHA-256 is
+`c64760c225372f96045dcd9c340956db25ef94dd808d717c26d3b4a82fcaf13f`.
+The build checksum and executable gates rejected an accidentally lost ASR
+execute bit before it reached runtime. ABI smoke then passed for all four
+workers. The image also explicitly locks `LANGUAGE_MODE=multilanguage`; an
+initial service smoke proved that relying on the inherited `zh_en` default is
+correctly rejected by the profile loader.
+
+The corrected local image ID is
+`sha256:97aa610c9a61693f6691127afbf06e40c410295eb73d0392dbdbab7495a43604`
+and its unpacked size is 624,921,007 bytes. On NX, the fail-closed ASR profile
+verified the complete model SHA manifest, adopted device-native v0.10 engine
+sidecars for host signature `sm87-trt10.3-jp6.2-cuda12.6`, loaded the latest
+unified plugin, and reached `/readyz`. An actual 7.04-second WAV returned the
+expected Chinese transcript with 358 ms worker time and no error. The
+container was stopped after the gate and the image remains unpublished.

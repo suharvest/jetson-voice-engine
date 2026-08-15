@@ -38,7 +38,7 @@ enable_cute_dsl = "fmha"
 worker = "moss_tts_nano_worker"
 precision_recipe = "mix1"
 global_precision = "fp32"
-local_precision = "bf16"
+local_precision = "fp16"
 codec_precision = "fp32"
 
 [model.tts]
@@ -57,7 +57,7 @@ revision = "f52645cb467506d8e18e746ddd59482685b74e58c"
 
 [onnx.codec]
 repo = "OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano-ONNX"
-revision = "eff0d0749bfb3fa2d61149794ec6feef0d1e1ae"
+revision = "ceff0d0749bfb3fa2d61149794ec6feef0d1e1ae"
 
 [artifacts]
 root = "/opt/edgellm-v010"

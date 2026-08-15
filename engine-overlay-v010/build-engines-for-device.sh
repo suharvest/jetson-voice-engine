@@ -622,14 +622,16 @@ build_moss() { # $1 model_id  $2 (unused) $3 precision(mix1)
   #            + browser_poc_manifest.json + tokenizer.model
   #     codec/ moss_audio_tokenizer_decode_step.onnx + codec_browser_onnx_meta.json (+ .data)
   # (re-export from the HF model with models/moss-tts-nano/vendor/export_hf_to_tts_onnx.py
-  #  if you only have weights). Precision recipe = mix1 (fp32 globals+codec, bf16
-  #  local) — a naive all-fp16 build compiles clean but is SILENT. See the build
-  #  script header. Build the fp32 globals from the CLEAN (non-paged) ONNX.
+  #  if you only have weights). Orin SM87's qualified mix1 recipe is fp32
+  #  globals+codec / fp16 local. BF16 local is the GB10 recipe and TRT 10.3 on
+  #  Orin selects no BF16 kernel for these graphs. Build the fp32 globals from
+  #  the CLEAN (non-paged) ONNX.
   local m="$1" out="${EXPORT_ROOT}/$1" trtexec
   local bundle="${MOSS_ONNX_BUNDLE:?set MOSS_ONNX_BUNDLE=<dir with tts/ + codec/ ONNX> for moss}"
   trtexec="$(_find_trtexec)"
-  echo "==> [moss:${m}] trtexec mix1 (fp32 globals+codec / bf16 local) via ${trtexec}"
-  ONNX_DIR="${bundle}/tts" CODEC_ONNX_DIR="${bundle}/codec" \
+  echo "==> [moss:${m}] trtexec mix1 (fp32 globals+codec / fp16 local) via ${trtexec}"
+  GLOBAL_PREC= LOCAL_PREC=--fp16 CODEC_PREC= \
+    ONNX_DIR="${bundle}/tts" CODEC_ONNX_DIR="${bundle}/codec" \
     OUT_DIR="${out}" TRTEXEC="${trtexec}" \
     bash "${HERE}/../models/moss-tts-nano/build_moss_tts_engines.sh"
   local artifact
@@ -649,7 +651,7 @@ build_moss() { # $1 model_id  $2 (unused) $3 precision(mix1)
   _provenance "${out}" \
     "OpenMOSS-Team/MOSS-TTS-Nano-100M+OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano" \
     "44502f80dbf9743528fa921cc544d662c685ebec+6aa02b01e445cc585582cf0ba480bc3ea6c8dd68" \
-    "mix1-fp32-global-bf16-local-fp32-codec"
+    "mix1-fp32-global-fp16-local-fp32-codec"
 }
 
 build_sparktts() { # $1 model_id  $2 (unused)  $3 mode(bf16|w4a16)
