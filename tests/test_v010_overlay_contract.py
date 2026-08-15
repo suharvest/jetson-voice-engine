@@ -290,6 +290,11 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
         "stage2_weights_sha256",
     ):
         assert checksum_field in int4_driver_text
+    validator = (OVERLAY / "validate-tts-onnx.py").read_text(encoding="utf-8")
+    assert 'expected_v1 = 196 if args.talker_int4_plugin_version == "1" else 0' in validator
+    assert 'component_ops["Int4GroupwiseGemmPluginV2"]' in validator
+    assert "--require-clone-encoders" in validator
+    assert 'python3 "${HERE}/validate-tts-onnx.py"' in text
 
     result = subprocess.run([str(driver)], text=True, capture_output=True)
     assert result.returncode != 0

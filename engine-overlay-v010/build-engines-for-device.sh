@@ -244,7 +244,7 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
 
 build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable revision
   local m="$1" repo="$2" prec="${3:-int4}" src out
-  local tts_batch tts_max_input tts_max_kv tts_engine_suffix is_base
+  local tts_batch tts_max_input tts_max_kv tts_engine_suffix is_base tts_kind
   src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   # Product defaults are the v0.8 Base limits already validated on Jetson.
   # Concurrency is a separate artifact choice: the default build is the
@@ -254,8 +254,9 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
   tts_max_input="${TTS_MAX_INPUT_LEN:-1024}"
   tts_max_kv="${TTS_MAX_KV_CACHE_CAPACITY:-1536}"
   case "${m}" in
-    qwen3-tts-base|qwen3-tts-base-int4) is_base=1 ;;
-    *) is_base=0 ;;
+    qwen3-tts-base|qwen3-tts-base-int4) is_base=1; tts_kind=base ;;
+    qwen3-tts-voicedesign) is_base=0; tts_kind=voice_design ;;
+    *) is_base=0; tts_kind=custom_voice ;;
   esac
   case "${tts_batch}" in
     1) tts_engine_suffix="" ;;
@@ -325,6 +326,15 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
       exit 12
     }
   done
+  local -a tts_validator_args=(
+    "${out}/onnx"
+    --expected-tts-model-type "${tts_kind}"
+    --talker-int4-plugin-version "$([ "${prec}" = "int4" ] && printf 1 || printf none)"
+  )
+  if [ "${is_base}" = "1" ]; then
+    tts_validator_args+=(--require-clone-encoders)
+  fi
+  python3 "${HERE}/validate-tts-onnx.py" "${tts_validator_args[@]}"
   run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
       --engineDir "${out}/talker${tts_engine_suffix}" \
       --maxBatchSize "${tts_batch}" \
