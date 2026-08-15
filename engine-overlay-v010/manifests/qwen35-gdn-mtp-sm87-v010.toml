@@ -40,16 +40,22 @@ plugin = "build-gdn/libNvInfer_edgellm_plugin.so"
 plugin_preload_required = true
 
 [model]
-id = "Qwen/Qwen3.5-4B"
-revision = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+id = "harvestsu/Qwen3.5-4B-AWQ"
+revision = "7551dd662b7f7b140aaa99558ac62ac9317be1b5b"
 precision = "int4_awq"
 quantization_algorithm = "W4A16_AWQ"
 quantization_group_size = 128
+has_zero_point = false
+pre_quant_scale = true
 int4_gemm_plugin_version = 1
-calibration_dataset = "cnn_dailymail"
+producer = "modelopt"
+producer_version = "0.42.0"
+model_sha256 = "4bfccfd9e5e4ddfedada9fd61e236496bc7076eceb1b74c8eccb9894c3698f81"
+config_sha256 = "c508638fa1807c5fb3d5a627dcd073344e494186a152d069f8ec1eff3aea37b9"
+hf_quant_config_sha256 = "d4864cb797794e6466edcea150d70941d1ec26332cab695335a3c60891dc895c"
 lm_head_quantized = false
 kv_cache_quantization = "none"
-fp8_kv_opt_in_env = "QWEN35_FP8_KV_CACHE=1"
+fp8_kv_status = "separate_unqualified_raw-checkpoint-ab"
 components = ["gdn_base", "mtp_draft"]
 
 [profiles."4k"]
@@ -57,16 +63,16 @@ model_id = "qwen3.5-4b-mtp-4k"
 max_batch_size = 1
 max_input_len = 4096
 max_kv_cache_capacity = 4096
-max_verify_tree_size = 4
-max_draft_tree_size = 4
+max_verify_tree_size = 7
+max_draft_tree_size = 7
 
 [profiles."8k"]
 model_id = "qwen3.5-4b-mtp-8k"
 max_batch_size = 1
 max_input_len = 8192
 max_kv_cache_capacity = 8192
-max_verify_tree_size = 4
-max_draft_tree_size = 4
+max_verify_tree_size = 7
+max_draft_tree_size = 7
 
 [artifacts]
 root = "/opt/edgellm-v010"

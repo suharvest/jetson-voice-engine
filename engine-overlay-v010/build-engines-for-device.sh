@@ -53,6 +53,11 @@ BUILD="${UPSTREAM}/build"                 # voice-worker build (ENABLE_CUTE_DSL=
 BUILD_GDN="${UPSTREAM}/build-gdn"         # GDN build (ENABLE_CUTE_DSL=ALL) — for GDN/spec decode
 PLUGIN="${BUILD}/libNvInfer_edgellm_plugin.so"
 HF="${HF_ENDPOINT:-}"
+QWEN35_AWQ_REPO="harvestsu/Qwen3.5-4B-AWQ"
+QWEN35_AWQ_REVISION="7551dd662b7f7b140aaa99558ac62ac9317be1b5b"
+QWEN35_AWQ_MODEL_SHA256="4bfccfd9e5e4ddfedada9fd61e236496bc7076eceb1b74c8eccb9894c3698f81"
+QWEN35_AWQ_CONFIG_SHA256="c508638fa1807c5fb3d5a627dcd073344e494186a152d069f8ec1eff3aea37b9"
+QWEN35_AWQ_QUANT_CONFIG_SHA256="d4864cb797794e6466edcea150d70941d1ec26332cab695335a3c60891dc895c"
 if [ "${HF}" != "https://hf-mirror.com" ]; then
   echo "ERROR: model downloads require HF_ENDPOINT=https://hf-mirror.com" >&2
   echo "       provision the device with: fleet bootstrap <device> --profile edge-mirror" >&2
@@ -168,6 +173,26 @@ _quantize_qwen35() { # model_dir output_dir precision
     args+=(--kv_cache_quantization fp8)
   fi
   tensorrt-edgellm-quantize "${args[@]}"
+}
+
+_qwen35_export_source() { # model_dir quantized_output_dir precision
+  local src="$1" quantized="$2" precision="$3"
+  if [ "${precision}" = "int4_awq" ] && [ -s "${src}/hf_quant_config.json" ]; then
+    if [ "${QWEN35_FP8_KV_CACHE:-0}" = "1" ]; then
+      echo "ERROR: the frozen prequantized Qwen3.5 checkpoint has ordinary KV storage" >&2
+      echo "       FP8 KV remains a separate raw-checkpoint A/B and cannot mutate this release lane" >&2
+      exit 16
+    fi
+    python3 "${HERE}/validate-qwen35-prequantized.py" "${src}" \
+      --expected-revision "${QWEN35_AWQ_REVISION}" \
+      --expected-model-sha256 "${QWEN35_AWQ_MODEL_SHA256}" \
+      --expected-config-sha256 "${QWEN35_AWQ_CONFIG_SHA256}" \
+      --expected-quant-config-sha256 "${QWEN35_AWQ_QUANT_CONFIG_SHA256}"
+    printf '%s' "${src}"
+    return
+  fi
+  _quantize_qwen35 "${src}" "${quantized}" "${precision}"
+  printf '%s' "${quantized}"
 }
 
 build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
@@ -394,7 +419,7 @@ build_tts() { # $1 model_id  $2 hf_repo  $3 precision(int4|fp16)  $4 immutable r
 }
 
 build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
-  local m="$1" repo="$2" prec="${3:-int4_awq}" src out
+  local m="$1" repo="$2" prec="${3:-int4_awq}" src out export_src
   local -a export_backend_args=()
   src="$(_dl "${repo}" "$4")"; out="${EXPORT_ROOT}/${m}"
   [ -x "${BUILD_GDN}/examples/llm/llm_build" ] \
@@ -402,13 +427,13 @@ build_llm_base() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revisio
     echo "ERROR: ${m} requires a v0.10 BUILD_GDN with ENABLE_CUTE_DSL=ALL" >&2
     exit 6
   }
-  echo "==> [llm:${m}] quantize ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) -> GDN engine"
+  echo "==> [llm:${m}] validate/prepare ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) -> GDN engine"
   ( cd "${UPSTREAM}"
-    _quantize_qwen35 "${src}" "${out}/_q" "${prec}"
+    export_src="$(_qwen35_export_source "${src}" "${out}/_q" "${prec}")"
     if [ "${prec}" = "int4_awq" ]; then
       export_backend_args+=(--int4-gemm-plugin-version 1)
     fi
-    tensorrt-edgellm-export "${out}/_q" "${out}/onnx" \
+    tensorrt-edgellm-export "${export_src}" "${out}/onnx" \
       "${export_backend_args[@]}" --skip-visual --skip-audio )
   for required in \
     llm/model.onnx llm/config.json llm/embedding.safetensors \
@@ -443,10 +468,12 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
   esac
   export_src="${src}"
   if [ "${prec}" != "fp16" ] && [ "${prec}" != "bf16" ]; then
-    export_src="${EXPORT_ROOT}/${m}/_q"
-    echo "==> [llm:${m}] quantize ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) for native v0.10 MTP"
+    echo "==> [llm:${m}] validate/prepare ${prec} (fp8-kv opt-in=${QWEN35_FP8_KV_CACHE:-0}) for native v0.10 MTP"
+    mkdir -p "${EXPORT_ROOT}/${m}"
     ( cd "${UPSTREAM}"
-      _quantize_qwen35 "${src}" "${export_src}" "${prec}" )
+      export_src="$(_qwen35_export_source "${src}" "${EXPORT_ROOT}/${m}/_q" "${prec}")"
+      printf '%s\n' "${export_src}" > "${EXPORT_ROOT}/${m}/EXPORT_SOURCE" )
+    export_src="$(cat "${EXPORT_ROOT}/${m}/EXPORT_SOURCE")"
   fi
   if [ "${prec}" = "int4_awq" ]; then
     export_backend_args+=(--int4-gemm-plugin-version 1)
@@ -454,7 +481,7 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
   echo "==> [llm:${m}] native v0.10 export --mtp"
   ( cd "${UPSTREAM}"
     tensorrt-edgellm-export "${export_src}" "${export_dir}" \
-      "${export_backend_args[@]}" --mtp )
+      "${export_backend_args[@]}" --mtp --skip-visual --skip-audio )
   for required in llm/model.onnx llm/config.json mtp_draft/model.onnx mtp_draft/config.json; do
     [ -s "${export_dir}/${required}" ] || {
       echo "ERROR: v0.10 MTP export did not produce ${export_dir}/${required}" >&2
@@ -473,7 +500,7 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
       --maxBatchSize 1 \
       --maxInputLen "${max_input}" \
       --maxKVCacheCapacity "${max_kv}" \
-      --maxVerifyTreeSize 4 \
+      --maxVerifyTreeSize 7 \
       --specBase
   run_gdn_builder "${BUILD_GDN}/examples/llm/llm_build" \
       --onnxDir "${export_dir}/mtp_draft" \
@@ -481,7 +508,7 @@ build_llm_mtp() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
       --maxBatchSize 1 \
       --maxInputLen "${max_input}" \
       --maxKVCacheCapacity "${max_kv}" \
-      --maxDraftTreeSize 4 \
+      --maxDraftTreeSize 7 \
       --specDraft
   # v0.9.1 used EDGELLM_MTP_BUILD_SCRIPT here. v0.10 owns --mtp export and
   # --specBase/--specDraft builds natively, so the opaque hook is retired.
@@ -688,11 +715,11 @@ REPO[qwen3-tts-int4]="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"; REV[qwen3-tts-int4]
 REPO[qwen3-tts-base]="Qwen/Qwen3-TTS-12Hz-0.6B-Base";   REV[qwen3-tts-base]="5d83992436eae1d760afd27aff78a71d676296fc"; KIND[qwen3-tts-base]=tts; PREC[qwen3-tts-base]=fp16
 REPO[qwen3-tts-base-int4]="Qwen/Qwen3-TTS-12Hz-0.6B-Base"; REV[qwen3-tts-base-int4]="5d83992436eae1d760afd27aff78a71d676296fc"; KIND[qwen3-tts-base-int4]=tts; PREC[qwen3-tts-base-int4]=int4
 REPO[qwen3-tts-voicedesign]="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"; REV[qwen3-tts-voicedesign]="5ecdb67327fd37bb2e042aab12ff7391903235d3"; KIND[qwen3-tts-voicedesign]=tts; PREC[qwen3-tts-voicedesign]=fp16
-REPO[qwen3.5-4b]="Qwen/Qwen3.5-4B";                     REV[qwen3.5-4b]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=int4_awq
-REPO[qwen3.5-4b-base]="Qwen/Qwen3.5-4B";                REV[qwen3.5-4b-base]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=int4_awq
-REPO[qwen3.5-4b-mtp]="Qwen/Qwen3.5-4B";                 REV[qwen3.5-4b-mtp]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=int4_awq
-REPO[qwen3.5-4b-mtp-4k]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-mtp-4k]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp-4k]=llm_mtp; PREC[qwen3.5-4b-mtp-4k]=int4_awq
-REPO[qwen3.5-4b-mtp-8k]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-mtp-8k]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; KIND[qwen3.5-4b-mtp-8k]=llm_mtp; PREC[qwen3.5-4b-mtp-8k]=int4_awq
+REPO[qwen3.5-4b]="${QWEN35_AWQ_REPO}";                  REV[qwen3.5-4b]="${QWEN35_AWQ_REVISION}"; KIND[qwen3.5-4b]=llm_base; PREC[qwen3.5-4b]=int4_awq
+REPO[qwen3.5-4b-base]="${QWEN35_AWQ_REPO}";             REV[qwen3.5-4b-base]="${QWEN35_AWQ_REVISION}"; KIND[qwen3.5-4b-base]=llm_base; PREC[qwen3.5-4b-base]=int4_awq
+REPO[qwen3.5-4b-mtp]="${QWEN35_AWQ_REPO}";              REV[qwen3.5-4b-mtp]="${QWEN35_AWQ_REVISION}"; KIND[qwen3.5-4b-mtp]=llm_mtp; PREC[qwen3.5-4b-mtp]=int4_awq
+REPO[qwen3.5-4b-mtp-4k]="${QWEN35_AWQ_REPO}";           REV[qwen3.5-4b-mtp-4k]="${QWEN35_AWQ_REVISION}"; KIND[qwen3.5-4b-mtp-4k]=llm_mtp; PREC[qwen3.5-4b-mtp-4k]=int4_awq
+REPO[qwen3.5-4b-mtp-8k]="${QWEN35_AWQ_REPO}";           REV[qwen3.5-4b-mtp-8k]="${QWEN35_AWQ_REVISION}"; KIND[qwen3.5-4b-mtp-8k]=llm_mtp; PREC[qwen3.5-4b-mtp-8k]=int4_awq
 REPO[qwen3.5-4b-dflash]="Qwen/Qwen3.5-4B";              REV[qwen3.5-4b-dflash]="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"; DRAFT_REPO[qwen3.5-4b-dflash]="z-lab/Qwen3.5-4B-DFlash"; DRAFT_REV[qwen3.5-4b-dflash]="9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf"; KIND[qwen3.5-4b-dflash]=llm_dflash; PREC[qwen3.5-4b-dflash]=int4_awq
 # moss/sparktts are not plain HF-repo pipelines — sources come from env
 # (MOSS_ONNX_BUNDLE / SPARKTTS_MODEL_DIR+SPARKTTS_REPO); REPO holds a hint only.

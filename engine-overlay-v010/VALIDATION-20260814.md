@@ -359,14 +359,63 @@ product `pcm_b64` path passes. That legacy compatibility path is not credited
 to the gray gate and must not be used as the release health check. The failure
 is retained as a compatibility difference rather than hidden by the PCM pass.
 
+## Qwen3-TTS INT4 N=2 candidate engines on orin-nx (2026-08-15)
+
+The Base release-shaped N=2 engines retain the qualified W4A16 plugin-v1
+Talker, input/KV limits 1024/1536, and FP16 CodePredictor/Code2Wav. The
+canonical payload manifest SHA-256 is
+`24c537c2526b492f0cb3e6fed87b13dd3a8766bd3cd21aaadcfc441e0e480455`.
+The direct worker gate created two slots, proved overlapping execution and
+byte-identical solo/concurrent PCM for two distinct prompts, then passed ten
+cancel/keep/recovery rounds with no CUDA/TensorRT error. Its evidence SHA-256
+is `94deb1d54df45de99ae91bc39a63860c8d899379e1b8091018ead193ad17ec1c`.
+
+CustomVoice was rebuilt from revision
+`85e237c12c027371202489a0ec509ded67b5e4b5b`, using the 256-sample qualified
+stage-2 checkpoint and the explicit v1 ONNX gate (196 v1 nodes, zero v2). The
+N=2 engine SHA-256 values are:
+
+- Talker: `46042176652b57f0465eca209372a0e2c78528a91abd7f0971d5f1d4b0da23b0`;
+- CodePredictor: `1f820bbdd639e5f1740fca953d3ef363dbc5afc3c5d902845c8a727d901fac64`;
+- Code2Wav: `2fac33117e50b0cf4176c01f530aac08d4f037aa088aec5738054cf41e69c34a`.
+
+The CustomVoice payload manifest SHA-256 is
+`62365e47ee88ea1957f225dc2be30b9aa44c13186e9fdeb0b12bbb9bf42b93ef`.
+The real built-in `Vivian` speaker path passed ten N=2 cancel/keep/recovery
+rounds. Concurrent TTFA was 594.8/595.1 ms, both outputs matched their solo PCM
+SHA-256 exactly, overlap was real, and stderr had no CUDA/TensorRT error. The
+evidence SHA-256 is
+`05e2134e67b0f89277bb3a8fa5c9cd43a9880e0072d5f3770fd77fd15effdc13`.
+
+## Qwen3.5 prequantized v0.10 export gate (2026-08-15)
+
+The Orin lane now consumes `harvestsu/Qwen3.5-4B-AWQ` at immutable revision
+`7551dd662b7f7b140aaa99558ac62ac9317be1b5b`. Every mirror metadata file binds
+that revision. `model.safetensors` SHA-256 is
+`4bfccfd9e5e4ddfedada9fd61e236496bc7076eceb1b74c8eccb9894c3698f81`;
+the config and HF quantization config SHA-256 values are respectively
+`c508638fa1807c5fb3d5a627dcd073344e494186a152d069f8ec1eff3aea37b9`
+and `d4864cb797794e6466edcea150d70941d1ec26332cab695335a3c60891dc895c`.
+The new validator rejects any drift from ModelOpt 0.42.0 W4A16_AWQ, group 128,
+no zero point, pre-quant scale enabled, ordinary KV storage, 32 base layers and
+one MTP layer. It skips requantization only after all checks pass.
+
+The v0.10 exporter produced thinker and MTP draft graphs with plugin v1:
+the thinker has 249 `Int4GroupwiseGemmPlugin` nodes and the draft has 9; both
+have zero `Int4GroupwiseGemmPluginV2` nodes and pass ONNX checker. The
+deterministic payload manifest SHA-256 is
+`744e7033b9511954ccfb5f76889862c1672dd3b8bba5b3532d243ce9bc751ae4`.
+The 4K/8K build contract restores the v0.9.1 MTP verify/draft tree size of 7;
+the prior v0.10 candidate value 4 was not a qualified product parameter.
+
 ## Gates still required before an overall OVS upgrade
 
 - Regenerate every ONNX and TensorRT engine with v0.10 identity.
 - Publish model-owned immutable artifacts and a new outer v0.10 release lock.
-- Replace the ASR FP16 gray set with formal INT4 artifacts; keep native audio
-  batch disabled until its two-WAV isolation defect is fixed.
-- Run Qwen3-TTS CustomVoice, MOSS, Spark, Qwen3.5, cancellation/recovery,
-  byte/parity, cross-model co-residency, and release-profile RSS gates.
+- Keep native ASR audio batching disabled until its two-WAV isolation defect
+  is fixed; the formal INT4 b1/b2 path remains the release lane.
+- Finish MOSS, Spark and Qwen3.5 TensorRT builds, then run performance,
+  byte/parity, cross-model co-residency and release-profile RSS gates.
 - Build new v0.10 runtime images/profiles/compose identities while preserving
   v0.9.1 as rollback.
 

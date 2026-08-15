@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import sys
 import tomllib
@@ -273,7 +274,7 @@ def test_v010_aggregate_engine_driver_is_pin_and_revision_locked():
         "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
         "85e237c12c027371202489a0ec509ded67b5e4b5",
         "5d83992436eae1d760afd27aff78a71d676296fc",
-        "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+        "7551dd662b7f7b140aaa99558ac62ac9317be1b5b",
         "5ecdb67327fd37bb2e042aab12ff7391903235d3",
         "9a1996ccf887b79ab3af4fcbf8c1d1f4b5658bcf",
     ):
@@ -398,12 +399,78 @@ def test_v010_qwen35_orin_contract_preserves_awq_and_context_profiles():
     assert manifest["build"]["enable_cute_dsl"] == "ALL"
     assert manifest["build"]["plugin_preload_required"] is True
     model = manifest["model"]
+    assert model["id"] == "harvestsu/Qwen3.5-4B-AWQ"
+    assert model["revision"] == "7551dd662b7f7b140aaa99558ac62ac9317be1b5b"
     assert model["precision"] == "int4_awq"
     assert model["quantization_algorithm"] == "W4A16_AWQ"
     assert model["quantization_group_size"] == 128
+    assert model["has_zero_point"] is False
+    assert model["pre_quant_scale"] is True
+    assert model["producer"] == "modelopt"
+    assert model["producer_version"] == "0.42.0"
+    assert model["model_sha256"] == "4bfccfd9e5e4ddfedada9fd61e236496bc7076eceb1b74c8eccb9894c3698f81"
     assert model["int4_gemm_plugin_version"] == 1
     assert model["kv_cache_quantization"] == "none"
     assert manifest["profiles"]["4k"]["max_input_len"] == 4096
     assert manifest["profiles"]["4k"]["max_kv_cache_capacity"] == 4096
+    assert manifest["profiles"]["4k"]["max_verify_tree_size"] == 7
+    assert manifest["profiles"]["4k"]["max_draft_tree_size"] == 7
     assert manifest["profiles"]["8k"]["max_input_len"] == 8192
     assert manifest["profiles"]["8k"]["max_kv_cache_capacity"] == 8192
+    assert manifest["profiles"]["8k"]["max_verify_tree_size"] == 7
+    assert manifest["profiles"]["8k"]["max_draft_tree_size"] == 7
+
+    driver = (OVERLAY / "build-engines-for-device.sh").read_text(encoding="utf-8")
+    assert "validate-qwen35-prequantized.py" in driver
+    assert "--maxVerifyTreeSize 7" in driver
+    assert "--maxDraftTreeSize 7" in driver
+
+
+def test_v010_qwen35_prequantized_validator_is_fail_closed(tmp_path: Path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    revision = "qualified-revision"
+    config = {
+        "model_type": "qwen3_5",
+        "text_config": {"num_hidden_layers": 32, "mtp_num_hidden_layers": 1},
+        "quantization_config": {
+            "quant_algo": "W4A16_AWQ",
+            "quant_method": "modelopt",
+        },
+    }
+    quant = {
+        "producer": {"name": "modelopt", "version": "0.42.0"},
+        "quantization": {
+            "quant_algo": "W4A16_AWQ",
+            "group_size": 128,
+            "has_zero_point": False,
+            "pre_quant_scale": True,
+            "kv_cache_quant_algo": None,
+        },
+    }
+    (checkpoint / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (checkpoint / "hf_quant_config.json").write_text(json.dumps(quant), encoding="utf-8")
+    (checkpoint / "model.safetensors").write_bytes(b"qualified-awq-weights")
+    (checkpoint / "SOURCE_REVISION").write_text(revision + "\n", encoding="utf-8")
+
+    command = [
+        sys.executable,
+        str(OVERLAY / "validate-qwen35-prequantized.py"),
+        str(checkpoint),
+        "--expected-revision",
+        revision,
+        "--expected-model-sha256",
+        _sha256(checkpoint / "model.safetensors"),
+        "--expected-config-sha256",
+        _sha256(checkpoint / "config.json"),
+        "--expected-quant-config-sha256",
+        _sha256(checkpoint / "hf_quant_config.json"),
+    ]
+    assert subprocess.run(command, capture_output=True, text=True).returncode == 0
+
+    quant["quantization"]["has_zero_point"] = True
+    (checkpoint / "hf_quant_config.json").write_text(json.dumps(quant), encoding="utf-8")
+    command[-1] = _sha256(checkpoint / "hf_quant_config.json")
+    rejected = subprocess.run(command, capture_output=True, text=True)
+    assert rejected.returncode != 0
+    assert "zero point must be disabled" in rejected.stderr
