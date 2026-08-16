@@ -29,9 +29,14 @@ Track upstream scheduler work, but do not advertise continuous batching yet.
 
 ## Opt-in evaluation after the base upgrade
 
-- **Nemotron-3.5-ASR.** Compare with Qwen3-ASR on Chinese/English accuracy,
-  first-token latency, streaming stability, and memory before adding a
-  profile.
+- **Nemotron-3.5-ASR: evaluated, not adopted.** The offline batch-1 v0.10
+  runner passed the Orin steady-state RTF gate but failed Chinese quality
+  (26.03% CER versus Qwen's 6.58% on the same corpus). The official
+  Transformers path reproduced the loss, so it is not an ONNX/TensorRT parity
+  regression. English passed the absolute gate but remained behind Qwen. Do
+  not publish engines, add a production profile, or claim cache-aware
+  streaming from this experimental runner; see
+  `NEMOTRON-ASR-VALIDATION-20260816.md`.
 - **Nemotron-3.5 Lightning, MTP/DFlash, and DSpark.** Potentially useful for
   chat latency, but Orin memory and the JP6.2 compatibility tier make these
   canary-only until measured. Do not replace the existing Qwen3.5 default.
