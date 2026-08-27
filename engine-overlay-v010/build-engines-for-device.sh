@@ -247,22 +247,38 @@ build_asr() { # $1 model_id  $2 hf_repo  $3 precision  $4 immutable revision
       exit 8
     }
   done
-  # Keep distinct b1/b2 artifacts: b1 is the low-footprint rollback; b2 is
-  # required for two independent SessionLaneManager lanes. Long-context
-  # opt-ins use suffixed directories and cannot overwrite the production pair.
-  run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
-      --engineDir "${out}/thinker-b1${suffix}" --maxBatchSize 1 \
-      --maxInputLen "${max_input}" --maxKVCacheCapacity "${max_kv}"
-  run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
-      --engineDir "${out}/thinker-b2${suffix}" --maxBatchSize 2 \
-      --maxInputLen "${max_input}" --maxKVCacheCapacity "${max_kv}"
+  # One engine per batch size, each in its own directory: the batch size is
+  # compiled into the engine and the ASR worker clamps its lane count to
+  # runtime->maxSessionBatchSize(), so N concurrent sessions need a bN engine.
+  # b1 is the low-footprint rollback. Long-context opt-ins use suffixed
+  # directories and cannot overwrite the production set.
+  #
+  # Default stays "1 2" so existing builds are byte-identical. Set
+  # ASR_MAX_BATCH_SIZES="1 2 3" to also produce the 3-lane engine.
+  local asr_batches="${ASR_MAX_BATCH_SIZES:-1 2}"
+  local b
+  for b in ${asr_batches}; do
+    case "${b}" in
+      1|2|3) ;;
+      *)
+        echo "ERROR: ASR_MAX_BATCH_SIZES entries must be 1, 2 or 3 (got ${b})" >&2
+        exit 8
+        ;;
+    esac
+  done
+  for b in ${asr_batches}; do
+    run_builder "${BUILD}/examples/llm/llm_build" --onnxDir "${out}/onnx/llm" \
+        --engineDir "${out}/thinker-b${b}${suffix}" --maxBatchSize "${b}" \
+        --maxInputLen "${max_input}" --maxKVCacheCapacity "${max_kv}"
+  done
   run_builder "${BUILD}/examples/multimodal/audio_build" \
       --onnxDir "${out}/onnx/audio" \
       --engineDir "${out}/audio_encoder" \
       --minTimeSteps "${ASR_AUDIO_MIN_TIME_STEPS:-100}" \
       --maxTimeSteps "${ASR_AUDIO_MAX_TIME_STEPS:-3000}"
-  _meta "${out}/thinker-b1${suffix}/llm.engine"
-  _meta "${out}/thinker-b2${suffix}/llm.engine"
+  for b in ${asr_batches}; do
+    _meta "${out}/thinker-b${b}${suffix}/llm.engine"
+  done
   _meta "${out}/audio_encoder/audio/audio_encoder.engine"
   _provenance "${out}" "${repo}" "$4" "${prec}"
 }
