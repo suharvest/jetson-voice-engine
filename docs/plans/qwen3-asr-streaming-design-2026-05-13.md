@@ -3,7 +3,7 @@
 Status: revised after codex review (2026-05-13)
 Owner: harvest
 Date: 2026-05-13
-Target fork branch: `Seeed-Solution/TensorRT-Edge-LLM @ qwen3-tts-highperf-runtime-w8a16`
+Target fork branch: `suharvest/TensorRT-Edge-LLM @ qwen3-tts-highperf-runtime-w8a16`
 
 > Revision history:
 > - **v5 (2026-05-13 final)**: P0 design pivot. Empirical LCS test

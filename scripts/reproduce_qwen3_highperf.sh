@@ -5,8 +5,8 @@
 # What it does (in order, fail-fast):
 #   1. Clone (or fetch) the three repos at the validated branches:
 #        Seeed-Solution/openvoicestream       branch qwen3tts-accurate-20260507
-#        Seeed-Solution/jetson-voice-engine     branch main
-#        Seeed-Solution/TensorRT-Edge-LLM        branch qwen3-tts-highperf-runtime-w8a16
+#        suharvest/jetson-voice-engine     branch main
+#        suharvest/TensorRT-Edge-LLM        branch qwen3-tts-highperf-runtime-w8a16
 #   2. Initialise EdgeLLM submodules.
 #   3. cmake configure + build (-j1; the SM87/CuTe-DSL/EMBEDDED_TARGET
 #      defaults are already in CMakeLists at HEAD).
@@ -81,8 +81,8 @@ JETSON_VOICE_COMMIT="${JETSON_VOICE_COMMIT:-}"
 log "step 1/7: ensure three repos at the validated branches"
 mkdir -p "$WORKSPACE"
 declare -A REPOS=(
-  ["$EDGELLM:qwen3-tts-highperf-runtime-w8a16"]="https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git"
-  ["$QEJ:main"]="https://github.com/Seeed-Solution/jetson-voice-engine.git"
+  ["$EDGELLM:qwen3-tts-highperf-runtime-w8a16"]="https://github.com/suharvest/TensorRT-Edge-LLM.git"
+  ["$QEJ:main"]="https://github.com/suharvest/jetson-voice-engine.git"
   ["$JV:qwen3tts-accurate-20260507"]="https://github.com/Seeed-Solution/openvoicestream.git"
 )
 for spec in "${!REPOS[@]}"; do

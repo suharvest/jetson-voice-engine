@@ -36,7 +36,7 @@ interrupted `.incomplete` download can resume. Do not construct a
 ## 2. Clone this build repository
 
 ```bash
-git clone https://github.com/Seeed-Solution/jetson-voice-engine.git
+git clone https://github.com/suharvest/jetson-voice-engine.git
 cd jetson-voice-engine
 git checkout <commit-recorded-by-OVS-release-lock>
 ```

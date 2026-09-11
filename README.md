@@ -43,7 +43,7 @@ proposed-upstream bug patches and 35 sparse local product patches.
 ## Quick Start — materialize or build v0.9.1
 
 ```bash
-git clone https://github.com/Seeed-Solution/jetson-voice-engine.git
+git clone https://github.com/suharvest/jetson-voice-engine.git
 cd jetson-voice-engine/engine-overlay
 ./build.sh --apply-only
 

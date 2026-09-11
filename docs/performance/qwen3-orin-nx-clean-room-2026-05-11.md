@@ -90,8 +90,8 @@ MAXN-style profile under low load.
 | Repo | Branch | Commit |
 |---|---|---|
 | `jetson-voice` (`Seeed-Solution/openvoicestream`) | `qwen3tts-accurate-20260507` | `bd464053141f318e69345f9d31f5c732a5c3d829` |
-| `qwen3-edgellm-jetson` (`Seeed-Solution/jetson-voice-engine`, private — rsynced from Mac) | local | `e6dd2385b04f9f7a7a228a79aaf8f687acb23b44` |
-| `TensorRT-Edge-LLM` (`Seeed-Solution/TensorRT-Edge-LLM`) | `qwen3-tts-highperf-runtime-w8a16` | `9f248ed6a54a1ff06be7e9ca7621ef5974a45987` |
+| `qwen3-edgellm-jetson` (`suharvest/jetson-voice-engine`, private — rsynced from Mac) | local | `e6dd2385b04f9f7a7a228a79aaf8f687acb23b44` |
+| `TensorRT-Edge-LLM` (`suharvest/TensorRT-Edge-LLM`) | `qwen3-tts-highperf-runtime-w8a16` | `9f248ed6a54a1ff06be7e9ca7621ef5974a45987` |
 
 Sidecar `deploy/artifacts/qwen3_checksums.json` was generated on this clean
 checkout and copied back to the Mac.
@@ -104,7 +104,7 @@ checkout and copied back to the Mac.
 git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
 mkdir -p ~/project/repro-qwen3 && cd ~/project/repro-qwen3
 git clone --branch qwen3tts-accurate-20260507 https://gh-proxy.com/https://github.com/Seeed-Solution/openvoicestream.git jetson-voice
-git clone --branch qwen3-tts-highperf-runtime-w8a16 https://gh-proxy.com/https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git TensorRT-Edge-LLM
+git clone --branch qwen3-tts-highperf-runtime-w8a16 https://gh-proxy.com/https://github.com/suharvest/TensorRT-Edge-LLM.git TensorRT-Edge-LLM
 cd TensorRT-Edge-LLM && git submodule update --init --recursive
 # qwen3-edgellm-jetson is private; rsynced from Mac:
 #   rsync -az /Users/harvest/project/qwen3-edgellm-jetson/ harvest@orin-nx:project/repro-qwen3/qwen3-edgellm-jetson/
