@@ -17,7 +17,7 @@
 set -euo pipefail
 
 DEFAULT_TAG="customvoice-v071-w8a16-asr-pass-20260526"
-DEFAULT_FORK="https://github.com/suharvest/TensorRT-Edge-LLM.git"
+DEFAULT_FORK="https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git"
 DEFAULT_CUDA="/usr/local/cuda-12.6"
 DEFAULT_ARCH="87"
 DEFAULT_OUT="deploy/jetson-workers/customvoice-v071"

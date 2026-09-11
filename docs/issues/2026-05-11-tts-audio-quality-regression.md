@@ -251,7 +251,7 @@ talker is sampling a varied or constant sequence.
 
 ## Commits relevant to this regression
 
-EdgeLLM fork `suharvest/TensorRT-Edge-LLM` branch
+EdgeLLM fork `Seeed-Solution/TensorRT-Edge-LLM` branch
 `qwen3-tts-highperf-runtime-w8a16`:
 
 - `c248f73` — FP8 dequant scale fix (primary suspect)

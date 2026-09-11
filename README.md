@@ -19,7 +19,7 @@
 
 ## What is this?
 
-jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoiceStream](https://github.com/suharvest/openvoicestream). It takes official model snapshots and produces TensorRT engines, workers, plugins, provenance, and checksums. It does not own OVS profiles, HTTP APIs, images, or deployment.
+jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream). It takes official model snapshots and produces TensorRT engines, workers, plugins, provenance, and checksums. It does not own OVS profiles, HTTP APIs, images, or deployment.
 
 The active source contract is NVIDIA TensorRT-Edge-LLM v0.9.1 at
 `7f061f21f0a581ba234a1e233c9315b89d8e47d6`, followed by exactly 7 locked
@@ -43,7 +43,7 @@ proposed-upstream bug patches and 35 sparse local product patches.
 ## Quick Start — materialize or build v0.9.1
 
 ```bash
-git clone https://github.com/suharvest/jetson-voice-engine.git
+git clone https://github.com/Seeed-Solution/jetson-voice-engine.git
 cd jetson-voice-engine/engine-overlay
 ./build.sh --apply-only
 
@@ -422,10 +422,10 @@ CUDA EP if TRT encoder produces NaN (auto-detected). `--encoder-engine` and
 
 ## Contributing
 
-This repo is the Jetson engine build component of [OpenVoiceStream](https://github.com/suharvest/openvoicestream). Bug reports and pull requests are welcome.
+This repo is the Jetson engine build component of [OpenVoiceStream](https://github.com/Seeed-Solution/openvoicestream). Bug reports and pull requests are welcome.
 
 - **Engine bugs / build failures** — open an issue here
-- **Product / Docker / deployment issues** — open an issue in [openvoicestream](https://github.com/suharvest/openvoicestream)
+- **Product / Docker / deployment issues** — open an issue in [openvoicestream](https://github.com/Seeed-Solution/openvoicestream)
 - **Agent operating guide** — see `AGENTS.md` for coding agent conventions in this repo
 - **Patch / overlay changes** — read `engine-overlay/DIVERGENCE.md` before modifying; some patches are PR-pending upstream and must not be force-submitted
 

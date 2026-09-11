@@ -11,7 +11,7 @@ Local EdgeLLM worktree:
 Fork branch:
 
 ```text
-https://github.com/suharvest/TensorRT-Edge-LLM/tree/official-qwen3-tts-upstream-runtime
+https://github.com/Seeed-Solution/TensorRT-Edge-LLM/tree/official-qwen3-tts-upstream-runtime
 ```
 
 Base:

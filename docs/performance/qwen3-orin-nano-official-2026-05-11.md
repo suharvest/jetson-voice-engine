@@ -11,7 +11,7 @@ This is the §4 official/minimal profile validation per
 
 - Host: Jetson Orin Nano 8GB (actually Orin NX Super per fleet description), JetPack 6
 - Host TensorRT: 10.3.0.30
-- EdgeLLM fork: `suharvest/TensorRT-Edge-LLM`, branch
+- EdgeLLM fork: `Seeed-Solution/TensorRT-Edge-LLM`, branch
   `official-qwen3-tts-upstream-runtime` at commit `631e7f8`
 - Binary built on orin-nx (SM87 cross-build) and transferred via `fleet transfer`:
   - `qwen3_tts_inference` md5 `4d11f22e4fdefc917c08e14fabd750aa`
@@ -99,7 +99,7 @@ than silently no-op at runtime.
 ## Reproduce
 
 ```bash
-# Source: https://github.com/suharvest/qwen3-edgellm-jetson
+# Source: https://github.com/Seeed-Solution/jetson-voice-engine
 cd ~/project/qwen3-edgellm-jetson
 HF_ENDPOINT=https://hf-mirror.com python3 scripts/deploy_qwen3_artifacts.py \
   --set orin-nano-official-2026-05-10 \

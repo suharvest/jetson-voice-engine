@@ -11,7 +11,7 @@ artifact set now boots cleanly on a fresh Orin NX checkout.
 
 - Host: Jetson Orin NX 16GB, JetPack 6 (CUDA 12.6), nvpmodel 40 W (mode 4)
 - Host TensorRT: 10.3.0.30 (system `/usr/lib/aarch64-linux-gnu/libnvinfer.so.10`)
-- EdgeLLM fork: `suharvest/TensorRT-Edge-LLM`, branch
+- EdgeLLM fork: `Seeed-Solution/TensorRT-Edge-LLM`, branch
   `qwen3-tts-highperf-runtime-w8a16` at commit `5cc6060`
   (FP8 text-embedding scale fix + SM87 + CuTe DSL gemm + EMBEDDED_TARGET defaults)
 - Worker: `qwen3_tts_worker` md5 `dfe80e62312bc56600d9f67f3e4592cc`
@@ -101,9 +101,9 @@ above.
 ```bash
 # All three repos are public:
 cd ~/project
-git clone https://github.com/suharvest/jetson-local-voice.git jetson-voice
-git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
-git clone https://github.com/suharvest/TensorRT-Edge-LLM.git
+git clone https://github.com/Seeed-Solution/openvoicestream.git jetson-voice
+git clone https://github.com/Seeed-Solution/jetson-voice-engine.git
+git clone https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git
 cd jetson-voice && git checkout qwen3tts-accurate-20260507 && cd ..
 cd TensorRT-Edge-LLM && git checkout qwen3-tts-highperf-runtime-w8a16
 git submodule update --init --recursive

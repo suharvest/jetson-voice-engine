@@ -18,7 +18,7 @@ This report covers `~/project/repro-qwen3/` on host `orin-nx`
    files). Host has `libnvinfer-bin 10.3.0.30-1+cuda12.5`. The HF set
    `orin-nx-highperf-2026-05-11` was built against TRT 10.4.0.26.
 2. **`docs/reproduce-from-zero.md` cloned the wrong default branch.** Repo
-   `suharvest/jetson-local-voice` has the highperf NX profile JSON on branch
+   `Seeed-Solution/openvoicestream` has the highperf NX profile JSON on branch
    `qwen3tts-accurate-20260507` only. `main` (`0330603`, 2026-04-27) does not
    contain `configs/profiles/multilanguage-qwen-highperf-nx.json`. A plain
    `git clone` per the doc lands you on `main` and downstream wiring breaks.
@@ -89,9 +89,9 @@ MAXN-style profile under low load.
 
 | Repo | Branch | Commit |
 |---|---|---|
-| `jetson-voice` (`suharvest/jetson-local-voice`) | `qwen3tts-accurate-20260507` | `bd464053141f318e69345f9d31f5c732a5c3d829` |
-| `qwen3-edgellm-jetson` (`suharvest/qwen3-edgellm-jetson`, private — rsynced from Mac) | local | `e6dd2385b04f9f7a7a228a79aaf8f687acb23b44` |
-| `TensorRT-Edge-LLM` (`suharvest/TensorRT-Edge-LLM`) | `qwen3-tts-highperf-runtime-w8a16` | `9f248ed6a54a1ff06be7e9ca7621ef5974a45987` |
+| `jetson-voice` (`Seeed-Solution/openvoicestream`) | `qwen3tts-accurate-20260507` | `bd464053141f318e69345f9d31f5c732a5c3d829` |
+| `qwen3-edgellm-jetson` (`Seeed-Solution/jetson-voice-engine`, private — rsynced from Mac) | local | `e6dd2385b04f9f7a7a228a79aaf8f687acb23b44` |
+| `TensorRT-Edge-LLM` (`Seeed-Solution/TensorRT-Edge-LLM`) | `qwen3-tts-highperf-runtime-w8a16` | `9f248ed6a54a1ff06be7e9ca7621ef5974a45987` |
 
 Sidecar `deploy/artifacts/qwen3_checksums.json` was generated on this clean
 checkout and copied back to the Mac.
@@ -103,8 +103,8 @@ checkout and copied back to the Mac.
 ```bash
 git config --global url."https://gh-proxy.com/https://github.com/".insteadOf "https://github.com/"
 mkdir -p ~/project/repro-qwen3 && cd ~/project/repro-qwen3
-git clone --branch qwen3tts-accurate-20260507 https://gh-proxy.com/https://github.com/suharvest/jetson-local-voice.git jetson-voice
-git clone --branch qwen3-tts-highperf-runtime-w8a16 https://gh-proxy.com/https://github.com/suharvest/TensorRT-Edge-LLM.git TensorRT-Edge-LLM
+git clone --branch qwen3tts-accurate-20260507 https://gh-proxy.com/https://github.com/Seeed-Solution/openvoicestream.git jetson-voice
+git clone --branch qwen3-tts-highperf-runtime-w8a16 https://gh-proxy.com/https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git TensorRT-Edge-LLM
 cd TensorRT-Edge-LLM && git submodule update --init --recursive
 # qwen3-edgellm-jetson is private; rsynced from Mac:
 #   rsync -az /Users/harvest/project/qwen3-edgellm-jetson/ harvest@orin-nx:project/repro-qwen3/qwen3-edgellm-jetson/

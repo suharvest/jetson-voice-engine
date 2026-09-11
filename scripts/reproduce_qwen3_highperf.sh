@@ -4,9 +4,9 @@
 #
 # What it does (in order, fail-fast):
 #   1. Clone (or fetch) the three repos at the validated branches:
-#        suharvest/jetson-local-voice       branch qwen3tts-accurate-20260507
-#        suharvest/qwen3-edgellm-jetson     branch main
-#        suharvest/TensorRT-Edge-LLM        branch qwen3-tts-highperf-runtime-w8a16
+#        Seeed-Solution/openvoicestream       branch qwen3tts-accurate-20260507
+#        Seeed-Solution/jetson-voice-engine     branch main
+#        Seeed-Solution/TensorRT-Edge-LLM        branch qwen3-tts-highperf-runtime-w8a16
 #   2. Initialise EdgeLLM submodules.
 #   3. cmake configure + build (-j1; the SM87/CuTe-DSL/EMBEDDED_TARGET
 #      defaults are already in CMakeLists at HEAD).
@@ -81,9 +81,9 @@ JETSON_VOICE_COMMIT="${JETSON_VOICE_COMMIT:-}"
 log "step 1/7: ensure three repos at the validated branches"
 mkdir -p "$WORKSPACE"
 declare -A REPOS=(
-  ["$EDGELLM:qwen3-tts-highperf-runtime-w8a16"]="https://github.com/suharvest/TensorRT-Edge-LLM.git"
-  ["$QEJ:main"]="https://github.com/suharvest/qwen3-edgellm-jetson.git"
-  ["$JV:qwen3tts-accurate-20260507"]="https://github.com/suharvest/jetson-local-voice.git"
+  ["$EDGELLM:qwen3-tts-highperf-runtime-w8a16"]="https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git"
+  ["$QEJ:main"]="https://github.com/Seeed-Solution/jetson-voice-engine.git"
+  ["$JV:qwen3tts-accurate-20260507"]="https://github.com/Seeed-Solution/openvoicestream.git"
 )
 for spec in "${!REPOS[@]}"; do
   path="${spec%%:*}"

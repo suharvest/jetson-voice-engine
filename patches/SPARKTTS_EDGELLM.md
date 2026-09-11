@@ -5,7 +5,7 @@ baseline branch (the pin), NOT split across fork-main + jve patches. This keeps
 upstream maintenance to ONE rebase.
 
 ## Where
-- Branch: `suharvest/TensorRT-Edge-LLM` `integration/v080-sparktts`
+- Branch: `Seeed-Solution/TensorRT-Edge-LLM` `integration/v080-sparktts`
   (= `c48c0de` Base+CustomVoice baseline + ①②③, all opt-in / default byte-identical).
 - Pinned by `engine-overlay/UPSTREAM_PIN` = `8437f027`.
 - ① bf16/fp16 mixed-precision · ② W4A16 INT4-AWQ BF16-output · ③ shared-engine

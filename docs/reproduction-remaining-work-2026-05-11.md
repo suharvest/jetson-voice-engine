@@ -13,7 +13,7 @@ Repositories:
 - `jetson-voice`: product service and API.
 - `qwen3-edgellm-jetson`: Qwen3 export/build/deploy docs, scripts, profiles,
   and artifact manifest.
-- `suharvest/TensorRT-Edge-LLM`: EdgeLLM fork with highperf runtime code.
+- `Seeed-Solution/TensorRT-Edge-LLM`: EdgeLLM fork with highperf runtime code.
 - `harvestsu/qwen3-edgellm-jetson-artifacts`: Hugging Face model artifact repo.
 
 Local path for this repo:
@@ -52,9 +52,9 @@ Procedure:
 ```bash
 mkdir -p ~/project/repro-qwen3
 cd ~/project/repro-qwen3
-git clone https://github.com/suharvest/jetson-local-voice.git jetson-voice
-git clone https://github.com/suharvest/qwen3-edgellm-jetson.git
-git clone https://github.com/suharvest/TensorRT-Edge-LLM.git
+git clone https://github.com/Seeed-Solution/openvoicestream.git jetson-voice
+git clone https://github.com/Seeed-Solution/jetson-voice-engine.git
+git clone https://github.com/Seeed-Solution/TensorRT-Edge-LLM.git
 ```
 
 Then follow `docs/reproduce-from-zero.md`.
