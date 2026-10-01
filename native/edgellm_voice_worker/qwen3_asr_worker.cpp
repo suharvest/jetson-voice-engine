@@ -46,6 +46,7 @@
 #include "tokenizer/tokenizer.h"
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -393,6 +394,124 @@ std::filesystem::path writeTempInput(Json const& input, std::string const& id)
     return path;
 }
 
+//! Opt-in Qwen3-ASR scaffold for standard user-audio requests. Existing
+//! assistant-prefix rollback requests pass through unchanged.
+std::optional<std::string> canonicalWorkerLanguage(std::string const& requested)
+{
+    std::string value = requested;
+    for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (value.empty() || value == "auto") return std::nullopt;
+    static std::unordered_map<std::string, std::string> const aliases = {
+        {"zh", "Chinese"}, {"zh-cn", "Chinese"}, {"chinese", "Chinese"},
+        {"en", "English"}, {"en-us", "English"}, {"english", "English"},
+        {"yue", "Cantonese"}, {"cantonese", "Cantonese"},
+        {"ja", "Japanese"}, {"japanese", "Japanese"}, {"ko", "Korean"}, {"korean", "Korean"},
+        {"fr", "French"}, {"french", "French"}, {"de", "German"}, {"german", "German"},
+        {"it", "Italian"}, {"italian", "Italian"}, {"pt", "Portuguese"}, {"portuguese", "Portuguese"},
+        {"ru", "Russian"}, {"russian", "Russian"}, {"es", "Spanish"}, {"spanish", "Spanish"},
+        {"ar", "Arabic"}, {"arabic", "Arabic"}, {"hi", "Hindi"}, {"hindi", "Hindi"},
+        {"bn", "Bengali"}, {"bengali", "Bengali"}, {"ur", "Urdu"}, {"urdu", "Urdu"},
+        {"id", "Indonesian"}, {"indonesian", "Indonesian"}, {"ms", "Malay"}, {"malay", "Malay"},
+        {"vi", "Vietnamese"}, {"vietnamese", "Vietnamese"}, {"th", "Thai"}, {"thai", "Thai"},
+        {"tr", "Turkish"}, {"turkish", "Turkish"}, {"nl", "Dutch"}, {"dutch", "Dutch"},
+        {"pl", "Polish"}, {"polish", "Polish"}, {"uk", "Ukrainian"}, {"ukrainian", "Ukrainian"},
+        {"sv", "Swedish"}, {"swedish", "Swedish"}, {"no", "Norwegian"}, {"norwegian", "Norwegian"},
+        {"da", "Danish"}, {"danish", "Danish"}, {"fi", "Finnish"}, {"finnish", "Finnish"},
+        {"el", "Greek"}, {"greek", "Greek"}, {"he", "Hebrew"}, {"hebrew", "Hebrew"},
+        {"fa", "Persian"}, {"persian", "Persian"}, {"cs", "Czech"}, {"czech", "Czech"},
+        {"sk", "Slovak"}, {"slovak", "Slovak"}, {"hu", "Hungarian"}, {"hungarian", "Hungarian"},
+        {"ro", "Romanian"}, {"romanian", "Romanian"}, {"bg", "Bulgarian"}, {"bulgarian", "Bulgarian"},
+        {"hr", "Croatian"}, {"croatian", "Croatian"}, {"sr", "Serbian"}, {"serbian", "Serbian"},
+        {"ta", "Tamil"}, {"tamil", "Tamil"}, {"te", "Telugu"}, {"telugu", "Telugu"},
+        {"mr", "Marathi"}, {"marathi", "Marathi"}, {"gu", "Gujarati"}, {"gujarati", "Gujarati"},
+        {"kn", "Kannada"}, {"kannada", "Kannada"}, {"ml", "Malayalam"}, {"malayalam", "Malayalam"},
+        {"pa", "Punjabi"}, {"punjabi", "Punjabi"}, {"ne", "Nepali"}, {"nepali", "Nepali"},
+        {"si", "Sinhala"}, {"sinhala", "Sinhala"}, {"my", "Burmese"}, {"burmese", "Burmese"},
+        {"km", "Khmer"}, {"khmer", "Khmer"}, {"lo", "Lao"}, {"lao", "Lao"},
+        {"mn", "Mongolian"}, {"mongolian", "Mongolian"}, {"bo", "Tibetan"}, {"tibetan", "Tibetan"},
+        {"ug", "Uyghur"}, {"uyghur", "Uyghur"},
+    };
+    auto const it = aliases.find(value);
+    if (it == aliases.end()) throw std::invalid_argument("unsupported ASR worker language: " + requested);
+    return it->second;
+}
+
+//! Apply the language assistant turn to a one-shot-style request. Auto leaves
+//! the JSON byte-shape unchanged; forced language owns the sole assistant turn.
+void applyWorkerLanguagePrompt(Json& input, std::optional<std::string> const& language)
+{
+    if (!language || !input.contains("requests") || !input["requests"].is_array()) return;
+    for (Json& request : input["requests"])
+    {
+        if (!request.is_object() || !request.contains("messages") || !request["messages"].is_array())
+            throw std::invalid_argument("ASR language prompt requires request messages");
+        auto& messages = request["messages"];
+        if (!messages.empty() && messages.back().value("role", "") == "assistant")
+            throw std::invalid_argument("ASR language prompt conflicts with assistant continuation");
+        messages.push_back(Json{{"role", "assistant"}, {"content", "language " + *language + "<asr_text>"}});
+    }
+    input["apply_chat_template"] = true;
+    input["add_generation_prompt"] = false;
+}
+
+//! Prefix warmup keeps the model language header in rawDecoded so rollback token
+//! accounting sees the same semantic stream as a one-shot decode.
+std::string prefixWarmupDecoded(std::string generated, std::optional<std::string> const& language)
+{
+    if (language) return "language " + *language + "<asr_text>" + generated;
+    return generated;
+}
+
+bool assistantScaffoldEnabled()
+{
+    char const* value = std::getenv("OVS_ASR_ASSISTANT_SCAFFOLD");
+    return value != nullptr && std::string(value) == "1";
+}
+
+void applyAssistantScaffold(Json& input)
+{
+    // Prefix rollback warmup is marked at its callsite. Standard A/B requests
+    // may use the same template flags and must remain eligible for the opt-in.
+    bool const prefixWarmup = input.value("_ovs_asr_prefix_warmup", false);
+    input.erase("_ovs_asr_prefix_warmup");
+    if (prefixWarmup || !assistantScaffoldEnabled() || !input.contains("requests") || !input["requests"].is_array())
+    {
+        return;
+    }
+    for (Json const& request : input["requests"])
+    {
+        if (!request.is_object() || !request.contains("messages") || !request["messages"].is_array()
+            || request["messages"].empty())
+        {
+            return;
+        }
+        bool hasAssistant = false;
+        for (Json const& message : request["messages"])
+        {
+            if (message.is_object() && message.value("role", "") == "assistant") hasAssistant = true;
+        }
+        Json const& last = request["messages"].back();
+        if (!last.is_object() || last.value("role", "") != "user"
+            || !last.contains("content") || !last["content"].is_array() || hasAssistant)
+        {
+            return;
+        }
+        bool hasAudio = false;
+        for (Json const& part : last["content"])
+        {
+            if (part.is_object() && part.value("type", "") == "audio") hasAudio = true;
+        }
+        if (!hasAudio) return;
+    }
+    for (Json& request : input["requests"])
+    {
+        // `language None` is a neutral prompt hint; it does not claim detected language.
+        request["messages"].push_back(Json{{"role", "assistant"}, {"content", "language None<asr_text>"}});
+    }
+    input["apply_chat_template"] = true;
+    input["add_generation_prompt"] = false;
+}
+
 // ===========================================================================
 // Task #9: N>1 concurrent-session support (begin/chunk/end accumulation path).
 // Task #10: true streaming PARTIALs (per-hop cumulative re-decode -> `partial`).
@@ -425,6 +544,7 @@ struct SessionState
     std::string melPathOwned;                 //!< PCM-derived temp mel safetensors we own + must rm on release.
     std::string pcmB64;                       //!< Cumulative PCM (base64), if PCM-input path is used.
     Json beginMeta;                           //!< Begin-time metadata (sampling params etc.) to replay at finalize.
+    std::optional<std::string> requestedLanguage; //!< Canonical forced language; nullopt preserves auto.
     std::chrono::steady_clock::time_point lastActivity{std::chrono::steady_clock::now()};
     //! Streaming-prefix path (OVS_ASR_STREAM_PREFIX=1, default OFF) state. When the
     //! flag is OFF these stay untouched and the cumulative re-decode path is
@@ -568,6 +688,18 @@ void handleBegin(Json const& input)
         std::cout << Json{{"event", "error"}, {"ok", false}, {"error", "begin_missing_id"}}.dump() << std::endl;
         return;
     }
+    std::optional<std::string> requestedLanguage;
+    try
+    {
+        requestedLanguage = input.contains("force_language")
+            ? canonicalWorkerLanguage(input.value("force_language", "")) : std::nullopt;
+    }
+    catch (std::invalid_argument const& e)
+    {
+        std::cout << Json{{"event", "error"}, {"id", sid}, {"ok", false},
+            {"error", "invalid_force_language"}, {"detail", e.what()}}.dump() << std::endl;
+        return;
+    }
     if (gSessions.count(sid))
     {
         // Idempotent re-begin: ack the existing lane (no double-acquire).
@@ -586,6 +718,7 @@ void handleBegin(Json const& input)
     }
     SessionState st;
     st.laneId = lane;
+    st.requestedLanguage = requestedLanguage;
     st.lastActivity = std::chrono::steady_clock::now();
     // Capture sampling/meta knobs so finalize replays the SAME request envelope as
     // a one-shot call would (keeps byte-identity with the golden one-shot path).
@@ -770,6 +903,7 @@ Json buildFinalizeRequest(std::string const& sid, SessionState const& st)
     }
     req["requests"] = Json::array({Json{{"messages", Json::array({Json{{"role", "user"}, {"content", content}}})},
         {"reference", "ref"}}});
+    applyWorkerLanguagePrompt(req, st.requestedLanguage);
     return req;
 }
 
@@ -1564,7 +1698,9 @@ Json buildPrefixRequest(std::string const& sid, SessionState const& st, std::str
         req["add_generation_prompt"] = false;
         messages.push_back(Json{{"role", "assistant"}, {"content", prefix}});
     }
+    if (prefix.empty()) req["_ovs_asr_prefix_warmup"] = true;
     req["requests"] = Json::array({Json{{"messages", messages}, {"reference", "ref"}}});
+    if (prefix.empty()) applyWorkerLanguagePrompt(req, st.requestedLanguage);
     return req;
 }
 
@@ -1590,7 +1726,11 @@ HopOut runPrefixHop(std::string const& sid, SessionState const& st, std::string 
     {
         Json const& r0 = core["responses"][0];
         if (r0.contains("output_text") && r0["output_text"].is_string())
+        {
             out.generated = parseAsrText(r0["output_text"].get<std::string>());
+            if (prefix.empty())
+                out.generated = prefixWarmupDecoded(out.generated, st.requestedLanguage);
+        }
     }
     if (!out.ok && core.contains("error") && core["error"].is_string())
         out.error = core["error"].get<std::string>();
@@ -1630,6 +1770,7 @@ Json runOneShotCore(Json input, rt::LLMInferenceRuntime& runtime, cudaStream_t s
         int64_t const maxGenerateLengthOverride = input.value("max_generate_length_override", -1);
         input.erase("batch_size_override");
         input.erase("max_generate_length_override");
+        applyAssistantScaffold(input);
 
         tempPath = writeTempInput(input, id);
         std::vector<rt::LLMGenerationRequest> batchedRequests;
