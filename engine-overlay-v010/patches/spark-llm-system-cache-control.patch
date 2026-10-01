@@ -1,0 +1,74 @@
+diff --git a/experimental/server/api_server.py b/experimental/server/api_server.py
+index c039599..b18c35c 100644
+--- a/experimental/server/api_server.py
++++ b/experimental/server/api_server.py
+@@ -112,6 +112,20 @@ def _create_app(llm_instance):
+         stream = body.get("stream", False)
+         enable_thinking = body.get("enable_thinking", False)
+         disable_spec_decode = body.get("disable_spec_decode", False)
++        cache_prompt = body.get(
++            "save_system_prompt_kv_cache",
++            body.get("cache_prompt", False),
++        )
++        if not isinstance(cache_prompt, bool):
++            return JSONResponse(
++                status_code=400,
++                content={
++                    "error": {
++                        "code": "invalid_cache_prompt",
++                        "message": "cache_prompt must be a boolean",
++                    }
++                },
++            )
+         tools = body.get("tools")
+         tool_choice = body.get("tool_choice")
+ 
+@@ -148,6 +162,7 @@ def _create_app(llm_instance):
+             max_tokens=max_tokens,
+             enable_thinking=enable_thinking,
+             disable_spec_decode=disable_spec_decode,
++            save_system_prompt_kv_cache=cache_prompt,
+             stop=stop,
+         )
+ 
+@@ -183,6 +198,19 @@ def _create_app(llm_instance):
+                 status_code=400,
+                 content={"error": f"Invalid messages: {exc}"},
+             )
++        except RuntimeError as exc:
++            if "HybridCacheManager::captureKVCache currently only supports kHALF KV cache" in str(exc):
++                return JSONResponse(
++                    status_code=422,
++                    content={
++                        "error": {
++                            "code": "system_prompt_cache_unsupported",
++                            "message": "system-prompt KV cache is unsupported by this engine",
++                        }
++                    },
++                )
++            logger.exception("Inference failed")
++            return JSONResponse(status_code=500, content={"error": str(exc)})
+         except Exception as exc:
+             logger.exception("Inference failed")
+             return JSONResponse(status_code=500, content={"error": str(exc)})
+diff --git a/experimental/server/engine.py b/experimental/server/engine.py
+index e185555..3db600f 100644
+--- a/experimental/server/engine.py
++++ b/experimental/server/engine.py
+@@ -80,6 +80,7 @@ class SamplingParams:
+     max_tokens: int = 2048
+     enable_thinking: bool = False
+     disable_spec_decode: bool = False
++    save_system_prompt_kv_cache: bool = False
+     stop: List[str] = field(default_factory=list)
+ 
+ 
+@@ -710,7 +711,7 @@ class LLM:
+         request.add_generation_prompt = add_prompt
+         request.enable_thinking = params.enable_thinking
+         request.disable_spec_decode = params.disable_spec_decode
+-        request.save_system_prompt_kv_cache = True
++        request.save_system_prompt_kv_cache = params.save_system_prompt_kv_cache
+         return request
+ 
+     def _parse_generation_output(
