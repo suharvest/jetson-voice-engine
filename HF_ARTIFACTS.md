@@ -73,3 +73,20 @@ Upload requires explicit release approval. After upload, record the immutable
 HF commit in the OVS release lock, download that revision into a clean path,
 and verify every byte against `SHA256SUMS` before changing
 `published_to_hf` to true.
+
+## v0.11 OVS candidate inputs
+
+The v0.11 candidate is assembled by OpenVoiceStream. The following immutable
+HF revisions are consumed by the OVS profiles; they are published runtime
+artifacts, not outputs produced by the current JVE `main` source tree:
+
+| OVS component | Artifact repository | Immutable revision |
+|---|---|---|
+| Qwen3 ASR | `harvestsu/qwen3-asr-0.6b-jetson-artifacts` | `862ae0db85703e894ed9ae7448ae1ce11a79cda3` |
+| Qwen3 CustomVoice | `harvestsu/qwen3-tts-0.6b-customvoice-jetson-artifacts` | `009cd08677ec0f42378060f99c99a0a409e5ca70` |
+
+The corresponding OVS candidate images and VoxEdge package are documented in
+the root README and in the OVS release lock. This JVE repository does not own
+those image tags, the HTTP service, or the VoxEdge package. Do not use a
+floating HF branch, the legacy aggregate `main` revision, or the JVE v0.9.1
+aggregate manifest as a v0.11 deployment lock.

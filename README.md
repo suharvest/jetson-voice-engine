@@ -7,6 +7,12 @@
   <img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License">
 </p>
 
+> **v0.11 deployment note:** this repository remains the v0.9.1 Jetson engine
+> build component. The current OpenVoiceStream v0.11 candidate consumes the
+> published HF runtime artifacts and VoxEdge package; it does not rebuild them
+> from this repository's `main` branch. See the OVS deployment profile and
+> release lock before deploying.
+
 <p align="center">
   TensorRT-Edge-LLM v0.9.1 engine builds for Jetson Orin — <strong>7 upstream fixes + 35 local product patches</strong>
 </p>
@@ -24,6 +30,23 @@ jetson-voice-engine is the **Jetson speech engine build toolkit** for [OpenVoice
 The active source contract is NVIDIA TensorRT-Edge-LLM v0.9.1 at
 `7f061f21f0a581ba234a1e233c9315b89d8e47d6`, followed by exactly 7 locked
 proposed-upstream bug patches and 35 sparse local product patches.
+
+The v0.11 candidate is an integration release owned by OpenVoiceStream. Its
+current immutable runtime inputs are:
+
+| Component | Published input |
+|---|---|
+| Qwen3 ASR runtime artifacts | [`harvestsu/qwen3-asr-0.6b-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-asr-0.6b-jetson-artifacts), revision `862ae0db85703e894ed9ae7448ae1ce11a79cda3` |
+| Qwen3 CustomVoice runtime artifacts | [`harvestsu/qwen3-tts-0.6b-customvoice-jetson-artifacts`](https://huggingface.co/harvestsu/qwen3-tts-0.6b-customvoice-jetson-artifacts), revision `009cd08677ec0f42378060f99c99a0a409e5ca70` |
+| OVS voice candidate image | `sensecraft-missionpack.seeed.cn/solution/seeed-local-voice@sha256:4a61834fdc2862ec8d61c4748898fb02694a06bfea07c4ba166bee49d811a39a` |
+| OVS LLM candidate image | `sensecraft-missionpack.seeed.cn/solution/edge-llm-chat-service@sha256:7a9548e01db6255cb30d07ebff76ec53e0464a331ba284506483c03ea331c868` |
+| VoxEdge package | `0.0.15a3` |
+
+These are candidate inputs for Jetson Orin / SM87 with JetPack 6.2 and
+TensorRT 10.3. They are not a new JVE engine-build identity or an official
+NVIDIA JetPack qualification. The OVS profile resolves the HF artifacts at
+runtime; use the OVS repository's v0.11 deployment entrypoint and release lock
+for installation and verification.
 
 > **For deployment:** use OpenVoiceStream. Its
 > `deploy/artifacts/v091-release-lock.json` is the only release source of truth;
